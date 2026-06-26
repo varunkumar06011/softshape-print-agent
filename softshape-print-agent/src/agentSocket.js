@@ -124,9 +124,10 @@ async function handlePrintJob(envelope) {
   let targetPrinter = null;
   if (type === "KOT") targetPrinter = printerMapping.kitchen;
   else if (type === "BAR_KOT") targetPrinter = printerMapping.bar;
-  else if (type === "FINAL_BILL") targetPrinter = printerMapping.bill;
+  else if (type === "FINAL_BILL" || type === "BILL") targetPrinter = printerMapping.bill;
   else if (type === "CANCEL_KOT" || type === "CANCEL_ORDER")
     targetPrinter = printerMapping.kitchen;
+  else if (type === "TABLE_SWAP") targetPrinter = printerMapping.kitchen;
   else {
     console.warn(`[Agent] Unknown job type: ${type}`);
     return;
