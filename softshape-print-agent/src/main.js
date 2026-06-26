@@ -167,7 +167,13 @@ connectBtn.addEventListener("click", async () => {
       onStatusChange: (status) => {
         if (status === "connected") setStatus("Connected", true);
         else if (status === "disconnected") setStatus("Reconnecting…", false);
-        else if (status === "auth_error") setStatus("Auth Error", false);
+        else if (status === "auth_error") {
+          setStatus("Auth Error", false);
+          disconnectAgent();
+          showSetup();
+          setupError.textContent = "Session expired. Generate a new setup token and reconnect.";
+          connectBtn.disabled = false;
+        }
       },
       onPrintJob: (envelope) => addJobToList(envelope),
     });
@@ -190,11 +196,18 @@ connectBtn.addEventListener("click", async () => {
 });
 
 saveMappingBtn.addEventListener("click", async () => {
+  const availablePrinters = Array.from(kitchenSelect.options).map((o) => o.value).filter(Boolean);
   const mapping = {
     kitchen: kitchenSelect.value,
     bar: barSelect.value,
     bill: billSelect.value,
   };
+
+  const invalid = Object.entries(mapping).filter(([, name]) => name && !availablePrinters.includes(name));
+  if (invalid.length > 0) {
+    mappingMsg.textContent = "Error: selected printer not in system list.";
+    return;
+  }
 
   updatePrinterMapping(mapping);
   mappingMsg.textContent = "Saved! Sending test print…";
@@ -243,7 +256,10 @@ if (stored) {
       else if (status === "disconnected") setStatus("Reconnecting…", false);
       else if (status === "auth_error") {
         setStatus("Auth Error", false);
+        disconnectAgent();
         showSetup();
+        setupError.textContent = "Session expired. Generate a new setup token and reconnect.";
+        connectBtn.disabled = false;
       }
     },
     onPrintJob: (envelope) => addJobToList(envelope),

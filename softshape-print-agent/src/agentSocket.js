@@ -13,10 +13,11 @@
 
 import { io } from "socket.io-client";
 
-// Backend URL — injected at build time via VITE_BACKEND_URL, or fallback
-const BACKEND_URL =
-  (typeof import.meta !== "undefined" && import.meta.env?.VITE_BACKEND_URL) ||
-  "https://softshape-backend.onrender.com";
+// Backend URL — must be injected at build time via VITE_BACKEND_URL
+const BACKEND_URL = typeof import.meta !== "undefined" && import.meta.env?.VITE_BACKEND_URL;
+if (!BACKEND_URL) {
+  throw new Error("VITE_BACKEND_URL is not set. The print agent cannot connect without a backend URL.");
+}
 
 let socket = null;
 let sessionToken = null;
@@ -72,7 +73,7 @@ export async function registerAgent({ setupToken, agentId, printerMapping: mappi
  * Call this on every app start once sessionToken is loaded from storage.
  * @param {{ token: string, rid: string, mapping: object, onStatusChange?: Function, onPrintJob?: Function }} opts
  */
-export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob }) {
+export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, onAuthError }) {
   sessionToken = token;
   restaurantId = rid;
   printerMapping = mapping || {};
@@ -109,6 +110,7 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob }
   socket.on("auth:error", (err) => {
     console.error("[Agent] Auth error:", err.message);
     onStatusChangeCb?.("auth_error");
+    onAuthError?.(err);
   });
 }
 
@@ -121,20 +123,23 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob }
 async function handlePrintJob(envelope) {
   const { type, data } = envelope;
 
-  let targetPrinter = null;
-  if (type === "KOT") targetPrinter = printerMapping.kitchen;
-  else if (type === "BAR_KOT") targetPrinter = printerMapping.bar;
-  else if (type === "FINAL_BILL" || type === "BILL") targetPrinter = printerMapping.bill;
-  else if (type === "CANCEL_KOT" || type === "CANCEL_ORDER")
-    targetPrinter = printerMapping.kitchen;
-  else if (type === "TABLE_SWAP") targetPrinter = printerMapping.kitchen;
-  else {
-    console.warn(`[Agent] Unknown job type: ${type}`);
-    return;
+  // Prefer explicit printerName from backend, then fall back to mapping by job type
+  let targetPrinter = data?.printerName || null;
+  if (!targetPrinter) {
+    if (type === "KOT") targetPrinter = printerMapping.kitchen;
+    else if (type === "BAR_KOT") targetPrinter = printerMapping.bar;
+    else if (type === "FINAL_BILL" || type === "BILL") targetPrinter = printerMapping.bill;
+    else if (type === "CANCEL_KOT" || type === "CANCEL_ORDER")
+      targetPrinter = printerMapping.kitchen;
+    else if (type === "TABLE_SWAP") targetPrinter = printerMapping.kitchen;
+    else {
+      console.warn(`[Agent] Unknown job type: ${type}`);
+      return;
+    }
   }
 
   if (!targetPrinter) {
-    console.warn(`[Agent] No printer mapped for job type: ${type}`);
+    console.warn(`[Agent] No printer mapped for job type: ${type}`, { printerName: data?.printerName });
     return;
   }
 
@@ -230,14 +235,22 @@ export function disconnectAgent() {
  * @returns {{ token: string, rid: string, name: string, mapping: object } | null}
  */
 export function loadStoredSession() {
-  const token = localStorage.getItem("agent_session_token");
-  const rid = localStorage.getItem("agent_restaurant_id");
-  const name = localStorage.getItem("agent_restaurant_name") || "";
-  const mappingStr = localStorage.getItem("agent_printer_mapping");
-  const mapping = mappingStr ? JSON.parse(mappingStr) : {};
+  try {
+    const token = localStorage.getItem("agent_session_token");
+    const rid = localStorage.getItem("agent_restaurant_id");
+    const name = localStorage.getItem("agent_restaurant_name") || "";
+    const mappingStr = localStorage.getItem("agent_printer_mapping");
+    const mapping = mappingStr ? JSON.parse(mappingStr) : {};
 
-  if (token && rid) {
-    return { token, rid, name, mapping };
+    if (token && rid) {
+      return { token, rid, name, mapping };
+    }
+  } catch (err) {
+    console.error("[Agent] Failed to load stored session:", err);
+    localStorage.removeItem("agent_session_token");
+    localStorage.removeItem("agent_restaurant_id");
+    localStorage.removeItem("agent_restaurant_name");
+    localStorage.removeItem("agent_printer_mapping");
   }
   return null;
 }
