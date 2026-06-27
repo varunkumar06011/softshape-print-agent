@@ -27,6 +27,63 @@ let printerMapping = {};
 let heartbeatInterval = null;
 let onStatusChangeCb = null;
 let onPrintJobCb = null;
+let isOnline = false;
+
+// ── Offline print queue (localStorage-based for the print agent) ─────────────
+// The print agent runs in Tauri and may lose socket connection while the
+// cashier app is still sending print requests via the OS. When offline,
+// we queue jobs in localStorage and flush them when the socket reconnects.
+
+const OFFLINE_QUEUE_KEY = "agent_offline_print_queue";
+
+function getOfflineQueue() {
+  try {
+    return JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY) || "[]");
+  } catch {
+    return [];
+  }
+}
+
+function saveOfflineQueue(queue) {
+  try {
+    localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(queue));
+  } catch {
+    // localStorage might be full — drop oldest jobs
+    const trimmed = queue.slice(-20);
+    localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(trimmed));
+  }
+}
+
+function addToOfflineQueue(envelope) {
+  const queue = getOfflineQueue();
+  queue.push({ ...envelope, queuedAt: Date.now() });
+  saveOfflineQueue(queue);
+  console.log(`[Agent] Queued offline print job: ${envelope.type} (queue: ${queue.length})`);
+}
+
+async function flushOfflineQueue() {
+  const queue = getOfflineQueue();
+  if (queue.length === 0) return;
+
+  console.log(`[Agent] Flushing ${queue.length} queued offline print jobs...`);
+  const remaining = [];
+
+  for (const envelope of queue) {
+    try {
+      await handlePrintJob(envelope);
+      console.log(`[Agent] Flushed queued job: ${envelope.type}`);
+    } catch (err) {
+      console.error(`[Agent] Failed to flush queued job:`, err);
+      // Keep failed jobs in queue for next attempt
+      remaining.push(envelope);
+    }
+  }
+
+  saveOfflineQueue(remaining);
+  if (remaining.length > 0) {
+    console.log(`[Agent] ${remaining.length} jobs still in offline queue`);
+  }
+}
 
 /**
  * Register agent for the first time using a setup token.
@@ -89,8 +146,11 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
   });
 
   socket.on("connect", () => {
+    isOnline = true;
     socket.emit("agent:join", { restaurantId, sessionToken });
     onStatusChangeCb?.("connected");
+    // Flush any print jobs that were queued while offline
+    flushOfflineQueue();
   });
 
   socket.on("agent:joined", ({ bufferedCount }) => {
@@ -100,10 +160,16 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
   socket.on("print_job", async (envelope) => {
     console.log(`[Agent] Received print_job: ${envelope.type}`);
     onPrintJobCb?.(envelope);
+    if (!isOnline) {
+      // Should not happen via socket, but handle gracefully
+      addToOfflineQueue(envelope);
+      return;
+    }
     await handlePrintJob(envelope);
   });
 
   socket.on("disconnect", () => {
+    isOnline = false;
     onStatusChangeCb?.("disconnected");
   });
 
@@ -298,4 +364,43 @@ export function updatePrinterMapping(mapping) {
  */
 export function getBackendUrl() {
   return BACKEND_URL;
+}
+
+/**
+ * Check if the agent socket is currently connected.
+ * @returns {boolean}
+ */
+export function isAgentOnline() {
+  return isOnline;
+}
+
+/**
+ * Submit a print job directly (bypassing socket). Used by the cashier app
+ * when it detects the agent is offline but still wants to print locally.
+ * The job is processed immediately if possible, otherwise queued.
+ *
+ * @param {{ type: string, data: object }} envelope
+ */
+export async function printDirect(envelope) {
+  if (isOnline && socket?.connected) {
+    // If online, just process normally
+    await handlePrintJob(envelope);
+  } else {
+    // Queue for later processing
+    addToOfflineQueue(envelope);
+    // Attempt immediate local print anyway (Tauri can print without socket)
+    try {
+      await handlePrintJob(envelope);
+    } catch (err) {
+      console.warn(`[Agent] Direct print failed, job queued:`, err.message);
+    }
+  }
+}
+
+/**
+ * Get the count of queued offline print jobs.
+ * @returns {number}
+ */
+export function getOfflineQueueCount() {
+  return getOfflineQueue().length;
 }
