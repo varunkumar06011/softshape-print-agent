@@ -159,11 +159,15 @@ connectBtn.addEventListener("click", async () => {
       printerMapping: {},
     });
 
-    // Connect socket
+    // Load any previously saved mapping from localStorage so jobs route correctly
+    const stored = loadStoredSession();
+    const initialMapping = (stored && stored.mapping) ? stored.mapping : {};
+
+    // Connect socket with the persisted mapping (not empty {})
     connectAgent({
       token: data.sessionToken,
       rid: data.restaurantId,
-      mapping: {},
+      mapping: initialMapping,
       onStatusChange: (status) => {
         if (status === "connected") setStatus("Connected", true);
         else if (status === "disconnected") setStatus("Reconnecting…", false);

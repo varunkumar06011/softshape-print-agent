@@ -134,18 +134,39 @@ async function handlePrintJob(envelope) {
     else if (type === "TABLE_SWAP") targetPrinter = printerMapping.kitchen;
     else {
       console.warn(`[Agent] Unknown job type: ${type}`);
+      socket?.emit("print:ack", {
+        restaurantId,
+        eventId: envelope.eventId,
+        requestId: data?.requestId,
+        status: "failed",
+        error: `Unknown job type: ${type}`,
+      });
       return;
     }
   }
 
   if (!targetPrinter) {
     console.warn(`[Agent] No printer mapped for job type: ${type}`, { printerName: data?.printerName });
+    socket?.emit("print:ack", {
+      restaurantId,
+      eventId: envelope.eventId,
+      requestId: data?.requestId,
+      status: "failed",
+      error: `No printer mapped for job type: ${type}`,
+    });
     return;
   }
 
   const escposData = data?.escposData;
   if (!escposData || (Array.isArray(escposData) && escposData.length === 0)) {
     console.warn(`[Agent] No ESC/POS data in job: ${type}`);
+    socket?.emit("print:ack", {
+      restaurantId,
+      eventId: envelope.eventId,
+      requestId: data?.requestId,
+      status: "failed",
+      error: `No ESC/POS data in job: ${type}`,
+    });
     return;
   }
 
@@ -179,6 +200,13 @@ async function handlePrintJob(envelope) {
     });
   } catch (err) {
     console.error(`[Agent] Print failed [${type}] → ${targetPrinter}:`, err);
+    socket?.emit("print:ack", {
+      restaurantId,
+      eventId: envelope.eventId,
+      requestId: data?.requestId,
+      status: "failed",
+      error: err?.message || String(err),
+    });
   }
 }
 
