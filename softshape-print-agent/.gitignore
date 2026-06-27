@@ -19,3 +19,5 @@ src-tauri/gen/
 Thumbs.db
 Desktop.ini
 .DS_Store
+# Capacitor generated platforms
+android/
