@@ -19,8 +19,19 @@
         "fullscreen": false
       }
     ],
+    "allowlist": {
+      "all": false,
+      "http": {
+        "all": false,
+        "request": true,
+        "scope": [
+          "http://localhost:3000",
+          "https://softshape-backend.onrender.com"
+        ]
+      }
+    },
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; connect-src 'self' http: https: ws: wss:; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;"
     },
     "bundle": {
       "identifier": "ai.softshape.print-agent",

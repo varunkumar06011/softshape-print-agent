@@ -16,6 +16,7 @@ import {
   loadStoredSession,
   updatePrinterMapping,
   getBackendUrl,
+  checkBackendHealth,
 } from "./agentSocket.js";
 
 // DOM elements
@@ -26,6 +27,7 @@ const restaurantCodeInput = document.getElementById("restaurantCode");
 const setupTokenInput = document.getElementById("setupToken");
 const connectBtn = document.getElementById("connectBtn");
 const setupError = document.getElementById("setupError");
+const retryBtn = document.getElementById("retryBtn");
 const restaurantNameEl = document.getElementById("restaurantName");
 const agentIdEl = document.getElementById("agentIdDisplay");
 const kitchenSelect = document.getElementById("kitchenPrinter");
@@ -140,23 +142,44 @@ async function populatePrinterDropdowns() {
 
 // ─── Event Handlers ─────────────────────────────────────────────────────
 
-connectBtn.addEventListener("click", async () => {
+connectBtn.addEventListener("click", () => attemptConnect());
+retryBtn?.addEventListener("click", () => attemptConnect());
+
+async function attemptConnect() {
   const code = restaurantCodeInput.value.trim();
   const token = setupTokenInput.value.trim();
 
   if (!token) {
     setupError.textContent = "Please enter the setup token from the dashboard.";
+    retryBtn?.classList.add("hidden");
     return;
   }
 
   connectBtn.disabled = true;
-  setupError.textContent = "";
+  retryBtn?.classList.add("hidden");
+  setupError.textContent = "Checking backend…";
 
   try {
+    await checkBackendHealth(5000);
+  } catch (err) {
+    setupError.innerHTML = formatSetupError(err);
+    connectBtn.disabled = false;
+    retryBtn?.classList.remove("hidden");
+    return;
+  }
+
+  try {
+    setupError.textContent = "Registering…";
     const data = await registerAgent({
       setupToken: token,
+      restaurantCode: code,
       agentId: AGENT_ID,
       printerMapping: {},
+      onAttempt: (attempt, total) => {
+        if (attempt > 1) {
+          setupError.textContent = `Retrying… (${attempt}/${total})`;
+        }
+      },
     });
 
     // Load any previously saved mapping from localStorage so jobs route correctly
@@ -194,10 +217,47 @@ connectBtn.addEventListener("click", async () => {
     renderPrinterStatus({});
     renderJobs();
   } catch (err) {
-    setupError.textContent = err.message || "Connection failed. Check your token and try again.";
+    setupError.innerHTML = formatSetupError(err);
+    retryBtn?.classList.remove("hidden");
+  } finally {
     connectBtn.disabled = false;
   }
-});
+}
+
+function formatSetupError(err) {
+  const url = getBackendUrl();
+  const message = err.message || "Connection failed";
+
+  let detail = "";
+  if (err.type === "timeout") {
+    detail = "The backend did not respond in time. It may be waking up — try again.";
+  } else if (err.type === "network") {
+    detail = "Could not reach the network. Check your internet connection.";
+  } else if (err.type === "client") {
+    detail = "The server rejected the request. Check your restaurant code and setup token.";
+  } else if (err.type === "server") {
+    detail = "The server had an error. Please wait a moment and try again.";
+  } else if (err.type === "parse") {
+    detail = "The server response was unreadable. Please try again.";
+  } else {
+    detail = "Check your token and try again.";
+  }
+
+  return (
+    `<div>${escapeHtml(message)}</div>` +
+    `<div style="font-size:0.85em;color:#6b7280;margin-top:4px;">URL: ${escapeHtml(url)}</div>` +
+    `<div style="font-size:0.85em;color:#6b7280;">${escapeHtml(detail)}</div>`
+  );
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
 saveMappingBtn.addEventListener("click", async () => {
   const availablePrinters = Array.from(kitchenSelect.options).map((o) => o.value).filter(Boolean);

@@ -19,6 +19,137 @@ if (!BACKEND_URL) {
   throw new Error("VITE_BACKEND_URL is not set. The print agent cannot connect without a backend URL.");
 }
 
+/**
+ * Typed fetch error used by fetchWithRetry so callers can distinguish
+ * timeout, network, 4xx, 5xx, and parse failures without string parsing.
+ */
+class FetchError extends Error {
+  constructor(message, type, statusCode = null) {
+    super(message);
+    this.name = "FetchError";
+    this.type = type;
+    this.statusCode = statusCode;
+  }
+}
+
+/**
+ * Fetch with per-attempt timeout and exponential backoff.
+ *
+ * Retry policy:
+ *   - 4xx client errors are NOT retried (bad token, bad input, unauthorized)
+ *   - 5xx server errors, network errors, and timeouts ARE retried
+ *
+ * @param {string} url
+ * @param {object} options
+ * @param {object} config
+ * @param {number} config.retries - max attempts (default 3)
+ * @param {number} config.timeoutMs - per attempt timeout (default 12000)
+ * @param {number} config.baseDelayMs - first retry delay (default 1000)
+ * @param {Function} config.onAttempt - (attempt, total) => void
+ * @returns {Promise<Response>}
+ */
+export async function fetchWithRetry(
+  url,
+  options = {},
+  { retries = 3, timeoutMs = 12000, baseDelayMs = 1000, onAttempt } = {},
+) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    onAttempt?.(attempt, retries);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort("timeout"), timeoutMs);
+
+    try {
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timeoutId);
+
+      if (res.ok) return res;
+
+      if (res.status >= 400 && res.status < 500) {
+        const body = await res.json().catch(() => ({}));
+        throw new FetchError(
+          body.error || `HTTP ${res.status}: ${res.statusText}`,
+          "client",
+          res.status,
+        );
+      }
+
+      // 5xx: retry
+      lastError = new FetchError(
+        `HTTP ${res.status}: ${res.statusText}`,
+        "server",
+        res.status,
+      );
+    } catch (err) {
+      clearTimeout(timeoutId);
+
+      if (err instanceof FetchError) {
+        lastError = err;
+        // 4xx client errors should not be retried (bad token, bad input, unauthorized)
+        if (err.type === "client") throw lastError;
+      } else if (err.name === "AbortError") {
+        lastError = new FetchError("Request timed out", "timeout");
+      } else {
+        lastError = new FetchError(
+          err.message || "Network request failed",
+          "network",
+        );
+      }
+    }
+
+    if (attempt < retries) {
+      const delay = baseDelayMs * Math.pow(2, attempt - 1);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+
+  throw lastError;
+}
+
+/**
+ * Lightweight pre-flight check to tell users whether the backend is reachable
+ * before attempting a full registration.
+ *
+ * @param {number} timeoutMs
+ * @returns {Promise<{ ok: true }>}
+ */
+export async function checkBackendHealth(timeoutMs = 5000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort("timeout"), timeoutMs);
+
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/health`, {
+      method: "GET",
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      throw new FetchError(
+        `Health check returned HTTP ${res.status}`,
+        res.status >= 500 ? "server" : "client",
+        res.status,
+      );
+    }
+
+    return { ok: true };
+  } catch (err) {
+    clearTimeout(timeoutId);
+    if (err instanceof FetchError) throw err;
+    if (err.name === "AbortError") {
+      throw new FetchError(
+        `Backend is not responding at ${BACKEND_URL}`,
+        "timeout",
+      );
+    }
+    throw new FetchError(
+      `Cannot reach backend at ${BACKEND_URL}`,
+      "network",
+    );
+  }
+}
+
 let socket = null;
 let sessionToken = null;
 let restaurantId = null;
@@ -87,25 +218,35 @@ async function flushOfflineQueue() {
 
 /**
  * Register agent for the first time using a setup token.
- * @param {{ setupToken: string, agentId: string, printerMapping?: object }} opts
+ * @param {{ setupToken: string, agentId: string, restaurantCode?: string, printerMapping?: object, onAttempt?: Function }} opts
  * @returns {Promise<object>} registration result
  */
-export async function registerAgent({ setupToken, agentId, printerMapping: mapping }) {
-  const res = await fetch(`${BACKEND_URL}/api/print/agent-register`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${setupToken}`,
-      "Content-Type": "application/json",
+export async function registerAgent({
+  setupToken,
+  agentId,
+  restaurantCode,
+  printerMapping: mapping,
+  onAttempt,
+}) {
+  const body = { agentId, printerMapping: mapping || {} };
+  if (restaurantCode) body.restaurantCode = restaurantCode;
+
+  const res = await fetchWithRetry(
+    `${BACKEND_URL}/api/print/agent-register`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${setupToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
     },
-    body: JSON.stringify({ agentId, printerMapping: mapping || {} }),
+    { retries: 3, timeoutMs: 12000, onAttempt },
+  );
+
+  const data = await res.json().catch(() => {
+    throw new FetchError("Failed to parse registration response", "parse");
   });
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || "Registration failed");
-  }
-
-  const data = await res.json();
   sessionToken = data.sessionToken;
   restaurantId = data.restaurantId;
   restaurantName = data.restaurantName;
@@ -404,3 +545,5 @@ export async function printDirect(envelope) {
 export function getOfflineQueueCount() {
   return getOfflineQueue().length;
 }
+
+export { handlePrintJob, FetchError };

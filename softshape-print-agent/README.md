@@ -26,20 +26,32 @@ npm run tauri build
 
 ### Environment
 
-Create a `.env` file in the project root:
+Create a `.env` file in the project root **before building**:
 
 ```
 VITE_BACKEND_URL=https://softshape-backend.onrender.com
 ```
+
+`VITE_BACKEND_URL` is required at build time. The app bakes this URL into the bundle and cannot be pointed at a different backend without rebuilding.
 
 ## Authentication Flow
 
 1. Owner opens Admin Dashboard → Printers tab
 2. Clicks **Generate Setup Token** (valid 15 minutes)
 3. Opens the Print Agent app on the printer PC
-4. Enters the setup token
-5. App calls `/api/print/agent-register` → receives a 30-day session token
-6. App stores the token and auto-connects on future starts
+4. Enters the restaurant code and setup token
+5. App pings `/api/health` to confirm the backend is reachable
+6. App calls `/api/print/agent-register` with automatic retries (timeout / network / 5xx only, 4xx is not retried)
+7. App receives a 30-day session token, stores it, and auto-connects on future starts
+
+If registration fails, the error message now shows:
+- the exact failure type (timeout, network, client, server)
+- the backend URL that was tried
+- a **Retry** button
+
+## Local HTTP Print Server
+
+`server.js` is a standalone Node HTTP server that accepts print jobs on the same machine as the Cashier desktop app. It is not part of the Tauri frontend setup flow and is not affected by changes to `agentSocket.js`.
 
 ## Printer Support
 

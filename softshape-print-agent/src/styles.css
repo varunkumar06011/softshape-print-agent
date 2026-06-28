@@ -123,6 +123,23 @@ body {
   min-height: 18px;
 }
 
+.btn-retry {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid #ef4444;
+  border-radius: 10px;
+  background: #fef2f2;
+  color: #b91c1c;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  margin-top: 8px;
+}
+
+.btn-retry:hover {
+  background: #fee2e2;
+}
+
 .success-msg {
   color: #22c55e;
   font-size: 13px;
