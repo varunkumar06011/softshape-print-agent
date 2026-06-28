@@ -11,6 +11,11 @@ src-tauri/gen/
 # Environment
 .env
 
+# Tauri signing keys
+*.key
+*.key.pub
+.tauri/
+
 # IDE
 .vscode/
 .idea/
