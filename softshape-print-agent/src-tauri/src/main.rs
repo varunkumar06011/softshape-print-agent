@@ -78,10 +78,9 @@ fn get_app_version() -> String {
 /// Check for updates using Tauri's built-in updater.
 #[tauri::command]
 async fn check_for_updates(app: tauri::AppHandle) -> Result<bool, String> {
-    use tauri::updater::UpdaterExt;
     let update = app.updater().check().await
         .map_err(|e| format!("Update check failed: {}", e))?;
-    if let Some(update) = update {
+    if update.is_update_available() {
         update.download_and_install().await
             .map_err(|e| format!("Update install failed: {}", e))?;
         Ok(true)
