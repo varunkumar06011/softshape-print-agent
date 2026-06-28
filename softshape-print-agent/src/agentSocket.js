@@ -160,6 +160,23 @@ let onStatusChangeCb = null;
 let onPrintJobCb = null;
 let isOnline = false;
 
+// ── EventId dedup ────────────────────────────────────────────────────────────
+// Prevents double-printing when the agent reconnects: the backend re-delivers
+// buffered PENDING jobs via socket while the agent's own offline localStorage
+// queue may also hold the same job.  We track seen eventIds in a bounded Set
+// so duplicates are skipped and a success ack is sent immediately.
+const SEEN_EVENT_IDS_MAX = 500;
+const seenEventIds = new Set();
+
+function markEventIdSeen(id) {
+  if (seenEventIds.size >= SEEN_EVENT_IDS_MAX) {
+    // Evict oldest entry (first inserted) to keep the Set bounded
+    const first = seenEventIds.values().next().value;
+    if (first) seenEventIds.delete(first);
+  }
+  seenEventIds.add(id);
+}
+
 // ── Offline print queue (localStorage-based for the print agent) ─────────────
 // The print agent runs in Tauri and may lose socket connection while the
 // cashier app is still sending print requests via the OS. When offline,
@@ -335,14 +352,34 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
 export async function handlePrintJob(envelope) {
   const { type, data } = envelope;
 
+  // ── Dedup: skip if we've already printed this eventId ──
+  // On reconnect the backend re-delivers buffered PENDING jobs and the agent's
+  // own offline queue may also contain the same job.  This guard ensures each
+  // job is printed exactly once.
+  if (envelope.eventId && seenEventIds.has(envelope.eventId)) {
+    console.log(`[Agent] Duplicate eventId skipped: ${envelope.eventId}`);
+    socket?.emit("print:ack", {
+      restaurantId,
+      eventId: envelope.eventId,
+      requestId: data?.requestId,
+      status: "success",
+    });
+    return;
+  }
+  if (envelope.eventId) markEventIdSeen(envelope.eventId);
+
   // Prefer explicit printerName from backend, then fall back to mapping by job type
   let targetPrinter = data?.printerName || null;
   if (!targetPrinter) {
     if (type === "KOT") targetPrinter = printerMapping.kitchen;
     else if (type === "BAR_KOT") targetPrinter = printerMapping.bar;
     else if (type === "FINAL_BILL" || type === "BILL") targetPrinter = printerMapping.bill;
-    else if (type === "CANCEL_KOT" || type === "CANCEL_ORDER")
-      targetPrinter = printerMapping.kitchen;
+    else if (type === "CANCEL_KOT" || type === "CANCEL_ORDER") {
+      // Route cancel slips to the correct printer based on the cancelled item's type
+      const cancelItem = data?.item || data?.items?.[0];
+      const isLiquor = cancelItem?.menuType === "BAR" || cancelItem?.menuType === "LIQUOR";
+      targetPrinter = isLiquor ? printerMapping.bar : printerMapping.kitchen;
+    }
     else if (type === "TABLE_SWAP") targetPrinter = printerMapping.kitchen;
     else {
       console.warn(`[Agent] Unknown job type: ${type}`);

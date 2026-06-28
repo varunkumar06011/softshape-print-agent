@@ -13,6 +13,7 @@
     "windows": [
       {
         "title": "SoftShape Print Agent",
+        "url": "https://www.softshape.in/print-agent",
         "width": 560,
         "height": 680,
         "resizable": true,
@@ -31,7 +32,7 @@
       }
     },
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' http: https: ws: wss:; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;"
+      "csp": null
     },
     "bundle": {
       "identifier": "ai.softshape.print-agent",
