@@ -7,8 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "tauri": "tauri",
-    "test": "vitest run",
-    "server": "node server.js"
+    "test": "vitest run"
   },
   "dependencies": {
     "socket.io-client": "^4.7.5"
