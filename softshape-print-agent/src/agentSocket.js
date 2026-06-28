@@ -281,9 +281,9 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
   socket = io(BACKEND_URL, {
     transports: ["websocket", "polling"],
     reconnection: true,
-    reconnectionAttempts: Infinity,
+    reconnectionAttempts: 50,
     reconnectionDelay: 5000,
-    reconnectionDelayMax: 30000,
+    reconnectionDelayMax: 60000,
   });
 
   socket.on("connect", () => {
@@ -314,6 +314,11 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
     onStatusChangeCb?.("disconnected");
   });
 
+  socket.on("reconnect_failed", () => {
+    console.error("[Agent] All reconnection attempts exhausted. Manual reconnect required.");
+    onStatusChangeCb?.("connection_failed");
+  });
+
   socket.on("auth:error", (err) => {
     console.error("[Agent] Auth error:", err.message);
     onStatusChangeCb?.("auth_error");
@@ -327,7 +332,7 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
  * Job types: KOT | BAR_KOT | FINAL_BILL | CANCEL_KOT | CANCEL_ORDER | TABLE_SWAP
  * ESC/POS bytes are in envelope.data.escposData (pre-built by backend).
  */
-async function handlePrintJob(envelope) {
+export async function handlePrintJob(envelope) {
   const { type, data } = envelope;
 
   // Prefer explicit printerName from backend, then fall back to mapping by job type

@@ -39,7 +39,7 @@ fn print_raw(printer_name: String, bytes: Vec<u8>) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         let _ = (printer_name, bytes);
-        Err("Printing is only supported on Windows".to_string())
+        Err("Print agent is currently only supported on Windows. Network printing (print_network) is available on all platforms.".to_string())
     }
 }
 
@@ -56,6 +56,11 @@ fn print_network(ip: String, port: u16, bytes: Vec<u8>) -> Result<(), String> {
         Duration::from_secs(5),
     )
     .map_err(|e| format!("Cannot connect to {}: {}", addr, e))?;
+
+    // Set a 10-second write timeout so a hung printer doesn't block forever
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| format!("Failed to set write timeout: {}", e))?;
 
     stream
         .write_all(&bytes)
