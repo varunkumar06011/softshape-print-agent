@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SoftShape Print Agent</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- Header -->
+      <div class="header">
+        <div class="header-title">SoftShape Print Agent</div>
+        <div class="header-status" id="connectionStatus">Disconnected</div>
+      </div>
+
+      <!-- Setup Section (shown when not connected) -->
+      <div id="setupSection" class="section">
+        <div class="section-title">Step 1 — Enter Restaurant Code</div>
+        <p class="hint">Find your restaurant code in the SoftShape dashboard under Printers.</p>
+        <div class="input-row">
+          <input type="text" id="restaurantCode" placeholder="e.g. RST-AB12" class="text-input" />
+        </div>
+
+        <div class="section-title" style="margin-top: 20px;">Step 2 — Enter Setup Token</div>
+        <p class="hint">Generate a setup token from the dashboard Printers page. Valid for 15 minutes.</p>
+        <div class="input-row">
+          <input type="text" id="setupToken" placeholder="Paste setup token here" class="text-input" />
+        </div>
+
+        <button id="connectBtn" class="btn-primary">Connect</button>
+        <div id="setupError" class="error-msg"></div>
+        <button id="retryBtn" class="btn-retry hidden">Retry</button>
+      </div>
+
+      <!-- Connected Section (shown after registration) -->
+      <div id="connectedSection" class="section hidden">
+        <div class="info-row">
+          <span class="label">Restaurant:</span>
+          <span id="restaurantName" class="value">—</span>
+        </div>
+        <div class="info-row">
+          <span class="label">Agent ID:</span>
+          <span id="agentIdDisplay" class="value">—</span>
+        </div>
+
+        <div class="section-title" style="margin-top: 20px;">Printer Mapping</div>
+        <p class="hint">Select which printer handles each job type.</p>
+
+        <div class="printer-mapping">
+          <div class="mapping-row">
+            <label>🍳 Kitchen</label>
+            <select id="kitchenPrinter" class="select-input"></select>
+          </div>
+          <div class="mapping-row">
+            <label>🍺 Bar</label>
+            <select id="barPrinter" class="select-input"></select>
+          </div>
+          <div class="mapping-row">
+            <label>🧾 Bill</label>
+            <select id="billPrinter" class="select-input"></select>
+          </div>
+        </div>
+
+        <button id="saveMappingBtn" class="btn-primary">Save &amp; Test</button>
+        <div id="mappingMsg" class="success-msg"></div>
+
+        <div class="section-title" style="margin-top: 20px;">Printer Status</div>
+        <div class="status-grid" id="printerStatusGrid"></div>
+
+        <div class="section-title" style="margin-top: 20px;">Recent Jobs</div>
+        <div id="recentJobs" class="jobs-list"></div>
+
+        <button id="disconnectBtn" class="btn-secondary">Disconnect</button>
+      </div>
+    </div>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
