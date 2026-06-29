@@ -131,10 +131,11 @@ async function populatePrinterDropdowns() {
 
   for (const select of [kitchenSelect, barSelect, billSelect]) {
     select.innerHTML = '<option value="">— Select —</option>';
-    for (const name of printers) {
+    for (const printer of printers) {
       const opt = document.createElement("option");
-      opt.value = name;
-      opt.textContent = name;
+      const printerName = typeof printer === "string" ? printer : printer.name;
+      opt.value = printerName;
+      opt.textContent = printer.isDefault ? `${printerName} (Default)` : printerName;
       select.appendChild(opt);
     }
   }

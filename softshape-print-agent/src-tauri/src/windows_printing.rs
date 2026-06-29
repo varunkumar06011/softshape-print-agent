@@ -10,7 +10,7 @@ use windows::Win32::Foundation::{BOOL, HANDLE};
 use windows::Win32::Graphics::Printing::{
     ClosePrinter, EndDocPrinter, EndPagePrinter, OpenPrinterA, StartDocPrinterA,
     StartPagePrinter, WritePrinter, DOC_INFO_1A, PRINTER_INFO_1A, EnumPrintersA,
-    PRINTER_ENUM_LOCAL, PRINTER_ENUM_CONNECTIONS,
+    PRINTER_ENUM_LOCAL, PRINTER_ENUM_CONNECTIONS, GetDefaultPrinterA,
 };
 
 /// Convert a Rust string to a null-terminated ANSI string (for OpenPrinterA etc.)
@@ -20,6 +20,20 @@ fn to_ansi(s: &str) -> Vec<u8> {
 
 /// Enumerate all installed printers on this machine.
 pub fn enumerate_printers() -> Result<Vec<super::PrinterInfo>, String> {
+    // Get the default printer name first
+    let default_printer_name = {
+        let mut size: u32 = 0;
+        let _ = unsafe { GetDefaultPrinterA(PSTR::null(), &mut size) };
+        let mut buf = vec![0u8; size as usize];
+        let ok = unsafe { GetDefaultPrinterA(PSTR::from_raw(buf.as_mut_ptr()), &mut size) };
+        if ok.is_ok() && size > 1 {
+            let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const i8) };
+            cstr.to_string_lossy().to_string()
+        } else {
+            String::new()
+        }
+    };
+
     let flags = PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS;
     let mut needed: u32 = 0;
     let mut returned: u32 = 0;
@@ -77,9 +91,10 @@ pub fn enumerate_printers() -> Result<Vec<super::PrinterInfo>, String> {
         if !name_pcstr.is_null() {
             let name_cstr = unsafe { std::ffi::CStr::from_ptr(name_pcstr.as_ptr() as *const i8) };
             let name = name_cstr.to_string_lossy().to_string();
+            let is_default = !default_printer_name.is_empty() && name == default_printer_name;
             printers.push(super::PrinterInfo {
                 name,
-                is_default: false,
+                is_default,
             });
         }
     }
