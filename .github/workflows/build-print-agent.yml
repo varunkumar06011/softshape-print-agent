@@ -8,6 +8,10 @@ on:
 env:
   NODE_VERSION: 22
   RUST_VERSION: 1.88
+  # Backend URL baked into the bundle at build time. The agent throws on
+  # startup if this is missing (see src/agentSocket.js). The print agent is a
+  # standalone app and connects to its own backend, NOT softshape.in.
+  VITE_BACKEND_URL: https://softshape-backend.onrender.com
 
 permissions:
   contents: write
@@ -42,6 +46,7 @@ jobs:
       - name: Build Print Agent
         run: npx tauri build
         env:
+          VITE_BACKEND_URL: ${{ env.VITE_BACKEND_URL }}
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
 
@@ -54,11 +59,42 @@ jobs:
             src-tauri/target/release/bundle/nsis/*.sig
           if-no-files-found: warn
 
+      # Produce the two fixed filenames the rest of the system expects:
+      #  1. print-agent-windows-x86_64-setup.exe → Tauri auto-updater URL built
+      #     by the backend (/api/updates/print-agent/...).
+      #  2. SoftShape.Print.Agent_x64-setup.exe → manual "latest" download link
+      #     referenced by the admin app (VITE_PRINT_AGENT_DOWNLOAD_URL).
+      - name: Rename installer to fixed filenames
+        shell: bash
+        run: |
+          dir="src-tauri/target/release/bundle/nsis"
+          updater="print-agent-windows-x86_64-setup.exe"
+          manual="SoftShape.Print.Agent_x64-setup.exe"
+          exe=$(ls "$dir"/*.exe 2>/dev/null | grep -v "$updater" | grep -v "$manual" | head -n 1)
+          sig=$(ls "$dir"/*.sig 2>/dev/null | head -n 1)
+          if [ -z "$exe" ]; then
+            echo "::error::No NSIS installer found in $dir"
+            exit 1
+          fi
+          cp "$exe" "$dir/$updater"
+          cp "$exe" "$dir/$manual"
+          if [ -n "$sig" ]; then
+            cp "$sig" "$dir/${updater}.sig"
+            cp "$sig" "$dir/${manual}.sig"
+            echo "── Updater signature (copy into backend env PRINT_AGENT_DESKTOP_APP_SIGNATURE_WINDOWS) ──"
+            cat "$sig"
+            echo ""
+          else
+            echo "::warning::No .sig produced — auto-updater will not work without a signature"
+          fi
+
       - name: Attach to release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ github.event.release.tag_name }}
           files: |
-            src-tauri/target/release/bundle/nsis/*.exe
-            src-tauri/target/release/bundle/nsis/*.sig
+            src-tauri/target/release/bundle/nsis/print-agent-windows-x86_64-setup.exe
+            src-tauri/target/release/bundle/nsis/print-agent-windows-x86_64-setup.exe.sig
+            src-tauri/target/release/bundle/nsis/SoftShape.Print.Agent_x64-setup.exe
+            src-tauri/target/release/bundle/nsis/SoftShape.Print.Agent_x64-setup.exe.sig
