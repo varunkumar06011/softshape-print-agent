@@ -3,10 +3,8 @@
 /// Uses RawDocToPrinter to send ESC/POS bytes directly to the printer
 /// without showing a print dialog.
 
-use std::ptr::null_mut;
-
 use windows::core::{PCSTR, PSTR};
-use windows::Win32::Foundation::{BOOL, HANDLE};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Printing::{
     ClosePrinter, EndDocPrinter, EndPagePrinter, OpenPrinterA, StartDocPrinterA,
     StartPagePrinter, WritePrinter, DOC_INFO_1A, PRINTER_INFO_1A, EnumPrintersA,
@@ -26,7 +24,7 @@ pub fn enumerate_printers() -> Result<Vec<super::PrinterInfo>, String> {
         let _ = unsafe { GetDefaultPrinterA(PSTR::null(), &mut size) };
         let mut buf = vec![0u8; size as usize];
         let ok = unsafe { GetDefaultPrinterA(PSTR::from_raw(buf.as_mut_ptr()), &mut size) };
-        if ok.is_ok() && size > 1 {
+        if ok.as_bool() && size > 1 {
             let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const i8) };
             cstr.to_string_lossy().to_string()
         } else {
