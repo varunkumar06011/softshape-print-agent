@@ -19,6 +19,17 @@ if (!BACKEND_URL) {
   throw new Error("VITE_BACKEND_URL is not set. The print agent cannot connect without a backend URL.");
 }
 
+// Resolve the Tauri invoke function regardless of API shape. Tauri v1 with
+// withGlobalTauri exposes both window.__TAURI__.invoke and
+// window.__TAURI__.tauri.invoke. Returns null outside the desktop webview.
+function getTauriInvoke() {
+  const t = typeof window !== "undefined" ? window.__TAURI__ : null;
+  if (!t) return null;
+  if (typeof t.invoke === "function") return t.invoke.bind(t);
+  if (t.tauri && typeof t.tauri.invoke === "function") return t.tauri.invoke.bind(t.tauri);
+  return null;
+}
+
 /**
  * Typed fetch error used by fetchWithRetry so callers can distinguish
  * timeout, network, 4xx, 5xx, and parse failures without string parsing.
@@ -430,8 +441,9 @@ export async function handlePrintJob(envelope) {
 
   try {
     // Invoke Tauri Rust command
-    if (window.__TAURI__) {
-      await window.__TAURI__.invoke("print_raw", {
+    const invoke = getTauriInvoke();
+    if (invoke) {
+      await invoke("print_raw", {
         printerName: targetPrinter,
         bytes: Array.from(bytes),
       });
