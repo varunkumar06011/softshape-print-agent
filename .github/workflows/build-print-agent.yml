@@ -70,14 +70,40 @@ jobs:
           dir="src-tauri/target/release/bundle/nsis"
           updater="print-agent-windows-x86_64-setup.exe"
           manual="SoftShape.Print.Agent_x64-setup.exe"
-          exe=$(ls "$dir"/*.exe 2>/dev/null | grep -v "$updater" | grep -v "$manual" | head -n 1)
-          sig=$(ls "$dir"/*.sig 2>/dev/null | head -n 1)
+
+          echo "Contents of $dir:"
+          ls -la "$dir" || true
+
+          # Find the original installer (skip our two target filenames)
+          exe=""
+          for f in "$dir"/*.exe; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f")
+            if [ "$base" != "$updater" ] && [ "$base" != "$manual" ]; then
+              exe="$f"
+              break
+            fi
+          done
+
           if [ -z "$exe" ]; then
             echo "::error::No NSIS installer found in $dir"
             exit 1
           fi
+          echo "Found installer: $exe"
           cp "$exe" "$dir/$updater"
           cp "$exe" "$dir/$manual"
+
+          # Find the signature (if any)
+          sig=""
+          for s in "$dir"/*.sig; do
+            [ -e "$s" ] || continue
+            base=$(basename "$s")
+            if [ "$base" != "${updater}.sig" ] && [ "$base" != "${manual}.sig" ]; then
+              sig="$s"
+              break
+            fi
+          done
+
           if [ -n "$sig" ]; then
             cp "$sig" "$dir/${updater}.sig"
             cp "$sig" "$dir/${manual}.sig"
