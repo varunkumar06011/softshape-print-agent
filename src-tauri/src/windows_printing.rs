@@ -129,7 +129,7 @@ pub fn raw_print(printer_name: &str, bytes: &[u8]) -> Result<(), String> {
 
     let job_id = unsafe { StartDocPrinterA(handle, 1, &doc_info) };
     if job_id == 0 {
-        unsafe { ClosePrinter(handle) };
+        unsafe { let _ = ClosePrinter(handle); };
         return Err("StartDocPrinter failed".to_string());
     }
 
@@ -137,8 +137,8 @@ pub fn raw_print(printer_name: &str, bytes: &[u8]) -> Result<(), String> {
     let page_result = unsafe { StartPagePrinter(handle) };
     if !page_result.as_bool() {
         unsafe {
-            EndDocPrinter(handle);
-            ClosePrinter(handle);
+            let _ = EndDocPrinter(handle);
+            let _ = ClosePrinter(handle);
         }
         return Err("StartPagePrinter failed".to_string());
     }
@@ -156,9 +156,9 @@ pub fn raw_print(printer_name: &str, bytes: &[u8]) -> Result<(), String> {
 
     // End page and document
     unsafe {
-        EndPagePrinter(handle);
-        EndDocPrinter(handle);
-        ClosePrinter(handle);
+        let _ = EndPagePrinter(handle);
+        let _ = EndDocPrinter(handle);
+        let _ = ClosePrinter(handle);
     }
 
     if !write_result.as_bool() {
