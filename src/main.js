@@ -15,6 +15,7 @@ import {
   startHeartbeat,
   loadStoredSession,
   updatePrinterMapping,
+  setPrinterStatus,
   getBackendUrl,
   checkBackendHealth,
 } from "./agentSocket.js";
@@ -115,33 +116,66 @@ function renderPrinterStatus(status) {
     .join("");
 }
 
-// Populate printer dropdowns (in dev mode, use stub list; in Tauri, call Rust command)
+// Resolve the Tauri invoke function regardless of API shape (v1 exposes both
+// window.__TAURI__.invoke and window.__TAURI__.tauri.invoke when withGlobalTauri
+// is enabled). Returns null when not running inside the Tauri webview.
+function getTauriInvoke() {
+  const t = window.__TAURI__;
+  if (!t) return null;
+  if (typeof t.invoke === "function") return t.invoke.bind(t);
+  if (t.tauri && typeof t.tauri.invoke === "function") return t.tauri.invoke.bind(t.tauri);
+  return null;
+}
+
+// Populate printer dropdowns from the Rust list_printers command.
+// Failures are surfaced in the dropdown text so the user is never left guessing.
 async function populatePrinterDropdowns() {
   let printers = [];
-  if (window.__TAURI__) {
+  let placeholder = "— Select —";
+  const invoke = getTauriInvoke();
+
+  if (!invoke) {
+    placeholder = "⚠ Tauri unavailable (run as desktop app)";
+    console.error("window.__TAURI__ not available — withGlobalTauri may be off.");
+  } else {
     try {
-      printers = await window.__TAURI__.invoke("list_printers");
+      printers = await invoke("list_printers");
+      if (!Array.isArray(printers) || printers.length === 0) {
+        placeholder = "⚠ No printers found on this PC";
+        console.warn("list_printers returned no printers.");
+      }
     } catch (err) {
+      placeholder = "⚠ Failed to read printers";
       console.error("Failed to list printers:", err);
       printers = [];
     }
-  } else {
-    printers = ["(dev mode — no real printers)"];
   }
 
   for (const select of [kitchenSelect, barSelect, billSelect]) {
-    select.innerHTML = '<option value="">— Select —</option>';
+    select.innerHTML = `<option value="">${placeholder}</option>`;
     for (const printer of printers) {
       const opt = document.createElement("option");
       const printerName = typeof printer === "string" ? printer : printer.name;
+      const isDefault = typeof printer === "object" && printer.isDefault;
       opt.value = printerName;
-      opt.textContent = printer.isDefault ? `${printerName} (Default)` : printerName;
+      opt.textContent = isDefault ? `${printerName} (Default)` : printerName;
       select.appendChild(opt);
     }
   }
 }
 
 // ─── Event Handlers ─────────────────────────────────────────────────────
+
+// Update printer status when dropdowns change
+[kitchenSelect, barSelect, billSelect].forEach((sel) => {
+  sel.addEventListener("change", () => {
+    setPrinterStatus({
+      kitchen: kitchenSelect.value ? "online" : "offline",
+      bar: barSelect.value ? "online" : "offline",
+      bill: billSelect.value ? "online" : "offline",
+    });
+  });
+});
 
 connectBtn.addEventListener("click", () => attemptConnect());
 retryBtn?.addEventListener("click", () => attemptConnect());
@@ -171,21 +205,21 @@ async function attemptConnect() {
 
   try {
     setupError.textContent = "Registering…";
+    // Load any previously saved mapping from localStorage so we pass it to register AND connect
+    const stored = loadStoredSession();
+    const initialMapping = (stored && stored.mapping) ? stored.mapping : {};
+
     const data = await registerAgent({
       setupToken: token,
       restaurantCode: code,
       agentId: AGENT_ID,
-      printerMapping: {},
+      printerMapping: initialMapping,
       onAttempt: (attempt, total) => {
         if (attempt > 1) {
           setupError.textContent = `Retrying… (${attempt}/${total})`;
         }
       },
     });
-
-    // Load any previously saved mapping from localStorage so jobs route correctly
-    const stored = loadStoredSession();
-    const initialMapping = (stored && stored.mapping) ? stored.mapping : {};
 
     // Connect socket with the persisted mapping (not empty {})
     connectAgent({
@@ -274,23 +308,30 @@ saveMappingBtn.addEventListener("click", async () => {
     return;
   }
 
-  updatePrinterMapping(mapping);
+  await updatePrinterMapping(mapping);
+  setPrinterStatus({
+    kitchen: mapping.kitchen ? "online" : "offline",
+    bar: mapping.bar ? "online" : "offline",
+    bill: mapping.bill ? "online" : "offline",
+  });
   mappingMsg.textContent = "Saved! Sending test print…";
 
   // Send a test print via Tauri
-  if (window.__TAURI__) {
+  const invoke = getTauriInvoke();
+  if (invoke) {
     for (const [type, printerName] of Object.entries(mapping)) {
       if (!printerName) continue;
       try {
         const testStr = "\x1B\x40Test Print — " + type.toUpperCase() + "\n\n\n\x1D\x56\x42\x00";
         const encoder = new TextEncoder();
         const bytes = encoder.encode(testStr);
-        await window.__TAURI__.invoke("print_raw", {
+        await invoke("print_raw", {
           printerName,
           bytes: Array.from(bytes),
         });
       } catch (err) {
         console.error(`Test print failed for ${type}:`, err);
+        mappingMsg.textContent = `Test print failed for ${type}: ${err?.message || err}`;
       }
     }
   }
@@ -342,6 +383,12 @@ if (stored) {
     if (stored.mapping.kitchen) kitchenSelect.value = stored.mapping.kitchen;
     if (stored.mapping.bar) barSelect.value = stored.mapping.bar;
     if (stored.mapping.bill) billSelect.value = stored.mapping.bill;
+    // Set initial printer status from restored mapping
+    setPrinterStatus({
+      kitchen: kitchenSelect.value ? "online" : "offline",
+      bar: barSelect.value ? "online" : "offline",
+      bill: billSelect.value ? "online" : "offline",
+    });
   });
   renderPrinterStatus({});
   renderJobs();

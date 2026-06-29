@@ -19,6 +19,17 @@ if (!BACKEND_URL) {
   throw new Error("VITE_BACKEND_URL is not set. The print agent cannot connect without a backend URL.");
 }
 
+// Resolve the Tauri invoke function regardless of API shape. Tauri v1 with
+// withGlobalTauri exposes both window.__TAURI__.invoke and
+// window.__TAURI__.tauri.invoke. Returns null outside the desktop webview.
+function getTauriInvoke() {
+  const t = typeof window !== "undefined" ? window.__TAURI__ : null;
+  if (!t) return null;
+  if (typeof t.invoke === "function") return t.invoke.bind(t);
+  if (t.tauri && typeof t.tauri.invoke === "function") return t.tauri.invoke.bind(t.tauri);
+  return null;
+}
+
 /**
  * Typed fetch error used by fetchWithRetry so callers can distinguish
  * timeout, network, 4xx, 5xx, and parse failures without string parsing.
@@ -160,6 +171,36 @@ let onStatusChangeCb = null;
 let onPrintJobCb = null;
 let isOnline = false;
 
+// ── Printer status tracking ──────────────────────────────────────────────────
+// Updated by the UI when dropdown selections change. Used by handlePrintJob
+// to detect if the target printer is currently offline/unmapped and log a
+// warning + include the status in the print:ack so the backend knows.
+let printerStatus = { kitchen: "unknown", bar: "unknown", bill: "unknown" };
+
+/**
+ * Update printer status from the UI. Called when dropdowns change.
+ * @param {{ kitchen?: string, bar?: string, bill?: string }} status
+ */
+export function setPrinterStatus(status) {
+  printerStatus = { ...printerStatus, ...status };
+}
+
+/**
+ * Get the printer status for a given job type.
+ * @param {string} type — KOT, BAR_KOT, FINAL_BILL, CANCEL_KOT, TABLE_SWAP
+ * @returns {string} — "online" | "offline" | "unknown"
+ */
+function getPrinterStatusForType(type) {
+  if (type === "KOT" || type === "TABLE_SWAP") return printerStatus.kitchen || "unknown";
+  if (type === "BAR_KOT") return printerStatus.bar || "unknown";
+  if (type === "FINAL_BILL" || type === "BILL") return printerStatus.bill || "unknown";
+  if (type === "CANCEL_KOT" || type === "CANCEL_ORDER") {
+    // Cancel routing depends on item type — check both
+    return printerStatus.kitchen || printerStatus.bar || "unknown";
+  }
+  return "unknown";
+}
+
 // ── EventId dedup ────────────────────────────────────────────────────────────
 // Prevents double-printing when the agent reconnects: the backend re-delivers
 // buffered PENDING jobs via socket while the agent's own offline localStorage
@@ -214,18 +255,25 @@ async function flushOfflineQueue() {
   if (queue.length === 0) return;
 
   console.log(`[Agent] Flushing ${queue.length} queued offline print jobs...`);
-  const remaining = [];
 
-  for (const envelope of queue) {
-    try {
-      await handlePrintJob(envelope);
-      console.log(`[Agent] Flushed queued job: ${envelope.type}`);
-    } catch (err) {
-      console.error(`[Agent] Failed to flush queued job:`, err);
-      // Keep failed jobs in queue for next attempt
-      remaining.push(envelope);
-    }
-  }
+  // Process all queued jobs concurrently — each targets a different printer
+  // so parallel printing is safe and much faster than sequential.
+  const results = await Promise.allSettled(
+    queue.map(async (envelope) => {
+      try {
+        await handlePrintJob(envelope);
+        console.log(`[Agent] Flushed queued job: ${envelope.type}`);
+        return null;
+      } catch (err) {
+        console.error(`[Agent] Failed to flush queued job:`, err);
+        return envelope; // return failed job to keep in queue
+      }
+    })
+  );
+
+  const remaining = results
+    .map(r => r.status === 'fulfilled' ? r.value : null)
+    .filter(Boolean);
 
   saveOfflineQueue(remaining);
   if (remaining.length > 0) {
@@ -299,8 +347,8 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
     transports: ["websocket", "polling"],
     reconnection: true,
     reconnectionAttempts: 50,
-    reconnectionDelay: 5000,
-    reconnectionDelayMax: 60000,
+    reconnectionDelay: 2000,
+    reconnectionDelayMax: 30000,
   });
 
   socket.on("connect", () => {
@@ -315,7 +363,7 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
     console.log(`[Agent] Joined print room. Buffered jobs: ${bufferedCount}`);
   });
 
-  socket.on("print_job", async (envelope) => {
+  socket.on("print_job", (envelope) => {
     console.log(`[Agent] Received print_job: ${envelope.type}`);
     onPrintJobCb?.(envelope);
     if (!isOnline) {
@@ -323,7 +371,13 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
       addToOfflineQueue(envelope);
       return;
     }
-    await handlePrintJob(envelope);
+    // Process concurrently — don't await, so simultaneous print jobs
+    // (e.g., cashier final bill + captain KOT) don't block each other.
+    // Each job targets a different printer (kitchen/bar/bill) so parallel
+    // printing is safe and eliminates the 10-second sequential delay.
+    handlePrintJob(envelope).catch(err => {
+      console.error(`[Agent] Concurrent print_job error [${envelope.type}]:`, err);
+    });
   });
 
   socket.on("disconnect", () => {
@@ -406,6 +460,12 @@ export async function handlePrintJob(envelope) {
     return;
   }
 
+  // Warn if the target printer is marked offline in the UI
+  const statusForType = getPrinterStatusForType(type);
+  if (statusForType === "offline") {
+    console.warn(`[Agent] Printer for ${type} is marked offline in UI — attempting print anyway to ${targetPrinter}`);
+  }
+
   const escposData = data?.escposData;
   if (!escposData || (Array.isArray(escposData) && escposData.length === 0)) {
     console.warn(`[Agent] No ESC/POS data in job: ${type}`);
@@ -430,11 +490,22 @@ export async function handlePrintJob(envelope) {
 
   try {
     // Invoke Tauri Rust command
-    if (window.__TAURI__) {
-      await window.__TAURI__.invoke("print_raw", {
-        printerName: targetPrinter,
-        bytes: Array.from(bytes),
-      });
+    const invoke = getTauriInvoke();
+    if (invoke) {
+      // Detect network printer (IP:port format, e.g. "192.168.1.100:9100")
+      const netMatch = targetPrinter.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)$/);
+      if (netMatch) {
+        await invoke("print_network", {
+          ip: netMatch[1],
+          port: parseInt(netMatch[2], 10),
+          bytes: Array.from(bytes),
+        });
+      } else {
+        await invoke("print_raw", {
+          printerName: targetPrinter,
+          bytes: Array.from(bytes),
+        });
+      }
     } else {
       console.log(`[Agent] (dev mode) Would print [${type}] → ${targetPrinter} (${bytes.length} bytes)`);
     }
@@ -533,12 +604,33 @@ export function loadStoredSession() {
 }
 
 /**
- * Update printer mapping and persist to localStorage.
+ * Update printer mapping, persist to localStorage, and sync to backend.
  * @param {{ kitchen?: string, bar?: string, bill?: string }} mapping
  */
-export function updatePrinterMapping(mapping) {
+export async function updatePrinterMapping(mapping) {
   printerMapping = { ...printerMapping, ...mapping };
   localStorage.setItem("agent_printer_mapping", JSON.stringify(printerMapping));
+
+  // Sync to backend so printerConfig.agentMapping stays current
+  if (sessionToken && restaurantId) {
+    try {
+      await fetchWithRetry(
+        `${BACKEND_URL}/api/print/agent-update-mapping`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${sessionToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ printerMapping }),
+        },
+        { retries: 2, timeoutMs: 8000 },
+      );
+      console.log("[Agent] Printer mapping synced to backend");
+    } catch (err) {
+      console.warn("[Agent] Failed to sync mapping to backend (non-fatal):", err.message);
+    }
+  }
 }
 
 /**
