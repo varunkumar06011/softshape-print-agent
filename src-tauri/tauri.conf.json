@@ -1,0 +1,61 @@
+{
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devPath": "http://localhost:1420",
+    "distDir": "../dist"
+  },
+  "package": {
+    "productName": "SoftShape Print Agent",
+    "version": "1.3.2"
+  },
+  "tauri": {
+    "windows": [
+      {
+        "title": "SoftShape Print Agent",
+        "width": 560,
+        "height": 680,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "allowlist": {
+      "all": false,
+      "http": {
+        "all": false,
+        "request": true,
+        "scope": [
+          "http://localhost:3000",
+          "https://softshape-backend.onrender.com"
+        ]
+      }
+    },
+    "security": {
+      "csp": null
+    },
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://softshape-backend.onrender.com/api/updates/print-agent/{{target}}/{{current_version}}"
+      ],
+      "dialog": true,
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQwRDQwOUM5NEExNzc2MDcKUldRSGRoZEt5UW5VUUI3R1hEUUNLNE5sZitnZVRaaXJURjhReWN3Qld6WFVzSTNDREcrcWRka0UK"
+    },
+    "bundle": {
+      "identifier": "ai.softshape.print-agent",
+      "active": true,
+      "targets": ["nsis", "msi"],
+      "icon": [
+        "icons/32x32.png",
+        "icons/128x128.png",
+        "icons/128x128@2x.png",
+        "icons/icon.ico"
+      ],
+      "windows": {
+        "webviewInstallMode": {
+          "type": "embedBootstrapper"
+        }
+      }
+    }
+  }
+}

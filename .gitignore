@@ -1,33 +1,28 @@
 # Dependencies
 node_modules/
 
-# Build outputs
+# Build output
 dist/
-build/
-.next/
-out/
+src-tauri/target/
 
-# Environment variables
+# Tauri build artifacts
+src-tauri/gen/
+
+# Environment
 .env
-.env.local
-.env.production
+
+# Tauri signing keys
+*.key
+*.key.pub
+.tauri/
 
 # IDE
 .vscode/
 .idea/
-*.swp
-*.swo
 
 # OS
-.DS_Store
 Thumbs.db
-
-# Logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Temporary files
-*.tmp
-*.temp
+Desktop.ini
+.DS_Store
+# Capacitor generated platforms
+android/
