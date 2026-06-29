@@ -255,18 +255,25 @@ async function flushOfflineQueue() {
   if (queue.length === 0) return;
 
   console.log(`[Agent] Flushing ${queue.length} queued offline print jobs...`);
-  const remaining = [];
 
-  for (const envelope of queue) {
-    try {
-      await handlePrintJob(envelope);
-      console.log(`[Agent] Flushed queued job: ${envelope.type}`);
-    } catch (err) {
-      console.error(`[Agent] Failed to flush queued job:`, err);
-      // Keep failed jobs in queue for next attempt
-      remaining.push(envelope);
-    }
-  }
+  // Process all queued jobs concurrently — each targets a different printer
+  // so parallel printing is safe and much faster than sequential.
+  const results = await Promise.allSettled(
+    queue.map(async (envelope) => {
+      try {
+        await handlePrintJob(envelope);
+        console.log(`[Agent] Flushed queued job: ${envelope.type}`);
+        return null;
+      } catch (err) {
+        console.error(`[Agent] Failed to flush queued job:`, err);
+        return envelope; // return failed job to keep in queue
+      }
+    })
+  );
+
+  const remaining = results
+    .map(r => r.status === 'fulfilled' ? r.value : null)
+    .filter(Boolean);
 
   saveOfflineQueue(remaining);
   if (remaining.length > 0) {
@@ -340,8 +347,8 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
     transports: ["websocket", "polling"],
     reconnection: true,
     reconnectionAttempts: 50,
-    reconnectionDelay: 5000,
-    reconnectionDelayMax: 60000,
+    reconnectionDelay: 2000,
+    reconnectionDelayMax: 30000,
   });
 
   socket.on("connect", () => {
@@ -356,7 +363,7 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
     console.log(`[Agent] Joined print room. Buffered jobs: ${bufferedCount}`);
   });
 
-  socket.on("print_job", async (envelope) => {
+  socket.on("print_job", (envelope) => {
     console.log(`[Agent] Received print_job: ${envelope.type}`);
     onPrintJobCb?.(envelope);
     if (!isOnline) {
@@ -364,7 +371,13 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
       addToOfflineQueue(envelope);
       return;
     }
-    await handlePrintJob(envelope);
+    // Process concurrently — don't await, so simultaneous print jobs
+    // (e.g., cashier final bill + captain KOT) don't block each other.
+    // Each job targets a different printer (kitchen/bar/bill) so parallel
+    // printing is safe and eliminates the 10-second sequential delay.
+    handlePrintJob(envelope).catch(err => {
+      console.error(`[Agent] Concurrent print_job error [${envelope.type}]:`, err);
+    });
   });
 
   socket.on("disconnect", () => {
