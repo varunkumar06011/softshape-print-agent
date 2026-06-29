@@ -171,6 +171,36 @@ let onStatusChangeCb = null;
 let onPrintJobCb = null;
 let isOnline = false;
 
+// ── Printer status tracking ──────────────────────────────────────────────────
+// Updated by the UI when dropdown selections change. Used by handlePrintJob
+// to detect if the target printer is currently offline/unmapped and log a
+// warning + include the status in the print:ack so the backend knows.
+let printerStatus = { kitchen: "unknown", bar: "unknown", bill: "unknown" };
+
+/**
+ * Update printer status from the UI. Called when dropdowns change.
+ * @param {{ kitchen?: string, bar?: string, bill?: string }} status
+ */
+export function setPrinterStatus(status) {
+  printerStatus = { ...printerStatus, ...status };
+}
+
+/**
+ * Get the printer status for a given job type.
+ * @param {string} type — KOT, BAR_KOT, FINAL_BILL, CANCEL_KOT, TABLE_SWAP
+ * @returns {string} — "online" | "offline" | "unknown"
+ */
+function getPrinterStatusForType(type) {
+  if (type === "KOT" || type === "TABLE_SWAP") return printerStatus.kitchen || "unknown";
+  if (type === "BAR_KOT") return printerStatus.bar || "unknown";
+  if (type === "FINAL_BILL" || type === "BILL") return printerStatus.bill || "unknown";
+  if (type === "CANCEL_KOT" || type === "CANCEL_ORDER") {
+    // Cancel routing depends on item type — check both
+    return printerStatus.kitchen || printerStatus.bar || "unknown";
+  }
+  return "unknown";
+}
+
 // ── EventId dedup ────────────────────────────────────────────────────────────
 // Prevents double-printing when the agent reconnects: the backend re-delivers
 // buffered PENDING jobs via socket while the agent's own offline localStorage
@@ -417,6 +447,12 @@ export async function handlePrintJob(envelope) {
     return;
   }
 
+  // Warn if the target printer is marked offline in the UI
+  const statusForType = getPrinterStatusForType(type);
+  if (statusForType === "offline") {
+    console.warn(`[Agent] Printer for ${type} is marked offline in UI — attempting print anyway to ${targetPrinter}`);
+  }
+
   const escposData = data?.escposData;
   if (!escposData || (Array.isArray(escposData) && escposData.length === 0)) {
     console.warn(`[Agent] No ESC/POS data in job: ${type}`);
@@ -443,10 +479,20 @@ export async function handlePrintJob(envelope) {
     // Invoke Tauri Rust command
     const invoke = getTauriInvoke();
     if (invoke) {
-      await invoke("print_raw", {
-        printerName: targetPrinter,
-        bytes: Array.from(bytes),
-      });
+      // Detect network printer (IP:port format, e.g. "192.168.1.100:9100")
+      const netMatch = targetPrinter.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)$/);
+      if (netMatch) {
+        await invoke("print_network", {
+          ip: netMatch[1],
+          port: parseInt(netMatch[2], 10),
+          bytes: Array.from(bytes),
+        });
+      } else {
+        await invoke("print_raw", {
+          printerName: targetPrinter,
+          bytes: Array.from(bytes),
+        });
+      }
     } else {
       console.log(`[Agent] (dev mode) Would print [${type}] → ${targetPrinter} (${bytes.length} bytes)`);
     }
@@ -545,12 +591,33 @@ export function loadStoredSession() {
 }
 
 /**
- * Update printer mapping and persist to localStorage.
+ * Update printer mapping, persist to localStorage, and sync to backend.
  * @param {{ kitchen?: string, bar?: string, bill?: string }} mapping
  */
-export function updatePrinterMapping(mapping) {
+export async function updatePrinterMapping(mapping) {
   printerMapping = { ...printerMapping, ...mapping };
   localStorage.setItem("agent_printer_mapping", JSON.stringify(printerMapping));
+
+  // Sync to backend so printerConfig.agentMapping stays current
+  if (sessionToken && restaurantId) {
+    try {
+      await fetchWithRetry(
+        `${BACKEND_URL}/api/print/agent-update-mapping`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${sessionToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ printerMapping }),
+        },
+        { retries: 2, timeoutMs: 8000 },
+      );
+      console.log("[Agent] Printer mapping synced to backend");
+    } catch (err) {
+      console.warn("[Agent] Failed to sync mapping to backend (non-fatal):", err.message);
+    }
+  }
 }
 
 /**

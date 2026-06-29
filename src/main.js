@@ -15,6 +15,7 @@ import {
   startHeartbeat,
   loadStoredSession,
   updatePrinterMapping,
+  setPrinterStatus,
   getBackendUrl,
   checkBackendHealth,
 } from "./agentSocket.js";
@@ -165,6 +166,17 @@ async function populatePrinterDropdowns() {
 
 // ─── Event Handlers ─────────────────────────────────────────────────────
 
+// Update printer status when dropdowns change
+[kitchenSelect, barSelect, billSelect].forEach((sel) => {
+  sel.addEventListener("change", () => {
+    setPrinterStatus({
+      kitchen: kitchenSelect.value ? "online" : "offline",
+      bar: barSelect.value ? "online" : "offline",
+      bill: billSelect.value ? "online" : "offline",
+    });
+  });
+});
+
 connectBtn.addEventListener("click", () => attemptConnect());
 retryBtn?.addEventListener("click", () => attemptConnect());
 
@@ -193,21 +205,21 @@ async function attemptConnect() {
 
   try {
     setupError.textContent = "Registering…";
+    // Load any previously saved mapping from localStorage so we pass it to register AND connect
+    const stored = loadStoredSession();
+    const initialMapping = (stored && stored.mapping) ? stored.mapping : {};
+
     const data = await registerAgent({
       setupToken: token,
       restaurantCode: code,
       agentId: AGENT_ID,
-      printerMapping: {},
+      printerMapping: initialMapping,
       onAttempt: (attempt, total) => {
         if (attempt > 1) {
           setupError.textContent = `Retrying… (${attempt}/${total})`;
         }
       },
     });
-
-    // Load any previously saved mapping from localStorage so jobs route correctly
-    const stored = loadStoredSession();
-    const initialMapping = (stored && stored.mapping) ? stored.mapping : {};
 
     // Connect socket with the persisted mapping (not empty {})
     connectAgent({
@@ -296,7 +308,12 @@ saveMappingBtn.addEventListener("click", async () => {
     return;
   }
 
-  updatePrinterMapping(mapping);
+  await updatePrinterMapping(mapping);
+  setPrinterStatus({
+    kitchen: mapping.kitchen ? "online" : "offline",
+    bar: mapping.bar ? "online" : "offline",
+    bill: mapping.bill ? "online" : "offline",
+  });
   mappingMsg.textContent = "Saved! Sending test print…";
 
   // Send a test print via Tauri
@@ -366,6 +383,12 @@ if (stored) {
     if (stored.mapping.kitchen) kitchenSelect.value = stored.mapping.kitchen;
     if (stored.mapping.bar) barSelect.value = stored.mapping.bar;
     if (stored.mapping.bill) billSelect.value = stored.mapping.bill;
+    // Set initial printer status from restored mapping
+    setPrinterStatus({
+      kitchen: kitchenSelect.value ? "online" : "offline",
+      bar: barSelect.value ? "online" : "offline",
+      bill: billSelect.value ? "online" : "offline",
+    });
   });
   renderPrinterStatus({});
   renderJobs();
