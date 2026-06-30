@@ -11,7 +11,7 @@ env:
   # Backend URL baked into the bundle at build time. The agent throws on
   # startup if this is missing (see src/agentSocket.js). The print agent is a
   # standalone app and connects to its own backend, NOT softshape.in.
-  VITE_BACKEND_URL: https://softshape-backend.onrender.com
+  VITE_BACKEND_URL: https://softshape-backend-production.up.railway.app
 
 permissions:
   contents: write
