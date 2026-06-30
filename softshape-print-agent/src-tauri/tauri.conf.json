@@ -7,7 +7,7 @@
   },
   "package": {
     "productName": "SoftShape Print Agent",
-    "version": "4.0.0"
+    "version": "6.0.0"
   },
   "tauri": {
     "windows": [
@@ -26,7 +26,7 @@
         "request": true,
         "scope": [
           "http://localhost:3000",
-          "https://softshape-backend.onrender.com"
+          "https://softshape-backend-production.up.railway.app"
         ]
       }
     },
