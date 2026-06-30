@@ -1,13 +1,14 @@
 {
   "name": "softshape-print-agent",
-  "version": "5.1.0",
+  "version": "4.0.0",
   "description": "Windows Print Agent for SoftShape — silent ESC/POS printing via Socket.IO",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "tauri": "tauri",
-    "test": "vitest run"
+    "test": "vitest run",
+    "server": "node server.js"
   },
   "dependencies": {
     "socket.io-client": "^4.7.5"

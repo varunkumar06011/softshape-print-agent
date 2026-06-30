@@ -3,12 +3,11 @@
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
     "devPath": "http://localhost:1420",
-    "distDir": "../dist",
-    "withGlobalTauri": true
+    "distDir": "../dist"
   },
   "package": {
     "productName": "SoftShape Print Agent",
-    "version": "5.1.0"
+    "version": "4.0.0"
   },
   "tauri": {
     "windows": [
@@ -32,15 +31,7 @@
       }
     },
     "security": {
-      "csp": null
-    },
-    "updater": {
-      "active": true,
-      "endpoints": [
-        "https://softshape-backend.onrender.com/api/updates/print-agent/{{target}}/{{current_version}}"
-      ],
-      "dialog": true,
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQwRDQwOUM5NEExNzc2MDcKUldRSGRoZEt5UW5VUUI3R1hEUUNLNE5sZitnZVRaaXJURjhReWN3Qld6WFVzSTNDREcrcWRka0UK"
+      "csp": "default-src 'self'; connect-src 'self' http: https: ws: wss:; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;"
     },
     "bundle": {
       "identifier": "ai.softshape.print-agent",

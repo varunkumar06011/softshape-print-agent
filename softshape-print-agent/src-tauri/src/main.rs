@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(windows)]
 mod windows_printing;
-mod http_server;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PrinterInfo {
@@ -70,42 +69,12 @@ fn print_network(ip: String, port: u16, bytes: Vec<u8>) -> Result<(), String> {
     Ok(())
 }
 
-/// Get the app version.
-#[tauri::command]
-fn get_app_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
-}
-
-/// Check for updates using Tauri's built-in updater.
-#[tauri::command]
-async fn check_for_updates(app: tauri::AppHandle) -> Result<bool, String> {
-    let update = app.updater().check().await
-        .map_err(|e| format!("Update check failed: {}", e))?;
-    if update.is_update_available() {
-        update.download_and_install().await
-            .map_err(|e| format!("Update install failed: {}", e))?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
 fn main() {
     tauri::Builder::default()
-        .setup(|_app| {
-            // Spawn the local HTTP print server on 0.0.0.0:3100
-            // so cashier (localhost) and captain tablets (LAN) can reach it.
-            std::thread::spawn(|| {
-                http_server::start("0.0.0.0:3100");
-            });
-            Ok(())
-        })
         .invoke_handler(tauri::generate_handler![
             list_printers,
             print_raw,
-            print_network,
-            get_app_version,
-            check_for_updates
+            print_network
         ])
         .run(tauri::generate_context!())
         .expect("error while running SoftShape Print Agent");

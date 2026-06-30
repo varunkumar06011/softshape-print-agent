@@ -1,6 +1,6 @@
 [package]
 name = "softshape-print-agent"
-version = "5.1.0"
+version = "0.1.0"
 description = "Windows Print Agent for SoftShape"
 authors = ["SoftShape"]
 license = "MIT"
@@ -14,10 +14,9 @@ custom-protocol = ["tauri/custom-protocol"]
 tauri-build = { version = "1.5", features = [] }
 
 [dependencies]
-tauri = { version = "1.6", features = ["updater"] }
+tauri = { version = "1.6", features = [] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tiny_http = "0.12"
 
 # Windows printing
 [target.'cfg(windows)'.dependencies]
