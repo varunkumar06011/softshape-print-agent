@@ -14,7 +14,7 @@
 /// socket-based handlePrintJob in agentSocket.js.
 
 use std::collections::HashSet;
-use std::io::Read;
+use std::io::Write;
 use std::net::TcpStream;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -224,7 +224,7 @@ pub fn start(addr: &str) {
 
     println!("[PrintAgent:HTTP] Listening on http://{}", addr);
 
-    for request in server.incoming_requests() {
+    for mut request in server.incoming_requests() {
         let url = request.url().to_string();
         let method = request.method().clone();
 
@@ -262,7 +262,7 @@ pub fn start(addr: &str) {
         // Print endpoint
         if url == "/print" && method == Method::Post {
             let mut body = String::new();
-            let mut reader = request.as_reader();
+            let reader = request.as_reader();
             if let Err(e) = reader.read_to_string(&mut body) {
                 let resp = serde_json::json!({
                     "status": "failed",
