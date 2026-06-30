@@ -193,7 +193,7 @@ export function setPrinterStatus(status) {
 function getPrinterStatusForType(type) {
   if (type === "KOT" || type === "TABLE_SWAP") return printerStatus.kitchen || "unknown";
   if (type === "BAR_KOT") return printerStatus.bar || "unknown";
-  if (type === "FINAL_BILL" || type === "BILL") return printerStatus.bill || "unknown";
+  if (type === "FINAL_BILL" || type === "BILL" || type === "VOUCHER") return printerStatus.bill || "unknown";
   if (type === "CANCEL_KOT" || type === "CANCEL_ORDER") {
     // Cancel routing depends on item type — check both
     return printerStatus.kitchen || printerStatus.bar || "unknown";
@@ -427,7 +427,7 @@ export async function handlePrintJob(envelope) {
   if (!targetPrinter) {
     if (type === "KOT") targetPrinter = printerMapping.kitchen;
     else if (type === "BAR_KOT") targetPrinter = printerMapping.bar;
-    else if (type === "FINAL_BILL" || type === "BILL") targetPrinter = printerMapping.bill;
+    else if (type === "FINAL_BILL" || type === "BILL" || type === "VOUCHER") targetPrinter = printerMapping.bill;
     else if (type === "CANCEL_KOT" || type === "CANCEL_ORDER") {
       // Route cancel slips to the correct printer based on the cancelled item's type
       const cancelItem = data?.item || data?.items?.[0];
