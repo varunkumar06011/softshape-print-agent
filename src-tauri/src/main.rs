@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(windows)]
 mod windows_printing;
+mod http_server;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PrinterInfo {
@@ -91,6 +92,14 @@ async fn check_for_updates(app: tauri::AppHandle) -> Result<bool, String> {
 
 fn main() {
     tauri::Builder::default()
+        .setup(|_app| {
+            // Spawn the local HTTP print server on 0.0.0.0:3100
+            // so cashier (localhost) and captain tablets (LAN) can reach it.
+            std::thread::spawn(|| {
+                http_server::start("0.0.0.0:3100");
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_printers,
             print_raw,
