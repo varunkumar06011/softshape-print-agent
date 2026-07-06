@@ -47,6 +47,10 @@ const AGENT_ID = getOrCreateAgentId();
 const recentJobsList = [];
 const MAX_JOBS_DISPLAY = 20;
 
+// Full list of system printers from Tauri list_printers — sent to backend
+// so the admin panel can show all available printer names for KOT destination.
+let systemPrinterList = [];
+
 function getOrCreateAgentId() {
   let id = localStorage.getItem("agent_id");
   if (!id) {
@@ -151,6 +155,9 @@ async function populatePrinterDropdowns() {
     }
   }
 
+  // Store the full printer list globally so it can be sent to the backend
+  systemPrinterList = printers.map(p => (typeof p === "string" ? p : p.name)).filter(Boolean);
+
   for (const select of [kitchenSelect, barSelect, billSelect]) {
     select.innerHTML = `<option value="">${placeholder}</option>`;
     for (const printer of printers) {
@@ -214,6 +221,7 @@ async function attemptConnect() {
       restaurantCode: code,
       agentId: AGENT_ID,
       printerMapping: initialMapping,
+      availablePrinters: systemPrinterList,
       onAttempt: (attempt, total) => {
         if (attempt > 1) {
           setupError.textContent = `Retrying… (${attempt}/${total})`;
@@ -245,6 +253,7 @@ async function attemptConnect() {
       kitchen: kitchenSelect.value ? "online" : "offline",
       bar: barSelect.value ? "online" : "offline",
       bill: billSelect.value ? "online" : "offline",
+      availablePrinters: systemPrinterList,
     }));
 
     showConnected(data.restaurantName);
@@ -392,6 +401,7 @@ if (stored) {
     kitchen: kitchenSelect.value ? "online" : "offline",
     bar: barSelect.value ? "online" : "offline",
     bill: billSelect.value ? "online" : "offline",
+    availablePrinters: systemPrinterList,
   }));
 
   showConnected(stored.name);

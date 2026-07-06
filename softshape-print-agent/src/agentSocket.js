@@ -329,32 +329,38 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
 /**
  * Route a print_job envelope to the correct physical printer.
  *
- * Job types: KOT | BAR_KOT | FINAL_BILL | CANCEL_KOT | CANCEL_ORDER | TABLE_SWAP
+ * Job types: KOT | BAR_KOT | FINAL_BILL | CANCELLED_BILL | CANCEL_KOT | CANCEL_ORDER | TABLE_SWAP
  * ESC/POS bytes are in envelope.data.escposData (pre-built by backend).
  */
 export async function handlePrintJob(envelope) {
   const { type, data } = envelope;
 
-  // Prefer explicit printerName from backend, then fall back to mapping by job type
-  let targetPrinter = data?.printerName || null;
-  if (!targetPrinter) {
-    if (type === "KOT") targetPrinter = printerMapping.kitchen;
-    else if (type === "BAR_KOT") targetPrinter = printerMapping.bar;
-    else if (type === "FINAL_BILL" || type === "BILL") targetPrinter = printerMapping.bill;
-    else if (type === "CANCEL_KOT" || type === "CANCEL_ORDER")
-      targetPrinter = printerMapping.kitchen;
-    else if (type === "TABLE_SWAP") targetPrinter = printerMapping.kitchen;
-    else {
-      console.warn(`[Agent] Unknown job type: ${type}`);
-      socket?.emit("print:ack", {
-        restaurantId,
-        eventId: envelope.eventId,
-        requestId: data?.requestId,
-        status: "failed",
-        error: `Unknown job type: ${type}`,
-      });
-      return;
-    }
+  // Prefer local printerMapping over backend-sent printerName.
+  // The local mapping is configured on this machine and knows the actual printer names.
+  // The backend's printerName comes from admin config and may not match the local printer.
+  let targetPrinter = null;
+  if (type === "KOT") targetPrinter = printerMapping.kitchen;
+  else if (type === "BAR_KOT") targetPrinter = printerMapping.bar;
+  else if (type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "BILL") targetPrinter = printerMapping.bill;
+  else if (type === "CANCEL_KOT" || type === "CANCEL_ORDER")
+    targetPrinter = printerMapping.kitchen;
+  else if (type === "TABLE_SWAP") targetPrinter = printerMapping.kitchen;
+
+  // Fall back to backend-sent printerName if no local mapping is set
+  if (!targetPrinter && data?.printerName) {
+    targetPrinter = data.printerName;
+  }
+
+  if (!targetPrinter && type !== "KOT" && type !== "BAR_KOT" && type !== "FINAL_BILL" && type !== "CANCELLED_BILL" && type !== "BILL" && type !== "CANCEL_KOT" && type !== "CANCEL_ORDER" && type !== "TABLE_SWAP") {
+    console.warn(`[Agent] Unknown job type: ${type}`);
+    socket?.emit("print:ack", {
+      restaurantId,
+      eventId: envelope.eventId,
+      requestId: data?.requestId,
+      status: "failed",
+      error: `Unknown job type: ${type}`,
+    });
+    return;
   }
 
   if (!targetPrinter) {

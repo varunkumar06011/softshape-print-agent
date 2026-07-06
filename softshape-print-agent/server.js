@@ -19,18 +19,65 @@ import { URL } from 'url';
 
 const PORT = process.env.PORT || 3100;
 
+function getTauriInvoke() {
+  const t = typeof window !== 'undefined' ? window.__TAURI__ : null;
+  if (!t) return null;
+  if (typeof t.invoke === 'function') return t.invoke.bind(t);
+  if (t.tauri && typeof t.tauri.invoke === 'function') return t.tauri.invoke.bind(t.tauri);
+  return null;
+}
+
 async function handlePrintJob(body) {
-  const { jobType, printerName, text, bytes, data } = body || {};
-  if (!jobType || (!text && !Array.isArray(bytes))) {
-    return { ok: false, error: 'Missing jobType or print payload' };
+  const { jobType, type, printerName, text, bytes, escposData, data } = body || {};
+  const effectiveType = type || jobType;
+
+  if (!effectiveType) {
+    return { ok: false, error: 'Missing jobType or type' };
   }
 
-  // TODO: wire this to the actual printer driver (Tauri command, node-escpos,
-  // or raw network printer). For now we accept the job and return success so
-  // the Cashier app can complete the offline print flow.
-  console.log('[PrintAgent:HTTP] Print job received:', { jobType, printerName, textLength: text?.length, bytesLength: bytes?.length });
+  let rawBytes;
+  if (escposData && Array.isArray(escposData) && escposData.length > 0) {
+    const rawString = escposData.map((d) => d.data || '').join('');
+    rawBytes = Array.from(new TextEncoder().encode(rawString));
+  } else if (Array.isArray(bytes) && bytes.length > 0) {
+    rawBytes = bytes;
+  } else if (text) {
+    rawBytes = Array.from(new TextEncoder().encode(text));
+  } else {
+    return { ok: false, error: 'Missing print payload (escposData, bytes, or text required)' };
+  }
 
-  return { ok: true, queued: true, message: 'Print job accepted by Print Agent' };
+  const targetPrinter = printerName || data?.printerName;
+  if (!targetPrinter) {
+    return { ok: false, error: 'Missing printerName' };
+  }
+
+  const invoke = getTauriInvoke();
+  if (invoke) {
+    try {
+      const netMatch = targetPrinter.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)$/);
+      if (netMatch) {
+        await invoke('print_network', {
+          ip: netMatch[1],
+          port: parseInt(netMatch[2], 10),
+          bytes: rawBytes,
+        });
+      } else {
+        await invoke('print_raw', {
+          printerName: targetPrinter,
+          bytes: rawBytes,
+        });
+      }
+      console.log(`[PrintAgent:HTTP] Printed [${effectiveType}] → ${targetPrinter} (${rawBytes.length} bytes)`);
+      return { ok: true, queued: false, message: 'Printed' };
+    } catch (err) {
+      console.error(`[PrintAgent:HTTP] Print failed [${effectiveType}] → ${targetPrinter}:`, err);
+      return { ok: false, error: err?.message || String(err) };
+    }
+  }
+
+  console.log(`[PrintAgent:HTTP] No Tauri available, accepted [${effectiveType}] (${rawBytes.length} bytes)`);
+  return { ok: true, queued: true, message: 'Print job accepted (no Tauri)' };
 }
 
 const server = http.createServer(async (req, res) => {
