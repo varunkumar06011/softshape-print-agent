@@ -329,7 +329,7 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
 /**
  * Route a print_job envelope to the correct physical printer.
  *
- * Job types: KOT | BAR_KOT | FINAL_BILL | CANCELLED_BILL | CANCEL_KOT | CANCEL_ORDER | TABLE_SWAP
+ * Job types: KOT | BAR_KOT | FINAL_BILL | CANCELLED_BILL | BILL | EXPENDITURE | CANCEL_KOT | CANCEL_ORDER | TABLE_SWAP
  * ESC/POS bytes are in envelope.data.escposData (pre-built by backend).
  */
 export async function handlePrintJob(envelope) {
@@ -341,7 +341,7 @@ export async function handlePrintJob(envelope) {
   let targetPrinter = null;
   if (type === "KOT") targetPrinter = printerMapping.kitchen;
   else if (type === "BAR_KOT") targetPrinter = printerMapping.bar;
-  else if (type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "BILL") targetPrinter = printerMapping.bill;
+  else if (type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "BILL" || type === "EXPENDITURE") targetPrinter = printerMapping.bill;
   else if (type === "CANCEL_KOT" || type === "CANCEL_ORDER")
     targetPrinter = printerMapping.kitchen;
   else if (type === "TABLE_SWAP") targetPrinter = printerMapping.kitchen;
@@ -351,7 +351,7 @@ export async function handlePrintJob(envelope) {
     targetPrinter = data.printerName;
   }
 
-  if (!targetPrinter && type !== "KOT" && type !== "BAR_KOT" && type !== "FINAL_BILL" && type !== "CANCELLED_BILL" && type !== "BILL" && type !== "CANCEL_KOT" && type !== "CANCEL_ORDER" && type !== "TABLE_SWAP") {
+  if (!targetPrinter && type !== "KOT" && type !== "BAR_KOT" && type !== "FINAL_BILL" && type !== "CANCELLED_BILL" && type !== "BILL" && type !== "EXPENDITURE" && type !== "CANCEL_KOT" && type !== "CANCEL_ORDER" && type !== "TABLE_SWAP") {
     console.warn(`[Agent] Unknown job type: ${type}`);
     socket?.emit("print:ack", {
       restaurantId,
