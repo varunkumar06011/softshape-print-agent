@@ -31,6 +31,38 @@ function getTauriInvoke() {
 }
 
 /**
+ * Detect the local LAN IP address of this machine.
+ * Uses WebRTC ICE candidate gathering (no STUN server needed for LAN IP).
+ * Returns null if detection fails.
+ */
+let _cachedLanIp = null;
+async function getLanIp() {
+  if (_cachedLanIp) return _cachedLanIp;
+  try {
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    pc.createDataChannel('');
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    const ip = await new Promise((resolve) => {
+      const timeout = setTimeout(() => { resolve(null); pc.close(); }, 2000);
+      pc.onicecandidate = (e) => {
+        if (!e.candidate) { clearTimeout(timeout); resolve(null); pc.close(); return; }
+        const match = e.candidate.candidate.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/);
+        if (match && match[1] && !match[1].startsWith('0.') && match[1] !== '127.0.0.1') {
+          clearTimeout(timeout);
+          resolve(match[1]);
+          pc.close();
+        }
+      };
+    });
+    _cachedLanIp = ip;
+    return ip;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Typed fetch error used by fetchWithRetry so callers can distinguish
  * timeout, network, 4xx, 5xx, and parse failures without string parsing.
  */
@@ -187,13 +219,13 @@ export function setPrinterStatus(status) {
 
 /**
  * Get the printer status for a given job type.
- * @param {string} type — KOT, BAR_KOT, FINAL_BILL, CANCEL_KOT, TABLE_SWAP
+ * @param {string} type — KOT, BAR_KOT, FINAL_BILL, CANCELLED_BILL, CANCEL_KOT, TABLE_SWAP
  * @returns {string} — "online" | "offline" | "unknown"
  */
 function getPrinterStatusForType(type) {
   if (type === "KOT" || type === "TABLE_SWAP") return printerStatus.kitchen || "unknown";
   if (type === "BAR_KOT") return printerStatus.bar || "unknown";
-  if (type === "FINAL_BILL" || type === "BILL" || type === "VOUCHER" || type === "EXPENDITURE") return printerStatus.bill || "unknown";
+  if (type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "BILL" || type === "VOUCHER" || type === "EXPENDITURE") return printerStatus.bill || "unknown";
   if (type === "CANCEL_KOT" || type === "CANCEL_ORDER") {
     // Cancel routing depends on item type — check both
     return printerStatus.kitchen || printerStatus.bar || "unknown";
@@ -291,10 +323,14 @@ export async function registerAgent({
   agentId,
   restaurantCode,
   printerMapping: mapping,
+  availablePrinters,
   onAttempt,
 }) {
   const body = { agentId, printerMapping: mapping || {} };
   if (restaurantCode) body.restaurantCode = restaurantCode;
+  if (availablePrinters) body.availablePrinters = availablePrinters;
+  const lanIp = await getLanIp();
+  if (lanIp) body.lanIp = lanIp;
 
   const res = await fetchWithRetry(
     `${BACKEND_URL}/api/print/agent-register`,
@@ -427,25 +463,31 @@ export async function handlePrintJob(envelope) {
   if (!targetPrinter) {
     if (type === "KOT") targetPrinter = printerMapping.kitchen;
     else if (type === "BAR_KOT") targetPrinter = printerMapping.bar;
-    else if (type === "FINAL_BILL" || type === "BILL" || type === "VOUCHER" || type === "EXPENDITURE") targetPrinter = printerMapping.bill;
+    else if (type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "BILL" || type === "VOUCHER" || type === "EXPENDITURE") targetPrinter = printerMapping.bill;
     else if (type === "CANCEL_KOT" || type === "CANCEL_ORDER") {
       // Route cancel slips to the correct printer based on the cancelled item's type
       const cancelItem = data?.item || data?.items?.[0];
       const isLiquor = cancelItem?.menuType === "BAR" || cancelItem?.menuType === "LIQUOR";
       targetPrinter = isLiquor ? printerMapping.bar : printerMapping.kitchen;
     }
-    else if (type === "TABLE_SWAP") targetPrinter = printerMapping.kitchen;
-    else {
-      console.warn(`[Agent] Unknown job type: ${type}`);
-      socket?.emit("print:ack", {
-        restaurantId,
-        eventId: envelope.eventId,
-        requestId: data?.requestId,
-        status: "failed",
-        error: `Unknown job type: ${type}`,
-      });
-      return;
-    }
+  }
+  else if (type === "TABLE_SWAP") targetPrinter = printerMapping.kitchen;
+
+  // Fall back to backend-sent printerName if no local mapping is set
+  if (!targetPrinter && data?.printerName) {
+    targetPrinter = data.printerName;
+  }
+
+  if (!targetPrinter && type !== "KOT" && type !== "BAR_KOT" && type !== "FINAL_BILL" && type !== "CANCELLED_BILL" && type !== "BILL" && type !== "VOUCHER" && type !== "EXPENDITURE" && type !== "CANCEL_KOT" && type !== "CANCEL_ORDER" && type !== "TABLE_SWAP") {
+    console.warn(`[Agent] Unknown job type: ${type}`);
+    socket?.emit("print:ack", {
+      restaurantId,
+      eventId: envelope.eventId,
+      requestId: data?.requestId,
+      status: "failed",
+      error: `Unknown job type: ${type}`,
+    });
+    return;
   }
 
   if (!targetPrinter) {
@@ -541,14 +583,19 @@ export function startHeartbeat(getPrinterStatus) {
   heartbeatInterval = setInterval(async () => {
     if (!sessionToken) return;
     try {
-      const printerStatus = getPrinterStatus ? await getPrinterStatus() : {};
+      const status = getPrinterStatus ? await getPrinterStatus() : {};
+      const { availablePrinters, ...printerStatus } = status;
+      const body = { printerStatus };
+      if (availablePrinters) body.availablePrinters = availablePrinters;
+      const lanIp = await getLanIp();
+      if (lanIp) body.lanIp = lanIp;
       await fetch(`${BACKEND_URL}/api/print/agent-heartbeat`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${sessionToken}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ printerStatus }),
+        body: JSON.stringify(body),
       });
     } catch {
       /* ignore heartbeat failures */
@@ -607,13 +654,15 @@ export function loadStoredSession() {
  * Update printer mapping, persist to localStorage, and sync to backend.
  * @param {{ kitchen?: string, bar?: string, bill?: string }} mapping
  */
-export async function updatePrinterMapping(mapping) {
+export async function updatePrinterMapping(mapping, availablePrinters) {
   printerMapping = { ...printerMapping, ...mapping };
   localStorage.setItem("agent_printer_mapping", JSON.stringify(printerMapping));
 
   // Sync to backend so printerConfig.agentMapping stays current
   if (sessionToken && restaurantId) {
     try {
+      const body = { printerMapping };
+      if (availablePrinters) body.availablePrinters = availablePrinters;
       await fetchWithRetry(
         `${BACKEND_URL}/api/print/agent-update-mapping`,
         {
@@ -622,7 +671,7 @@ export async function updatePrinterMapping(mapping) {
             Authorization: `Bearer ${sessionToken}`,
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ printerMapping }),
+          body: JSON.stringify(body),
         },
         { retries: 2, timeoutMs: 8000 },
       );
