@@ -4,10 +4,29 @@
 )]
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 #[cfg(windows)]
 mod windows_printing;
 mod http_server;
+
+// Shared printer mapping: role -> printer name. Updated by the frontend UI
+// and read by the local HTTP server to resolve empty printerName requests.
+static PRINTER_MAPPING: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+pub fn get_printer_mapping() -> Option<HashMap<String, String>> {
+    PRINTER_MAPPING.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn resolve_printer_by_type(mapping: &HashMap<String, String>, job_type: &str) -> Option<String> {
+    match job_type {
+        "KOT" | "CANCEL_KOT" | "CANCEL_ORDER" | "TABLE_SWAP" => mapping.get("kitchen").cloned(),
+        "BAR_KOT" => mapping.get("bar").cloned(),
+        "FINAL_BILL" | "BILL" | "VOUCHER" | "EXPENDITURE" => mapping.get("bill").cloned(),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PrinterInfo {
@@ -76,6 +95,20 @@ fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// Save the printer mapping to shared state so the HTTP server can use it.
+#[tauri::command]
+fn save_printer_mapping(mapping: HashMap<String, String>) -> Result<(), String> {
+    let mut guard = PRINTER_MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(mapping);
+    Ok(())
+}
+
+/// Load the current printer mapping from shared state.
+#[tauri::command]
+fn load_printer_mapping() -> Option<HashMap<String, String>> {
+    get_printer_mapping()
+}
+
 /// Check for updates using Tauri's built-in updater.
 #[tauri::command]
 async fn check_for_updates(app: tauri::AppHandle) -> Result<bool, String> {
@@ -105,6 +138,8 @@ fn main() {
             print_raw,
             print_network,
             get_app_version,
+            save_printer_mapping,
+            load_printer_mapping,
             check_for_updates
         ])
         .run(tauri::generate_context!())

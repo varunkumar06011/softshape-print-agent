@@ -309,6 +309,15 @@ saveMappingBtn.addEventListener("click", async () => {
   }
 
   await updatePrinterMapping(mapping);
+  // Push mapping to the local HTTP server so it can resolve empty printerName
+  const invoke = getTauriInvoke();
+  if (invoke) {
+    try {
+      await invoke("save_printer_mapping", { mapping });
+    } catch (err) {
+      console.warn("[Agent] Failed to push mapping to HTTP server:", err);
+    }
+  }
   setPrinterStatus({
     kitchen: mapping.kitchen ? "online" : "offline",
     bar: mapping.bar ? "online" : "offline",
@@ -317,7 +326,6 @@ saveMappingBtn.addEventListener("click", async () => {
   mappingMsg.textContent = "Saved! Sending test print…";
 
   // Send a test print via Tauri
-  const invoke = getTauriInvoke();
   if (invoke) {
     for (const [type, printerName] of Object.entries(mapping)) {
       if (!printerName) continue;
@@ -353,6 +361,15 @@ disconnectBtn.addEventListener("click", () => {
 
 const stored = loadStoredSession();
 if (stored) {
+  // Push stored mapping to the HTTP server so offline jobs can resolve it
+  if (stored.mapping && Object.keys(stored.mapping).length > 0) {
+    const invoke = getTauriInvoke();
+    if (invoke) {
+      invoke("save_printer_mapping", { mapping: stored.mapping }).catch(err => {
+        console.warn("[Agent] Failed to push stored mapping to HTTP server:", err);
+      });
+    }
+  }
   connectAgent({
     token: stored.token,
     rid: stored.rid,

@@ -140,9 +140,18 @@ fn handle_print_request(body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     };
 
     let event_id = payload.get("eventId").and_then(|v| v.as_str()).unwrap_or("");
-    let printer_name = payload.get("printerName").and_then(|v| v.as_str()).unwrap_or("");
+    let mut printer_name = payload.get("printerName").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let job_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let escpos_data = payload.get("escposData").unwrap_or(&serde_json::Value::Null);
+
+    // Fallback to the Print Agent's own mapping when the frontend has no local mapping
+    if printer_name.is_empty() {
+        if let Some(mapping) = crate::get_printer_mapping() {
+            if let Some(name) = crate::resolve_printer_by_type(&mapping, job_type) {
+                printer_name = name;
+            }
+        }
+    }
 
     // Dedup check
     if !event_id.is_empty() && is_event_id_seen(event_id) {
