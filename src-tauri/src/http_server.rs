@@ -194,7 +194,7 @@ fn handle_print_request(body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     };
 
     // Route to printer
-    match route_print(printer_name, &bytes) {
+    match route_print(&printer_name, &bytes) {
         Ok(()) => {
             let resp = serde_json::json!({
                 "status": "success",
