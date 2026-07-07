@@ -179,17 +179,49 @@ fn handle_print_request(body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
             .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
     }
 
-    // Extract ESC/POS bytes
+    // Extract ESC/POS bytes — try escposData first, then fall back to text/bytes fields
     let bytes = match extract_escpos_bytes(escpos_data) {
         Some(b) => b,
         None => {
-            let resp = serde_json::json!({
-                "status": "failed",
-                "error": "No ESC/POS data in job"
-            });
-            return Response::from_string(resp.to_string())
-                .with_status_code(400)
-                .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+            // Fallback 1: "bytes" field (array of numbers)
+            if let Some(bytes_arr) = payload.get("bytes").and_then(|v| v.as_array()) {
+                let raw: Vec<u8> = bytes_arr.iter()
+                    .filter_map(|n| n.as_u64().map(|v| v as u8))
+                    .collect();
+                if !raw.is_empty() {
+                    raw
+                } else {
+                    let resp = serde_json::json!({
+                        "status": "failed",
+                        "error": "No ESC/POS data in job"
+                    });
+                    return Response::from_string(resp.to_string())
+                        .with_status_code(400)
+                        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+                }
+            }
+            // Fallback 2: "text" field (plain text encoded as UTF-8 bytes)
+            else if let Some(text) = payload.get("text").and_then(|v| v.as_str()) {
+                if !text.is_empty() {
+                    text.as_bytes().to_vec()
+                } else {
+                    let resp = serde_json::json!({
+                        "status": "failed",
+                        "error": "No ESC/POS data in job"
+                    });
+                    return Response::from_string(resp.to_string())
+                        .with_status_code(400)
+                        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+                }
+            } else {
+                let resp = serde_json::json!({
+                    "status": "failed",
+                    "error": "No ESC/POS data in job"
+                });
+                return Response::from_string(resp.to_string())
+                    .with_status_code(400)
+                    .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+            }
         }
     };
 
