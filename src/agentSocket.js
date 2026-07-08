@@ -236,18 +236,26 @@ function getPrinterStatusForType(type) {
 // ── EventId dedup ────────────────────────────────────────────────────────────
 // Prevents double-printing when the agent reconnects: the backend re-delivers
 // buffered PENDING jobs via socket while the agent's own offline localStorage
-// queue may also hold the same job.  We track seen eventIds in a bounded Set
-// so duplicates are skipped and a success ack is sent immediately.
-const SEEN_EVENT_IDS_MAX = 500;
-const seenEventIds = new Set();
-
-function markEventIdSeen(id) {
-  if (seenEventIds.size >= SEEN_EVENT_IDS_MAX) {
-    // Evict oldest entry (first inserted) to keep the Set bounded
-    const first = seenEventIds.values().next().value;
-    if (first) seenEventIds.delete(first);
+// queue may also hold the same job.  We use the shared Rust dedup state from
+// the HTTP server so both socket and HTTP paths share the same dedup set.
+async function isEventIdSeen(id) {
+  const invoke = getTauriInvoke();
+  if (!invoke) return false;
+  try {
+    return await invoke("is_event_id_seen", { eventId: id });
+  } catch {
+    return false;
   }
-  seenEventIds.add(id);
+}
+
+async function markEventIdSeen(id) {
+  const invoke = getTauriInvoke();
+  if (!invoke) return;
+  try {
+    await invoke("mark_event_id_seen", { eventId: id });
+  } catch {
+    // Ignore failures - dedup is best-effort
+  }
 }
 
 // ── Offline print queue (localStorage-based for the print agent) ─────────────
@@ -446,7 +454,7 @@ export async function handlePrintJob(envelope) {
   // On reconnect the backend re-delivers buffered PENDING jobs and the agent's
   // own offline queue may also contain the same job.  This guard ensures each
   // job is printed exactly once.
-  if (envelope.eventId && seenEventIds.has(envelope.eventId)) {
+  if (envelope.eventId && await isEventIdSeen(envelope.eventId)) {
     console.log(`[Agent] Duplicate eventId skipped: ${envelope.eventId}`);
     socket?.emit("print:ack", {
       restaurantId,
@@ -456,7 +464,7 @@ export async function handlePrintJob(envelope) {
     });
     return;
   }
-  if (envelope.eventId) markEventIdSeen(envelope.eventId);
+  if (envelope.eventId) await markEventIdSeen(envelope.eventId);
 
   // Prefer explicit printerName from backend, then fall back to mapping by job type
   let targetPrinter = data?.printerName || null;

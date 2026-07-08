@@ -25,7 +25,7 @@ const SEEN_EVENT_IDS_MAX: usize = 500;
 
 static SEEN_EVENT_IDS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
-fn mark_event_id_seen(id: &str) {
+pub fn mark_event_id_seen(id: &str) {
     let mut guard = SEEN_EVENT_IDS.lock().unwrap();
     let set = guard.get_or_insert_with(|| HashSet::with_capacity(SEEN_EVENT_IDS_MAX));
     if set.len() >= SEEN_EVENT_IDS_MAX {
@@ -38,7 +38,7 @@ fn mark_event_id_seen(id: &str) {
     set.insert(id.to_string());
 }
 
-fn is_event_id_seen(id: &str) -> bool {
+pub fn is_event_id_seen(id: &str) -> bool {
     let guard = SEEN_EVENT_IDS.lock().unwrap();
     guard.as_ref().map_or(false, |set| set.contains(id))
 }

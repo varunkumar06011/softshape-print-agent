@@ -123,6 +123,20 @@ async fn check_for_updates(app: tauri::AppHandle) -> Result<bool, String> {
     }
 }
 
+/// Check if an eventId has already been seen (for deduplication).
+/// This shares the same dedup state as the HTTP server to prevent double printing.
+#[tauri::command]
+fn is_event_id_seen(event_id: String) -> bool {
+    http_server::is_event_id_seen(&event_id)
+}
+
+/// Mark an eventId as seen (for deduplication).
+/// This shares the same dedup state as the HTTP server to prevent double printing.
+#[tauri::command]
+fn mark_event_id_seen(event_id: String) {
+    http_server::mark_event_id_seen(&event_id);
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|_app| {
@@ -140,7 +154,9 @@ fn main() {
             get_app_version,
             save_printer_mapping,
             load_printer_mapping,
-            check_for_updates
+            check_for_updates,
+            is_event_id_seen,
+            mark_event_id_seen
         ])
         .run(tauri::generate_context!())
         .expect("error while running SoftShape Print Agent");
