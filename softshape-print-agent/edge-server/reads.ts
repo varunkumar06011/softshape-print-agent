@@ -1,0 +1,541 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// reads.ts — Local read endpoints for captain/cashier apps
+// ─────────────────────────────────────────────────────────────────────────────
+// Reads from local SQLite — zero network round-trips.
+// Response shapes match the cloud backend's Prisma responses so the captain
+// app can swap between edge and cloud seamlessly.
+//
+// Endpoints:
+//   GET /api/edge/tables    — sections with nested tables + active orders + KOTs
+//   GET /api/edge/tables/flat — flat list of all tables
+//   GET /api/edge/sections  — sections with venue + floor info
+//   GET /api/edge/menu      — menu items with categories, variants, venue prices
+//   GET /api/edge/menu/items — lean flat list for POS
+//   GET /api/edge/venues    — venues with floors and sections
+//   GET /api/edge/outlet    — outlet settings (receipt header, GST, etc.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { getDb } from "./db.ts";
+import { getRestaurantId } from "./auth.ts";
+
+const ACTIVE_ORDER_STATUSES = ["PENDING", "CONFIRMED", "PREPARING", "READY", "BILLING_REQUESTED"];
+
+// ─── GET /api/edge/tables — sections with nested tables (matches cloud shape) ─
+
+export function getTablesForRestaurant(): any[] {
+  const restaurantId = getRestaurantId();
+  if (!restaurantId) return [];
+
+  const db = getDb();
+
+  // Get sections
+  const sections = db.query(`
+    SELECT s.*, v.name as venue_name, v.venue_type, v.kot_enabled,
+           f.name as floor_name
+    FROM section s
+    LEFT JOIN venue v ON s.venue_id = v.id
+    LEFT JOIN floor f ON s.floor_id = f.id
+    WHERE s.restaurant_id = ?
+    ORDER BY s.sort_order ASC, s.name ASC
+  `).all(restaurantId) as any[];
+
+  return sections.map((section) => {
+    // Get tables for this section
+    const tables = db.query(`
+      SELECT t.*,
+             (SELECT COUNT(*) FROM order_record o WHERE o.table_id = t.id AND o.status IN (${ACTIVE_ORDER_STATUSES.map(() => "?").join(",")}) AND o.is_deleted = 0) as active_order_count
+      FROM table t
+      WHERE t.section_id = ? AND t.restaurant_id = ?
+      ORDER BY t.number ASC
+    `).all(...ACTIVE_ORDER_STATUSES, section.id, restaurantId) as any[];
+
+    const mappedTables = tables.map((t) => mapTableRow(t));
+
+    return {
+      id: section.id,
+      name: section.name,
+      restaurantId: section.restaurant_id,
+      floorId: section.floor_id,
+      venueId: section.venue_id,
+      sortOrder: section.sort_order,
+      venue: section.venue_id ? {
+        id: section.venue_id,
+        name: section.venue_name,
+        venueType: section.venue_type,
+        kotEnabled: !!section.kot_enabled,
+      } : undefined,
+      floor: section.floor_id ? {
+        id: section.floor_id,
+        name: section.floor_name,
+      } : undefined,
+      tables: mappedTables,
+    };
+  });
+}
+
+// ─── GET /api/edge/tables/flat — flat list of all tables ─────────────────────
+
+export function getTablesFlat(): any[] {
+  const restaurantId = getRestaurantId();
+  if (!restaurantId) return [];
+
+  const db = getDb();
+
+  const tables = db.query(`
+    SELECT t.*, s.name as section_name, s.venue_id,
+           v.name as venue_name, v.venue_type, v.kot_enabled
+    FROM table t
+    LEFT JOIN section s ON t.section_id = s.id
+    LEFT JOIN venue v ON s.venue_id = v.id
+    WHERE t.restaurant_id = ?
+    ORDER BY s.name ASC, t.number ASC
+  `).all(restaurantId) as any[];
+
+  return tables.map((t) => mapTableRow(t));
+}
+
+// ─── Helper: Map a SQLite table row to the cloud response shape ───────────────
+
+function mapTableRow(t: any): any {
+  const db = getDb();
+
+  // Get active orders for this table
+  const activeOrders = db.query(`
+    SELECT o.* FROM order_record o
+    WHERE o.table_id = ? AND o.status IN (${ACTIVE_ORDER_STATUSES.map(() => "?").join(",")}) AND o.is_deleted = 0
+    ORDER BY o.updated_at DESC LIMIT 1
+  `).all(t.id, ...ACTIVE_ORDER_STATUSES) as any[];
+
+  let orders: any[] = [];
+  if (activeOrders.length > 0) {
+    const order = activeOrders[0];
+    const items = db.query(`
+      SELECT oi.*, m.gst_enabled, m.menu_type as mi_menu_type
+      FROM order_item oi
+      LEFT JOIN menu_item m ON oi.menu_item_id = m.id
+      WHERE oi.order_id = ? AND oi.removed_from_bill = 0 AND oi.quantity > 0
+      ORDER BY oi.id ASC
+    `).all(order.id) as any[];
+
+    orders = [{
+      id: order.id,
+      tableId: order.table_id,
+      restaurantId: order.restaurant_id,
+      status: order.status,
+      totalAmount: Number(order.total_amount),
+      captainId: order.captain_id,
+      platform: order.platform,
+      createdAt: new Date(order.created_at).toISOString(),
+      updatedAt: new Date(order.updated_at).toISOString(),
+      items: items.map((i) => ({
+        id: i.id,
+        orderId: i.order_id,
+        menuItemId: i.menu_item_id,
+        name: i.name,
+        price: Number(i.price),
+        quantity: i.quantity,
+        notes: i.notes,
+        menuType: i.menu_type,
+        cancelledQuantity: i.cancelled_quantity || 0,
+        removedFromBill: !!i.removed_from_bill,
+        menuItem: {
+          gstEnabled: !!i.gst_enabled,
+          menuType: i.mi_menu_type || i.menu_type,
+        },
+      })),
+    }];
+  }
+
+  // Get KOTs for this table
+  const kots = db.query(`
+    SELECT k.*, ki.id as ki_id, ki.order_item_id, ki.menu_item_id as ki_menu_item_id,
+           ki.name as ki_name, ki.quantity as ki_quantity, ki.price as ki_price,
+           ki.notes as ki_notes, ki.status as ki_status
+    FROM kot k
+    LEFT JOIN kot_item ki ON k.id = ki.kot_id
+    WHERE k.table_id = ?
+    ORDER BY k.created_at ASC, ki.id ASC
+  `).all(t.id) as any[];
+
+  // Group KOT items by KOT
+  const kotsMap = new Map<string, any>();
+  for (const row of kots) {
+    if (!kotsMap.has(row.id)) {
+      kotsMap.set(row.id, {
+        id: row.id,
+        restaurantId: row.restaurant_id,
+        tableId: row.table_id,
+        orderId: row.order_id,
+        kotNumber: row.kot_number,
+        createdAt: new Date(row.created_at).toISOString(),
+        items: [],
+      });
+    }
+    if (row.ki_id) {
+      kotsMap.get(row.id)!.items.push({
+        id: row.ki_id,
+        kotId: row.id,
+        orderItemId: row.order_item_id,
+        menuItemId: row.ki_menu_item_id,
+        name: row.ki_name,
+        quantity: row.ki_quantity,
+        price: Number(row.ki_price),
+        notes: row.ki_notes,
+        status: row.ki_status,
+      });
+    }
+  }
+
+  return {
+    id: t.id,
+    number: t.number,
+    capacity: t.capacity,
+    status: t.status,
+    sectionId: t.section_id,
+    restaurantId: t.restaurant_id,
+    workflowStatus: t.workflow_status,
+    captainId: t.captain_id,
+    guests: t.guests,
+    sessionStartedAt: t.session_started_at ? new Date(t.session_started_at).toISOString() : null,
+    currentBill: Number(t.current_bill),
+    kotHistory: typeof t.kot_history === "string" ? JSON.parse(t.kot_history) : (t.kot_history || []),
+    discount: t.discount ? Number(t.discount) : null,
+    sectionTag: t.section_tag,
+    lastWaiterCallAt: t.last_waiter_call_at ? new Date(t.last_waiter_call_at).toISOString() : null,
+    section: t.section_name ? {
+      id: t.section_id,
+      name: t.section_name,
+      venueId: t.venue_id,
+      venue: t.venue_id ? {
+        id: t.venue_id,
+        name: t.venue_name,
+        venueType: t.venue_type,
+        kotEnabled: !!t.kot_enabled,
+      } : undefined,
+    } : undefined,
+    orders: orders.length > 0 ? orders : [],
+    kots: Array.from(kotsMap.values()),
+  };
+}
+
+// ─── GET /api/edge/sections — sections with venue + floor info ───────────────
+
+export function getSections(): any[] {
+  const restaurantId = getRestaurantId();
+  if (!restaurantId) return [];
+
+  const db = getDb();
+
+  const sections = db.query(`
+    SELECT s.*, v.name as venue_name, v.venue_type, v.kot_enabled,
+           f.name as floor_name
+    FROM section s
+    LEFT JOIN venue v ON s.venue_id = v.id
+    LEFT JOIN floor f ON s.floor_id = f.id
+    WHERE s.restaurant_id = ?
+    ORDER BY s.sort_order ASC, s.name ASC
+  `).all(restaurantId) as any[];
+
+  return sections.map((s) => {
+    const tables = db.query(`
+      SELECT * FROM table WHERE section_id = ? AND restaurant_id = ?
+      ORDER BY number ASC
+    `).all(s.id, restaurantId) as any[];
+
+    return {
+      id: s.id,
+      name: s.name,
+      restaurantId: s.restaurant_id,
+      floorId: s.floor_id,
+      venueId: s.venue_id,
+      sortOrder: s.sort_order,
+      venue: s.venue_id ? {
+        id: s.venue_id,
+        name: s.venue_name,
+        venueType: s.venue_type,
+        kotEnabled: !!s.kot_enabled,
+      } : undefined,
+      floor: s.floor_id ? {
+        id: s.floor_id,
+        name: s.floor_name,
+      } : undefined,
+      tables: tables.map((t) => ({
+        id: t.id,
+        number: t.number,
+        capacity: t.capacity,
+        status: t.status,
+        sectionId: t.section_id,
+        restaurantId: t.restaurant_id,
+        workflowStatus: t.workflow_status,
+        captainId: t.captain_id,
+        guests: t.guests,
+        currentBill: Number(t.current_bill),
+        sectionTag: t.section_tag,
+      })),
+    };
+  });
+}
+
+// ─── GET /api/edge/menu — full menu with categories, items, variants ─────────
+
+export function getMenu(venueId?: string): any[] {
+  const restaurantId = getRestaurantId();
+  if (!restaurantId) return [];
+
+  const db = getDb();
+
+  // Get categories
+  const categories = db.query(`
+    SELECT * FROM category
+    WHERE restaurant_id = ? AND is_active = 1
+    ORDER BY sort_order ASC, name ASC
+  `).all(restaurantId) as any[];
+
+  // Get venue price map if venueId is provided
+  let venuePriceMap: Map<string, number> = new Map();
+  if (venueId) {
+    const venuePrices = db.query("SELECT menu_item_id, price FROM venue_price WHERE venue_id = ? AND is_active = 1").all(venueId) as any[];
+    for (const vp of venuePrices) {
+      venuePriceMap.set(vp.menu_item_id, Number(vp.price));
+    }
+  }
+
+  // Get all venue prices grouped by item (for client-side resolution)
+  const allVenuePrices = db.query(`
+    SELECT venue_id, menu_item_id, price FROM venue_price WHERE is_active = 1 AND restaurant_id = ?
+  `).all(restaurantId) as any[];
+
+  const allVenuePricesByItem: Record<string, Record<string, number>> = {};
+  for (const vp of allVenuePrices) {
+    if (!allVenuePricesByItem[vp.menu_item_id]) allVenuePricesByItem[vp.menu_item_id] = {};
+    allVenuePricesByItem[vp.menu_item_id][vp.venue_id] = Number(vp.price);
+  }
+
+  return categories.map((cat) => {
+    const items = db.query(`
+      SELECT * FROM menu_item
+      WHERE category_id = ? AND restaurant_id = ? AND is_available = 1 AND is_deleted = 0
+      ORDER BY sort_order ASC, name ASC
+    `).all(cat.id, restaurantId) as any[];
+
+    const mappedItems = items.map((m) => {
+      // Get default variant price if exists
+      const defaultVariant = db.query("SELECT price FROM menu_item_variant WHERE menu_item_id = ? AND is_default = 1 LIMIT 1").get(m.id) as any;
+
+      const basePrice = venuePriceMap.get(m.id) ?? Number(m.base_price);
+      const variantPrice = defaultVariant ? Number(defaultVariant.price) : null;
+      const effectivePrice = variantPrice ?? basePrice;
+
+      // Get all variants
+      const variants = db.query("SELECT id, name, price, is_default, is_available FROM menu_item_variant WHERE menu_item_id = ? AND is_available = 1").all(m.id) as any[];
+
+      // Get addons
+      const addons = db.query("SELECT id, name, price, is_available FROM menu_item_addon WHERE menu_item_id = ? AND is_available = 1").all(m.id) as any[];
+
+      return {
+        id: m.id,
+        name: m.name,
+        description: m.description,
+        imageUrl: m.image_url,
+        isVeg: !!m.is_veg,
+        isAvailable: !!m.is_available,
+        sortOrder: m.sort_order,
+        categoryId: m.category_id,
+        restaurantId: m.restaurant_id,
+        basePrice: Number(m.base_price),
+        unit: m.unit,
+        menuType: m.menu_type,
+        gstEnabled: !!m.gst_enabled,
+        isSpecial: !!m.is_special,
+        specialChannel: m.special_channel,
+        specialActive: !!m.special_active,
+        specialExpiresAt: m.special_expires_at ? new Date(m.special_expires_at).toISOString() : null,
+        printerTarget: m.printer_target,
+        printerName: m.printer_name,
+        effectivePrice,
+        variants: variants.map((v) => ({
+          id: v.id,
+          name: v.name,
+          price: Number(v.price),
+          isDefault: !!v.is_default,
+          isAvailable: !!v.is_available,
+        })),
+        addons: addons.map((a) => ({
+          id: a.id,
+          name: a.name,
+          price: Number(a.price),
+          isAvailable: !!a.is_available,
+        })),
+        venuePrices: allVenuePricesByItem[m.id] || {},
+      };
+    });
+
+    return {
+      id: cat.id,
+      name: cat.name,
+      sortOrder: cat.sort_order,
+      isActive: !!cat.is_active,
+      restaurantId: cat.restaurant_id,
+      printerTarget: cat.printer_target,
+      items: mappedItems,
+    };
+  });
+}
+
+// ─── GET /api/edge/menu/items — lean flat list for POS ───────────────────────
+
+export function getMenuItems(venueId?: string): any[] {
+  const restaurantId = getRestaurantId();
+  if (!restaurantId) return [];
+
+  const db = getDb();
+
+  let venuePriceMap: Map<string, number> = new Map();
+  if (venueId) {
+    const venuePrices = db.query("SELECT menu_item_id, price FROM venue_price WHERE venue_id = ? AND is_active = 1").all(venueId) as any[];
+    for (const vp of venuePrices) {
+      venuePriceMap.set(vp.menu_item_id, Number(vp.price));
+    }
+  }
+
+  const items = db.query(`
+    SELECT m.*, c.name as category_name, c.sort_order as category_sort_order
+    FROM menu_item m
+    LEFT JOIN category c ON m.category_id = c.id
+    WHERE m.restaurant_id = ? AND m.is_available = 1 AND m.is_deleted = 0 AND c.is_active = 1
+    ORDER BY c.sort_order ASC, m.sort_order ASC
+  `).all(restaurantId) as any[];
+
+  const now = Date.now();
+
+  return items
+    .filter((m) => {
+      if (!m.is_special) return true;
+      if (!m.special_active) return false;
+      if (m.special_expires_at && m.special_expires_at < now) return false;
+      return true;
+    })
+    .map((m) => {
+      const defaultVariant = db.query("SELECT price FROM menu_item_variant WHERE menu_item_id = ? AND is_default = 1 LIMIT 1").get(m.id) as any;
+      const basePrice = venuePriceMap.get(m.id) ?? Number(m.base_price);
+      const variantPrice = defaultVariant ? Number(defaultVariant.price) : null;
+
+      return {
+        id: m.id,
+        name: m.name,
+        description: m.description,
+        imageUrl: m.image_url,
+        isVeg: !!m.is_veg,
+        gstEnabled: !!m.gst_enabled,
+        menuType: m.menu_type,
+        isSpecial: !!m.is_special,
+        specialChannel: m.special_channel,
+        specialActive: !!m.special_active,
+        specialExpiresAt: m.special_expires_at ? new Date(m.special_expires_at).toISOString() : null,
+        unit: m.unit,
+        category: { name: m.category_name },
+        effectivePrice: variantPrice ?? basePrice,
+      };
+    });
+}
+
+// ─── GET /api/edge/venues — venues with floors and sections ──────────────────
+
+export function getVenues(): any[] {
+  const restaurantId = getRestaurantId();
+  if (!restaurantId) return [];
+
+  const db = getDb();
+
+  const venues = db.query(`
+    SELECT * FROM venue
+    WHERE restaurant_id = ? AND is_deleted = 0
+    ORDER BY sort_order ASC, name ASC
+  `).all(restaurantId) as any[];
+
+  return venues.map((v) => {
+    const floors = db.query(`
+      SELECT * FROM floor
+      WHERE venue_id = ? AND is_active = 1
+      ORDER BY sort_order ASC
+    `).all(v.id) as any[];
+
+    const sections = db.query(`
+      SELECT * FROM section
+      WHERE venue_id = ? AND restaurant_id = ?
+      ORDER BY sort_order ASC
+    `).all(v.id, restaurantId) as any[];
+
+    return {
+      id: v.id,
+      restaurantId: v.restaurant_id,
+      name: v.name,
+      venueType: v.venue_type,
+      sortOrder: v.sort_order,
+      isActive: !!v.is_active,
+      priceProfileId: v.price_profile_id,
+      taxProfileId: v.tax_profile_id,
+      kotPrinterName: v.kot_printer_name,
+      billPrinterName: v.bill_printer_name,
+      kotEnabled: !!v.kot_enabled,
+      floors: floors.map((f) => ({
+        id: f.id,
+        venueId: f.venue_id,
+        restaurantId: f.restaurant_id,
+        name: f.name,
+        sortOrder: f.sort_order,
+        isActive: !!f.is_active,
+      })),
+      sections: sections.map((s) => ({
+        id: s.id,
+        name: s.name,
+        restaurantId: s.restaurant_id,
+        floorId: s.floor_id,
+        venueId: s.venue_id,
+        sortOrder: s.sort_order,
+      })),
+    };
+  });
+}
+
+// ─── GET /api/edge/outlet — outlet settings ──────────────────────────────────
+
+export function getOutletSettings(): any | null {
+  const restaurantId = getRestaurantId();
+  if (!restaurantId) return null;
+
+  const db = getDb();
+
+  const outlet = db.query("SELECT * FROM outlet WHERE id = ?").get(restaurantId) as any;
+  if (!outlet) return null;
+
+  return {
+    id: outlet.id,
+    name: outlet.name,
+    slug: outlet.slug,
+    restaurantCode: outlet.restaurant_code,
+    restaurantType: outlet.restaurant_type,
+    address: outlet.address,
+    phone: outlet.phone,
+    email: outlet.email,
+    gstin: outlet.gstin,
+    logoUrl: outlet.logo_url,
+    receiptHeader: outlet.receipt_header,
+    receiptSubHeader: outlet.receipt_sub_header,
+    themePrimary: outlet.theme_primary,
+    themeSecondary: outlet.theme_secondary,
+    printerConfig: outlet.printer_config ? JSON.parse(outlet.printer_config) : {},
+    barUnitMl: outlet.bar_unit_ml,
+    fullBottleMl: outlet.full_bottle_ml,
+    halfBottleMl: outlet.half_bottle_ml,
+    fssai: outlet.fssai,
+    pricesIncludeGst: !!outlet.prices_include_gst,
+    gstCategory: outlet.gst_category,
+    gstRate: outlet.gst_rate,
+    gstRegistered: !!outlet.gst_registered,
+    serviceChargePercent: outlet.service_charge_percent,
+    enabledModules: outlet.enabled_modules ? JSON.parse(outlet.enabled_modules) : {},
+    organizationId: outlet.organization_id,
+    isActive: !!outlet.is_active,
+  };
+}
