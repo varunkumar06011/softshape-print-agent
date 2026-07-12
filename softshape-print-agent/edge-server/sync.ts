@@ -20,15 +20,24 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { getDb } from "./db.ts";
-import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid } from "./auth.ts";
+import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid, getDeviceId, saveSession, loadSession } from "./auth.ts";
 
 const SYNC_INTERVAL_MS = parseInt(process.env.EDGE_SYNC_INTERVAL_MS || "10000", 10);
 const MAX_BATCH_SIZE = 50;
 const MAX_ATTEMPTS = 5;
+const BACKOFF_BASE_MS = 10_000;   // 10 seconds
+const BACKOFF_MAX_MS = 5 * 60_000; // 5 minutes cap
 
 let syncRunning = false;
 let lastSyncAt = 0;
+let consecutiveFailures = 0;
 let lastSyncResult: { ok: boolean; pushed: number; accepted: number; rejected: number; error?: string } | null = null;
+
+function getBackoffDelay(): number {
+  if (consecutiveFailures === 0) return SYNC_INTERVAL_MS;
+  const delay = Math.min(BACKOFF_BASE_MS * Math.pow(2, consecutiveFailures - 1), BACKOFF_MAX_MS);
+  return delay;
+}
 
 // ─── Collect a batch of pending sync records ─────────────────────────────────
 
@@ -56,7 +65,7 @@ function collectBatch(): SyncQueueRow[] {
   return db.query(`
     SELECT * FROM sync_queue
     WHERE synced = 0 AND attempts < ?
-    ORDER BY created_at ASC
+    ORDER BY created_at ASC, id ASC
     LIMIT ?
   `).all(MAX_ATTEMPTS, MAX_BATCH_SIZE) as SyncQueueRow[];
 }
@@ -125,6 +134,155 @@ function loadRecordData(tableName: string, recordId: string): any | null {
       };
     }
 
+    case "outlet": {
+      const o = db.query("SELECT * FROM outlet WHERE id = ?").get(recordId) as any;
+      if (!o) return null;
+      return {
+        id: o.id,
+        name: o.name,
+        slug: o.slug,
+        restaurantCode: o.restaurant_code,
+        restaurantType: o.restaurant_type,
+        address: o.address,
+        phone: o.phone,
+        email: o.email,
+        gstin: o.gstin,
+        logoUrl: o.logo_url,
+        receiptHeader: o.receipt_header,
+        receiptSubHeader: o.receipt_sub_header,
+        themePrimary: o.theme_primary,
+        themeSecondary: o.theme_secondary,
+        printerConfig: o.printer_config,
+        barUnitMl: o.bar_unit_ml,
+        fullBottleMl: o.full_bottle_ml,
+        halfBottleMl: o.half_bottle_ml,
+        fssai: o.fssai,
+        pricesIncludeGst: !!o.prices_include_gst,
+        gstCategory: o.gst_category,
+        gstRate: o.gst_rate,
+        gstRegistered: !!o.gst_registered,
+        serviceChargePercent: o.service_charge_percent || 0,
+        enabledModules: o.enabled_modules,
+      };
+    }
+
+    case "venue": {
+      const v = db.query("SELECT * FROM venue WHERE id = ?").get(recordId) as any;
+      if (!v) return null;
+      return {
+        id: v.id,
+        restaurantId: v.restaurant_id,
+        name: v.name,
+        venueType: v.venue_type,
+        isActive: !!v.is_active,
+        sortOrder: v.sort_order,
+      };
+    }
+
+    case "floor": {
+      const f = db.query("SELECT * FROM floor WHERE id = ?").get(recordId) as any;
+      if (!f) return null;
+      return {
+        id: f.id,
+        venueId: f.venue_id,
+        restaurantId: f.restaurant_id,
+        name: f.name,
+        sortOrder: f.sort_order,
+      };
+    }
+
+    case "section": {
+      const s = db.query("SELECT * FROM section WHERE id = ?").get(recordId) as any;
+      if (!s) return null;
+      return {
+        id: s.id,
+        name: s.name,
+        restaurantId: s.restaurant_id,
+        floorId: s.floor_id,
+        sortOrder: s.sort_order,
+        isActive: !!s.is_active,
+      };
+    }
+
+    case "category": {
+      const c = db.query("SELECT * FROM category WHERE id = ?").get(recordId) as any;
+      if (!c) return null;
+      return {
+        id: c.id,
+        name: c.name,
+        restaurantId: c.restaurant_id,
+        sortOrder: c.sort_order,
+        isActive: !!c.is_active,
+        printerTarget: c.printer_target,
+      };
+    }
+
+    case "menu_item": {
+      const m = db.query("SELECT * FROM menu_item WHERE id = ?").get(recordId) as any;
+      if (!m) return null;
+      const variants = db.query("SELECT * FROM menu_item_variant WHERE menu_item_id = ?").all(recordId) as any[];
+      return {
+        id: m.id,
+        name: m.name,
+        description: m.description,
+        imageUrl: m.image_url,
+        isVeg: !!m.is_veg,
+        isAvailable: !!m.is_available,
+        sortOrder: m.sort_order,
+        categoryId: m.category_id,
+        restaurantId: m.restaurant_id,
+        basePrice: m.base_price,
+        unit: m.unit,
+        isDeleted: !!m.is_deleted,
+        deletedAt: m.deleted_at,
+        printerTarget: m.printer_target,
+        printerName: m.printer_name,
+        menuType: m.menu_type,
+        gstEnabled: !!m.gst_enabled,
+        isSpecial: !!m.is_special,
+        specialChannel: m.special_channel,
+        specialActive: !!m.special_active,
+        specialExpiresAt: m.special_expires_at,
+        variants: variants.map(v => ({
+          id: v.id,
+          name: v.name,
+          price: v.price,
+          isDefault: !!v.is_default,
+          menuItemId: v.menu_item_id,
+          isAvailable: !!v.is_available,
+          restaurantId: v.restaurant_id,
+        })),
+      };
+    }
+
+    case "menu_item_variant": {
+      const v = db.query("SELECT * FROM menu_item_variant WHERE id = ?").get(recordId) as any;
+      if (!v) return null;
+      return {
+        id: v.id,
+        name: v.name,
+        price: v.price,
+        isDefault: !!v.is_default,
+        menuItemId: v.menu_item_id,
+        isAvailable: !!v.is_available,
+        restaurantId: v.restaurant_id,
+      };
+    }
+
+    case "users": {
+      const u = db.query("SELECT * FROM users WHERE id = ?").get(recordId) as any;
+      if (!u) return null;
+      return {
+        id: u.id,
+        name: u.name,
+        pin: u.pin,
+        role: u.role,
+        outletId: u.outlet_id,
+        isActive: !!u.is_active,
+        permissions: u.permissions,
+      };
+    }
+
     default:
       return null;
   }
@@ -160,14 +318,90 @@ function deadLetterExhausted(): void {
 
 // ─── Main sync push ──────────────────────────────────────────────────────────
 
+let _cloudRegistrationAttempted = false;
+
+async function ensureCloudSession(): Promise<boolean> {
+  const session = loadSession();
+  if (!session) return false;
+
+  // If the token is a real JWT (not a local onboarding token), we're fine
+  if (!session.sessionToken.startsWith("local-onboard-")) return true;
+
+  // Already tried and failed — don't retry every cycle, just on startup
+  if (_cloudRegistrationAttempted) return false;
+  _cloudRegistrationAttempted = true;
+
+  const backendUrl = getBackendUrl();
+  const restaurantId = getRestaurantId();
+  if (!backendUrl || !restaurantId) return false;
+
+  // Load outlet + owner data from local SQLite to send to the cloud
+  const db = getDb();
+  const outlet = db.query("SELECT * FROM outlet WHERE id = ?").get(restaurantId) as any;
+  if (!outlet) {
+    console.warn("[Sync] No outlet found in local DB for cloud registration");
+    return false;
+  }
+
+  const owner = db.query("SELECT name, pin FROM users WHERE outlet_id = ? AND role = 'OWNER' LIMIT 1").get(restaurantId) as any;
+
+  console.log("[Sync] Local onboarding token detected — attempting cloud registration...");
+  try {
+    const res = await fetch(`${backendUrl}/api/edge/register-offline`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        restaurantId,
+        deviceId: getDeviceId(),
+        restaurantName: outlet.name,
+        restaurantType: outlet.restaurant_type,
+        restaurantCode: outlet.restaurant_code,
+        slug: outlet.slug,
+        owner: owner ? { name: owner.name, pin: owner.pin } : undefined,
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      console.warn(`[Sync] Cloud registration failed: HTTP ${res.status} — ${errBody.error || ''}`);
+      _cloudRegistrationAttempted = false; // allow retry next cycle
+      return false;
+    }
+
+    const data = await res.json() as { sessionToken: string; restaurantName: string; restaurantCode: string };
+    console.log(`[Sync] Cloud registration successful — got real JWT for ${data.restaurantName}`);
+
+    // Update the stored session with the real JWT
+    saveSession({
+      ...session,
+      sessionToken: data.sessionToken,
+      restaurantName: data.restaurantName,
+      restaurantCode: data.restaurantCode,
+    });
+
+    return true;
+  } catch (err) {
+    console.warn("[Sync] Cloud registration error:", err);
+    _cloudRegistrationAttempted = false; // allow retry next cycle
+    return false;
+  }
+}
+
 export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; accepted: number; rejected: number; error?: string }> {
   const backendUrl = getBackendUrl();
-  const token = getSessionToken();
   const restaurantId = getRestaurantId();
 
-  if (!backendUrl || !token || !restaurantId) {
+  if (!backendUrl || !restaurantId) {
     return { ok: false, pushed: 0, accepted: 0, rejected: 0, error: "No valid session" };
   }
+
+  // If we have a local onboarding token, try to exchange it for a real JWT first
+  if (!(await ensureCloudSession())) {
+    return { ok: false, pushed: 0, accepted: 0, rejected: 0, error: "No valid cloud session" };
+  }
+
+  const token = getSessionToken();
 
   const batch = collectBatch();
   if (batch.length === 0) {
@@ -209,6 +443,7 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
       },
       body: JSON.stringify({
         restaurantId,
+        deviceId: getDeviceId(),
         batch: payload,
       }),
     });
@@ -273,46 +508,58 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
   }
 }
 
-// ─── Sync worker loop ────────────────────────────────────────────────────────
+// ─── Sync worker loop (with exponential backoff) ─────────────────────────────
 
-let syncTimer: ReturnType<typeof setInterval> | null = null;
+let syncTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function runSyncCycle(): Promise<void> {
+  if (!isSessionValid()) {
+    scheduleNextCycle(SYNC_INTERVAL_MS);
+    return;
+  }
+  if (syncRunning) {
+    scheduleNextCycle(SYNC_INTERVAL_MS);
+    return;
+  }
+
+  syncRunning = true;
+  try {
+    const result = await pushSyncBatch();
+    deadLetterExhausted();
+
+    if (result.ok) {
+      consecutiveFailures = 0;
+    } else {
+      consecutiveFailures++;
+      console.warn(`[Sync] Push failed (${consecutiveFailures} consecutive) — backing off for ${getBackoffDelay()}ms`);
+    }
+  } catch (err) {
+    consecutiveFailures++;
+    console.error("[Sync] Worker cycle error:", err);
+  } finally {
+    syncRunning = false;
+  }
+
+  scheduleNextCycle(getBackoffDelay());
+}
+
+function scheduleNextCycle(delay: number): void {
+  syncTimer = setTimeout(async () => {
+    await runSyncCycle();
+  }, delay);
+}
 
 export function startSyncWorker(): void {
   if (syncTimer) return;
 
-  console.log(`[Sync] Worker started — interval: ${SYNC_INTERVAL_MS}ms`);
-
-  // Initial push after 5 seconds (let server warm up)
-  setTimeout(async () => {
-    if (!isSessionValid()) return;
-    try {
-      await pushSyncBatch();
-      deadLetterExhausted();
-    } catch (err) {
-      console.error("[Sync] Initial push error:", err);
-    }
-  }, 5_000);
-
-  // Regular interval
-  syncTimer = setInterval(async () => {
-    if (!isSessionValid()) return;
-    if (syncRunning) return; // Skip if previous cycle still running
-
-    syncRunning = true;
-    try {
-      await pushSyncBatch();
-      deadLetterExhausted();
-    } catch (err) {
-      console.error("[Sync] Worker cycle error:", err);
-    } finally {
-      syncRunning = false;
-    }
-  }, SYNC_INTERVAL_MS);
+  const initialDelay = consecutiveFailures > 0 ? getBackoffDelay() : 5_000;
+  console.log(`[Sync] Worker started — initial delay: ${initialDelay}ms, base interval: ${SYNC_INTERVAL_MS}ms`);
+  scheduleNextCycle(initialDelay);
 }
 
 export function stopSyncWorker(): void {
   if (syncTimer) {
-    clearInterval(syncTimer);
+    clearTimeout(syncTimer);
     syncTimer = null;
     console.log("[Sync] Worker stopped");
   }
@@ -326,6 +573,8 @@ export function getSyncStatus(): {
   lastSyncResult: typeof lastSyncResult;
   pendingCount: number;
   deadLetterCount: number;
+  consecutiveFailures: number;
+  nextSyncInMs: number;
 } {
   const db = getDb();
   const pendingCount = (db.query("SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0 AND attempts < ?").get(MAX_ATTEMPTS) as any)?.c || 0;
@@ -337,6 +586,8 @@ export function getSyncStatus(): {
     lastSyncResult,
     pendingCount,
     deadLetterCount,
+    consecutiveFailures,
+    nextSyncInMs: getBackoffDelay(),
   };
 }
 

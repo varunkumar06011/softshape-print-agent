@@ -12,21 +12,26 @@
 import { Database } from "bun:sqlite";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { openDatabaseWithRecovery, type RecoveryResult } from "./recovery.ts";
 
 const DB_PATH = process.env.EDGE_DB_PATH || join(homedir(), ".softshape", "edge.db");
 
 let db: Database | null = null;
+let recoveryStatus: RecoveryResult = { recovered: false, corruptPath: null, message: "" };
 
 export function getDb(): Database {
   if (db) return db;
 
-  db = new Database(DB_PATH, { create: true });
-  db.exec("PRAGMA journal_mode = WAL;");
-  db.exec("PRAGMA foreign_keys = ON;");
-  db.exec("PRAGMA busy_timeout = 5000;");
+  const result = openDatabaseWithRecovery();
+  db = result.db;
+  recoveryStatus = result.recovery;
 
   initSchema(db);
   return db;
+}
+
+export function getRecoveryStatus(): RecoveryResult {
+  return recoveryStatus;
 }
 
 function initSchema(database: Database) {
@@ -381,6 +386,20 @@ function initSchema(database: Database) {
       value           TEXT NOT NULL,
       updated_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
     );
+
+    -- ── Users (staff accounts for offline PIN verification) ────────────────
+    CREATE TABLE IF NOT EXISTS users (
+      id              TEXT PRIMARY KEY,
+      name            TEXT NOT NULL,
+      pin             TEXT,              -- bcrypt hash (same as cloud)
+      role            TEXT NOT NULL,     -- 'OWNER', 'ADMIN', 'CASHIER', 'CAPTAIN', 'MANAGER'
+      is_active       INTEGER DEFAULT 1,
+      outlet_id       TEXT NOT NULL,
+      permissions      TEXT,             -- JSON
+      synced_at       INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+    CREATE INDEX IF NOT EXISTS idx_users_outlet ON users(outlet_id);
+    CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active) WHERE is_active = 1;
   `);
 }
 

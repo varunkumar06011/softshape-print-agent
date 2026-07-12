@@ -20,14 +20,17 @@
 //   GET  /api/edge/menu/items   — lean flat list for POS
 //   GET  /api/edge/venues       — venues with floors and sections
 //   GET  /api/edge/outlet       — outlet settings
+//   GET  /api/edge/staff        — list active staff (for PIN login screen)
+//   POST /api/edge/auth/pin     — verify staff PIN (offline device-unlock)
 //   GET  /api/edge/sync/status  — sync worker status
 //   POST /api/edge/sync/push    — manually trigger sync push
 //   POST /api/edge/sync/retry   — retry dead-lettered records
 //   GET  /api/edge/sync/socket  — socket connection status
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, closeDb, getConfig, setConfig, getSyncState } from "./db.ts";
-import { loadSession, saveSession, clearSession, isSessionValid, getBackendUrl, getRestaurantId } from "./auth.ts";
+import { getDb, closeDb, getConfig, setConfig, getSyncState, enqueueSync, getRecoveryStatus } from "./db.ts";
+import { runDailyMaintenance } from "./backup.ts";
+import { loadSession, saveSession, clearSession, isSessionValid, getBackendUrl, getRestaurantId, getDeviceId } from "./auth.ts";
 import { downloadFullConfig, pullIncrementalChanges } from "./config.ts";
 import { createOrder, cancelKotItem, reprintKot } from "./orderService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings } from "./reads.ts";
@@ -66,6 +69,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   // ── GET /health ─────────────────────────────────────────────────────────────
   if (url.pathname === "/health" && req.method === "GET") {
     const session = loadSession();
+    const recovery = getRecoveryStatus();
     return jsonResponse({
       status: "ok",
       service: "softshape-edge-server",
@@ -74,6 +78,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
       uptime: process.uptime(),
+      databaseRecovered: recovery.recovered,
+      recoveryMessage: recovery.message || null,
     });
   }
 
@@ -133,7 +139,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          agentId: `edge-${crypto.randomUUID()}`,
+          agentId: getDeviceId(),
           printerMapping: {},
           ...(restaurantCode ? { restaurantCode } : {}),
         }),
@@ -353,6 +359,65 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse(data);
   }
 
+  // ── GET /api/edge/staff — list active staff for PIN login screen ───────────
+  if (url.pathname === "/api/edge/staff" && req.method === "GET") {
+    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    const db = getDb();
+    const restaurantId = getRestaurantId();
+    const staff = db.query(
+      "SELECT id, name, role FROM users WHERE outlet_id = ? AND is_active = 1 ORDER BY name ASC"
+    ).all(restaurantId) as { id: string; name: string; role: string }[];
+    return jsonResponse({ staff });
+  }
+
+  // ── POST /api/edge/auth/pin — verify staff PIN (offline device-unlock) ─────
+  if (url.pathname === "/api/edge/auth/pin" && req.method === "POST") {
+    if (!isSessionValid()) return errorResponse("No valid session", 401);
+
+    let body: any;
+    try {
+      body = await req.json();
+    } catch {
+      return errorResponse("Invalid JSON body", 400);
+    }
+
+    const { userId, pin } = body;
+    if (!userId || !pin) {
+      return errorResponse("userId and pin are required", 400);
+    }
+
+    const db = getDb();
+    const user = db.query(
+      "SELECT id, name, pin, role, is_active FROM users WHERE id = ? AND outlet_id = ?"
+    ).get(userId, getRestaurantId()) as { id: string; name: string; pin: string | null; role: string; is_active: number } | null;
+
+    if (!user) {
+      return errorResponse("Invalid credentials", 401);
+    }
+    if (!user.is_active) {
+      return errorResponse("Account is inactive", 403);
+    }
+    if (!user.pin) {
+      return errorResponse("No PIN set for this account", 401);
+    }
+
+    // Verify PIN using bcrypt (same hash as cloud)
+    const { compareSync } = await import("bcryptjs");
+    const isValid = compareSync(String(pin), user.pin);
+    if (!isValid) {
+      return errorResponse("Invalid credentials", 401);
+    }
+
+    return jsonResponse({
+      success: true,
+      user: {
+        id: user.id,
+        name: user.name,
+        role: user.role,
+      },
+    });
+  }
+
   // ── GET /api/edge/sync/status — sync worker status ────────────────────────
   if (url.pathname === "/api/edge/sync/status" && req.method === "GET") {
     if (!isSessionValid()) return errorResponse("No valid session", 401);
@@ -366,6 +431,57 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse(result);
   }
 
+  // ── POST /api/edge/close-day — force sync + lock day's transactions ─────────
+  // Forces a full sync push, waits for confirmation, returns day summary.
+  // The frontend uses this to show a "Close Day" confirmation dialog.
+  if (url.pathname === "/api/edge/close-day" && req.method === "POST") {
+    if (!isSessionValid()) return errorResponse("No valid session", 401);
+
+    const db = getDb();
+    const restaurantId = getRestaurantId();
+
+    // Force a sync push
+    const syncResult = await manualSyncPush();
+
+    // Get today's order summary from local SQLite
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+    const startOfDayMs = startOfDay.getTime();
+
+    const todayOrders = db.query(
+      "SELECT COUNT(*) as count, COALESCE(SUM(total), 0) as total, COALESCE(SUM(CASE WHEN status = 'SETTLED' THEN 1 ELSE 0 END), 0) as settled FROM order_record WHERE restaurant_id = ? AND created_at >= ?"
+    ).get(restaurantId, startOfDayMs) as any;
+
+    // Check for pending sync records
+    const pending = db.query(
+      "SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0 AND attempts < 5"
+    ).get() as any;
+
+    // Check for dead-lettered records
+    const deadLetters = db.query(
+      "SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0 AND attempts >= 5"
+    ).get() as any;
+
+    const canClose = pending.count === 0 && deadLetters.count === 0;
+
+    return jsonResponse({
+      success: true,
+      canClose,
+      syncResult,
+      daySummary: {
+        date: startOfDay.toISOString().slice(0, 10),
+        totalOrders: todayOrders.count,
+        settledOrders: todayOrders.settled,
+        totalRevenue: Number(todayOrders.total),
+        pendingSync: pending.count,
+        deadLetterRecords: deadLetters.count,
+      },
+      message: canClose
+        ? "All records synced. Ready to close day."
+        : `${pending.count} records still syncing. ${deadLetters.count} failed records need attention. Please wait for sync to complete or retry failed records.`,
+    });
+  }
+
   // ── POST /api/edge/sync/retry — retry dead-lettered records ────────────────
   if (url.pathname === "/api/edge/sync/retry" && req.method === "POST") {
     if (!isSessionValid()) return errorResponse("No valid session", 401);
@@ -377,6 +493,415 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   if (url.pathname === "/api/edge/sync/socket" && req.method === "GET") {
     if (!isSessionValid()) return errorResponse("No valid session", 401);
     return jsonResponse(getSocketStatus());
+  }
+
+  // ── POST /api/edge/onboard — 4-step offline onboarding ─────────────────────
+  // Creates the full local dataset from the QuickOnboarding wizard.
+  // No session required — this is the initial setup flow.
+  if (url.pathname === "/api/edge/onboard" && req.method === "POST") {
+    let body: any;
+    try {
+      body = await req.json();
+    } catch {
+      return errorResponse("Invalid JSON body", 400);
+    }
+
+    const { restaurantName, restaurantType, owner, menuTemplate, tableCount, printerMapping } = body;
+    if (!restaurantName || !owner?.name || !owner?.pin) {
+      return errorResponse("restaurantName, owner.name, and owner.pin are required", 400);
+    }
+
+    try {
+      const db = getDb();
+      const restaurantId = crypto.randomUUID();
+      const slug = restaurantName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+      const restaurantCode = slug.slice(0, 8).toUpperCase();
+
+      // 1. Create outlet (restaurant settings)
+      db.query(`INSERT INTO outlet (id, name, slug, restaurant_code, restaurant_type, gst_category, gst_rate, gst_registered, prices_include_gst)
+                VALUES (?, ?, ?, ?, ?, 'NON_AC', 5.0, 1, 0)`)
+        .run(restaurantId, restaurantName, slug, restaurantCode, restaurantType || 'DINE_IN_VEG');
+      enqueueSync('outlet', restaurantId, 'create');
+
+      // 2. Create default venue + floor + section
+      const venueId = crypto.randomUUID();
+      db.query(`INSERT INTO venue (id, restaurant_id, name, venue_type, is_active, sort_order)
+                VALUES (?, ?, 'Main Hall', 'RESTAURANT', 1, 0)`)
+        .run(venueId, restaurantId);
+      enqueueSync('venue', venueId, 'create');
+
+      const floorId = crypto.randomUUID();
+      db.query(`INSERT INTO floor (id, venue_id, restaurant_id, name, sort_order)
+                VALUES (?, ?, ?, 'Ground Floor', 0)`)
+        .run(floorId, venueId, restaurantId);
+      enqueueSync('floor', floorId, 'create');
+
+      const sectionId = crypto.randomUUID();
+      db.query(`INSERT INTO section (id, name, restaurant_id, floor_id, sort_order, is_active)
+                VALUES (?, 'Main Section', ?, ?, 0, 1)`)
+        .run(sectionId, restaurantId, floorId);
+      enqueueSync('section', sectionId, 'create');
+
+      // 3. Create tables
+      const numTables = Math.max(1, Math.min(100, parseInt(tableCount) || 10));
+      for (let i = 1; i <= numTables; i++) {
+        const tableId = crypto.randomUUID();
+        db.query(`INSERT INTO "table" (id, number, capacity, section_id, restaurant_id, status, workflow_status)
+                  VALUES (?, ?, 4, ?, ?, 'AVAILABLE', 'Free')`)
+          .run(tableId, i, sectionId, restaurantId);
+        enqueueSync('table', tableId, 'create');
+      }
+
+      // 4. Create menu from template
+      const template = menuTemplate || { categories: [] };
+      for (const cat of template.categories || []) {
+        const categoryId = crypto.randomUUID();
+        db.query(`INSERT INTO category (id, name, restaurant_id, sort_order, is_active)
+                  VALUES (?, ?, ?, ?, 1)`)
+          .run(categoryId, cat.name, restaurantId, cat.sortOrder || 0);
+        enqueueSync('category', categoryId, 'create');
+
+        for (const item of cat.items || []) {
+          const itemId = crypto.randomUUID();
+          db.query(`INSERT INTO menu_item (id, name, description, is_veg, is_available, sort_order, category_id, restaurant_id,
+                    base_price, unit, menu_type, gst_enabled, is_deleted)
+                    VALUES (?, ?, NULL, ?, 1, 0, ?, ?, ?, ?, ?, 1, 0)`)
+            .run(itemId, item.name, item.isVeg ? 1 : 0, categoryId, restaurantId,
+                 item.basePrice || 0, item.unit || null, item.menuType || 'FOOD');
+          enqueueSync('menu_item', itemId, 'create');
+
+          // Create variants if present
+          if (item.variants && Array.isArray(item.variants)) {
+            for (const variant of item.variants) {
+              const variantId = crypto.randomUUID();
+              db.query(`INSERT INTO menu_item_variant (id, name, price, is_default, menu_item_id, is_available, restaurant_id)
+                        VALUES (?, ?, ?, ?, ?, 1, ?)`)
+                .run(variantId, variant.name, variant.price, variant.isDefault ? 1 : 0, itemId, restaurantId);
+              enqueueSync('menu_item_variant', variantId, 'create');
+            }
+          }
+        }
+      }
+
+      // 5. Create owner user with PIN
+      const { hashSync } = await import("bcryptjs");
+      const userId = crypto.randomUUID();
+      const pinHash = hashSync(String(owner.pin), 10);
+      db.query(`INSERT INTO users (id, name, pin, role, outlet_id, is_active, synced_at)
+                VALUES (?, ?, ?, 'OWNER', ?, 1, unixepoch())`)
+        .run(userId, owner.name, pinHash, restaurantId);
+      enqueueSync('users', userId, 'create');
+
+      // 6. Save printer config
+      if (printerMapping) {
+        setConfig('printer_config', JSON.stringify(printerMapping));
+      }
+
+      // 7. Save session so the edge server is "registered" locally
+      saveSession({
+        sessionToken: `local-onboard-${Date.now()}`,
+        restaurantId,
+        restaurantName,
+        restaurantCode,
+        backendUrl: getBackendUrl() || '',
+        expiresAt: 0, // no expiry for local onboarding
+      });
+
+      console.log(`[Onboard] Created restaurant "${restaurantName}" (${restaurantId}) with ${numTables} tables, ${template.categories?.length || 0} categories, owner: ${owner.name}`);
+
+      return jsonResponse({
+        success: true,
+        restaurantId,
+        restaurantCode,
+        ownerUserId: userId,
+        tableCount: numTables,
+        menuCategories: template.categories?.length || 0,
+      });
+    } catch (err: any) {
+      console.error("[Onboard] Failed:", err);
+      return errorResponse(`Onboarding failed: ${err.message}`, 500);
+    }
+  }
+
+  // ── Admin operational write endpoints (local-first) ─────────────────────────
+  // These endpoints handle admin writes that should work offline.
+  // They write to local SQLite and enqueue sync_queue entries.
+  // The sync worker pushes changes to cloud when connectivity is available.
+
+  // ── PATCH /api/edge/admin/menu-item/:id — update menu item ──────────────────
+  if (url.pathname.startsWith("/api/edge/admin/menu-item/") && req.method === "PATCH") {
+    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    const itemId = url.pathname.split("/").pop();
+    let body: any;
+    try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
+
+    const db = getDb();
+    const restaurantId = getRestaurantId();
+    const updates: string[] = [];
+    const values: any[] = [];
+
+    if (body.name !== undefined) { updates.push("name = ?"); values.push(body.name); }
+    if (body.basePrice !== undefined) { updates.push("base_price = ?"); values.push(Number(body.basePrice)); }
+    if (body.isVeg !== undefined) { updates.push("is_veg = ?"); values.push(body.isVeg ? 1 : 0); }
+    if (body.isAvailable !== undefined) { updates.push("is_available = ?"); values.push(body.isAvailable ? 1 : 0); }
+    if (body.menuType !== undefined) { updates.push("menu_type = ?"); values.push(body.menuType); }
+    if (body.printerTarget !== undefined) { updates.push("printer_target = ?"); values.push(body.printerTarget); }
+    if (body.isDeleted !== undefined) { updates.push("is_deleted = ?"); values.push(body.isDeleted ? 1 : 0); }
+    if (body.description !== undefined) { updates.push("description = ?"); values.push(body.description); }
+
+    if (updates.length === 0) return errorResponse("No fields to update", 400);
+
+    values.push(itemId);
+    db.query(`UPDATE menu_item SET ${updates.join(", ")} WHERE id = ? AND restaurant_id = ?`).run(...values, restaurantId);
+    enqueueSync("menu_item", itemId, "update");
+
+    return jsonResponse({ success: true, id: itemId });
+  }
+
+  // ── POST /api/edge/admin/menu-item — create menu item ───────────────────────
+  if (url.pathname === "/api/edge/admin/menu-item" && req.method === "POST") {
+    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    let body: any;
+    try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
+
+    const db = getDb();
+    const restaurantId = getRestaurantId();
+    const itemId = crypto.randomUUID();
+
+    db.query(`INSERT INTO menu_item (id, name, description, is_veg, is_available, sort_order, category_id, restaurant_id,
+              base_price, unit, menu_type, gst_enabled, is_deleted)
+              VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, 1, 0)`)
+      .run(itemId, body.name, body.description || null, body.isVeg ? 1 : 0,
+           body.categoryId, restaurantId, Number(body.basePrice || 0), body.unit || null, body.menuType || "FOOD");
+    enqueueSync("menu_item", itemId, "create");
+
+    return jsonResponse({ success: true, id: itemId });
+  }
+
+  // ── DELETE /api/edge/admin/menu-item/:id — soft delete menu item ─────────────
+  if (url.pathname.startsWith("/api/edge/admin/menu-item/") && req.method === "DELETE") {
+    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    const itemId = url.pathname.split("/").pop();
+
+    const db = getDb();
+    const restaurantId = getRestaurantId();
+    db.query("UPDATE menu_item SET is_deleted = 1, deleted_at = ? WHERE id = ? AND restaurant_id = ?")
+      .run(Date.now(), itemId, restaurantId);
+    enqueueSync("menu_item", itemId, "update");
+
+    return jsonResponse({ success: true, id: itemId });
+  }
+
+  // ── PATCH /api/edge/admin/table/:id — update table ──────────────────────────
+  if (url.pathname.startsWith("/api/edge/admin/table/") && req.method === "PATCH") {
+    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    const tableId = url.pathname.split("/").pop();
+    let body: any;
+    try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
+
+    const db = getDb();
+    const restaurantId = getRestaurantId();
+    const updates: string[] = [];
+    const values: any[] = [];
+
+    if (body.number !== undefined) { updates.push("number = ?"); values.push(Number(body.number)); }
+    if (body.capacity !== undefined) { updates.push("capacity = ?"); values.push(Number(body.capacity)); }
+    if (body.status !== undefined) { updates.push("status = ?"); values.push(body.status); }
+    if (body.sectionId !== undefined) { updates.push("section_id = ?"); values.push(body.sectionId); }
+
+    if (updates.length === 0) return errorResponse("No fields to update", 400);
+
+    values.push(tableId);
+    db.query(`UPDATE "table" SET ${updates.join(", ")} WHERE id = ? AND restaurant_id = ?`).run(...values, restaurantId);
+    enqueueSync("table", tableId, "update");
+
+    return jsonResponse({ success: true, id: tableId });
+  }
+
+  // ── POST /api/edge/admin/table — create table ───────────────────────────────
+  if (url.pathname === "/api/edge/admin/table" && req.method === "POST") {
+    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    let body: any;
+    try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
+
+    const db = getDb();
+    const restaurantId = getRestaurantId();
+    const tableId = crypto.randomUUID();
+
+    db.query(`INSERT INTO "table" (id, number, capacity, section_id, restaurant_id, status, workflow_status)
+              VALUES (?, ?, ?, ?, ?, 'AVAILABLE', 'Free')`)
+      .run(tableId, Number(body.number), Number(body.capacity || 4), body.sectionId, restaurantId);
+    enqueueSync("table", tableId, "create");
+
+    return jsonResponse({ success: true, id: tableId });
+  }
+
+  // ── DELETE /api/edge/admin/table/:id — soft delete table ───────────────────
+  if (url.pathname.startsWith("/api/edge/admin/table/") && req.method === "DELETE") {
+    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    const tableId = url.pathname.split("/").pop()!;
+
+    const db = getDb();
+    const restaurantId = getRestaurantId();
+    db.query("UPDATE \"table\" SET status = 'REMOVED', workflow_status = 'Removed' WHERE id = ? AND restaurant_id = ?")
+      .run(tableId, restaurantId);
+    enqueueSync("table", tableId, "update");
+
+    return jsonResponse({ success: true, id: tableId });
+  }
+
+  // ── POST /api/edge/admin/category — create category ────────────────────────
+  if (url.pathname === "/api/edge/admin/category" && req.method === "POST") {
+    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    let body: any;
+    try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
+
+    if (!body.name) return errorResponse("name is required", 400);
+
+    const db = getDb();
+    const restaurantId = getRestaurantId();
+    const categoryId = crypto.randomUUID();
+
+    db.query("INSERT INTO category (id, name, restaurant_id, sort_order, is_active, printer_target) VALUES (?, ?, ?, 0, 1, ?)")
+      .run(categoryId, body.name, restaurantId, body.printerTarget || null);
+    enqueueSync("category", categoryId, "create");
+
+    return jsonResponse({ success: true, id: categoryId });
+  }
+
+  // ── PATCH /api/edge/admin/category/:id — update category ───────────────────
+  if (url.pathname.startsWith("/api/edge/admin/category/") && req.method === "PATCH") {
+    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    const categoryId = url.pathname.split("/").pop()!;
+    let body: any;
+    try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
+
+    const db = getDb();
+    const restaurantId = getRestaurantId();
+    const updates: string[] = [];
+    const values: any[] = [];
+
+    if (body.name !== undefined) { updates.push("name = ?"); values.push(body.name); }
+    if (body.sortOrder !== undefined) { updates.push("sort_order = ?"); values.push(Number(body.sortOrder)); }
+    if (body.printerTarget !== undefined) { updates.push("printer_target = ?"); values.push(body.printerTarget); }
+
+    if (updates.length === 0) return errorResponse("No fields to update", 400);
+
+    values.push(categoryId);
+    db.query(`UPDATE category SET ${updates.join(", ")} WHERE id = ? AND restaurant_id = ?`).run(...values, restaurantId);
+    enqueueSync("category", categoryId, "update");
+
+    return jsonResponse({ success: true, id: categoryId });
+  }
+
+  // ── DELETE /api/edge/admin/category/:id — soft delete category ──────────────
+  if (url.pathname.startsWith("/api/edge/admin/category/") && req.method === "DELETE") {
+    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    const categoryId = url.pathname.split("/").pop()!;
+
+    const db = getDb();
+    const restaurantId = getRestaurantId();
+    db.query("UPDATE category SET is_active = 0 WHERE id = ? AND restaurant_id = ?").run(categoryId, restaurantId);
+    enqueueSync("category", categoryId, "update");
+
+    return jsonResponse({ success: true, id: categoryId });
+  }
+
+  // ── POST /api/edge/admin/staff — create staff member ────────────────────────
+  if (url.pathname === "/api/edge/admin/staff" && req.method === "POST") {
+    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    let body: any;
+    try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
+
+    if (!body.name || !body.pin) return errorResponse("name and pin are required", 400);
+
+    const db = getDb();
+    const restaurantId = getRestaurantId();
+    const userId = crypto.randomUUID();
+    const { hashSync } = await import("bcryptjs");
+    const pinHash = hashSync(String(body.pin), 10);
+
+    db.query("INSERT INTO users (id, name, pin, role, outlet_id, is_active, synced_at) VALUES (?, ?, ?, ?, ?, 1, unixepoch())")
+      .run(userId, body.name, pinHash, body.role || "CAPTAIN", restaurantId);
+    enqueueSync("users", userId, "create");
+
+    return jsonResponse({ success: true, id: userId });
+  }
+
+  // ── PATCH /api/edge/admin/staff/:id — update staff member ───────────────────
+  if (url.pathname.startsWith("/api/edge/admin/staff/") && req.method === "PATCH") {
+    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    const userId = url.pathname.split("/").pop();
+    let body: any;
+    try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
+
+    const db = getDb();
+    const restaurantId = getRestaurantId();
+    const updates: string[] = [];
+    const values: any[] = [];
+
+    if (body.name !== undefined) { updates.push("name = ?"); values.push(body.name); }
+    if (body.isActive !== undefined) { updates.push("is_active = ?"); values.push(body.isActive ? 1 : 0); }
+    if (body.role !== undefined) { updates.push("role = ?"); values.push(body.role); }
+    if (body.pin !== undefined) {
+      const { hashSync } = await import("bcryptjs");
+      updates.push("pin = ?"); values.push(hashSync(String(body.pin), 10));
+    }
+
+    if (updates.length === 0) return errorResponse("No fields to update", 400);
+
+    values.push(userId);
+    db.query(`UPDATE users SET ${updates.join(", ")} WHERE id = ? AND outlet_id = ?`).run(...values, restaurantId);
+    enqueueSync("users", userId, "update");
+
+    return jsonResponse({ success: true, id: userId });
+  }
+
+  // ── DELETE /api/edge/admin/staff/:id — deactivate staff member ──────────────
+  if (url.pathname.startsWith("/api/edge/admin/staff/") && req.method === "DELETE") {
+    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    const userId = url.pathname.split("/").pop()!;
+
+    const db = getDb();
+    const restaurantId = getRestaurantId();
+    db.query("UPDATE users SET is_active = 0 WHERE id = ? AND outlet_id = ?").run(userId, restaurantId);
+    enqueueSync("users", userId, "update");
+
+    return jsonResponse({ success: true, id: userId });
+  }
+
+  // ── PATCH /api/edge/admin/outlet — update outlet settings ───────────────────
+  if (url.pathname === "/api/edge/admin/outlet" && req.method === "PATCH") {
+    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    let body: any;
+    try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
+
+    const db = getDb();
+    const restaurantId = getRestaurantId();
+    const updates: string[] = [];
+    const values: any[] = [];
+
+    if (body.name !== undefined) { updates.push("name = ?"); values.push(body.name); }
+    if (body.address !== undefined) { updates.push("address = ?"); values.push(body.address); }
+    if (body.phone !== undefined) { updates.push("phone = ?"); values.push(body.phone); }
+    if (body.email !== undefined) { updates.push("email = ?"); values.push(body.email); }
+    if (body.gstin !== undefined) { updates.push("gstin = ?"); values.push(body.gstin); }
+    if (body.gstCategory !== undefined) { updates.push("gst_category = ?"); values.push(body.gstCategory); }
+    if (body.gstRate !== undefined) { updates.push("gst_rate = ?"); values.push(Number(body.gstRate)); }
+    if (body.gstRegistered !== undefined) { updates.push("gst_registered = ?"); values.push(body.gstRegistered ? 1 : 0); }
+    if (body.pricesIncludeGst !== undefined) { updates.push("prices_include_gst = ?"); values.push(body.pricesIncludeGst ? 1 : 0); }
+    if (body.receiptHeader !== undefined) { updates.push("receipt_header = ?"); values.push(body.receiptHeader); }
+    if (body.receiptSubHeader !== undefined) { updates.push("receipt_sub_header = ?"); values.push(body.receiptSubHeader); }
+    if (body.themePrimary !== undefined) { updates.push("theme_primary = ?"); values.push(body.themePrimary); }
+    if (body.serviceChargePercent !== undefined) { updates.push("service_charge_percent = ?"); values.push(Number(body.serviceChargePercent)); }
+
+    if (updates.length === 0) return errorResponse("No fields to update", 400);
+
+    values.push(restaurantId);
+    db.query(`UPDATE outlet SET ${updates.join(", ")} WHERE id = ?`).run(...values);
+    enqueueSync("outlet", restaurantId, "update");
+
+    return jsonResponse({ success: true, id: restaurantId });
   }
 
   // ── 404 ─────────────────────────────────────────────────────────────────────
@@ -401,6 +926,32 @@ const server = Bun.serve({
 
 console.log(`[EdgeServer] SoftShape Edge Server running on http://0.0.0.0:${server.port}`);
 console.log(`[EdgeServer] Health check: http://localhost:${server.port}/health`);
+
+// ── Startup maintenance: backup + prune ──────────────────────────────────────
+try {
+  runDailyMaintenance(getDb());
+} catch (err) {
+  console.error("[EdgeServer] Startup maintenance failed:", err);
+}
+
+// Run maintenance every 24 hours
+setInterval(() => {
+  try { runDailyMaintenance(getDb()); } catch {}
+}, 24 * 60 * 60 * 1000);
+
+// ── Corruption recovery: trigger config re-download if DB was recovered ──────
+const _recovery = getRecoveryStatus();
+if (_recovery.recovered) {
+  console.warn("[EdgeServer] Database was recovered from corruption — attempting full config re-download...");
+  const session = loadSession();
+  if (session?.backendUrl && session?.sessionToken) {
+    downloadFullConfig()
+      .then(() => console.log("[EdgeServer] Config re-download complete"))
+      .catch(err => console.warn("[EdgeServer] Config re-download failed (will retry on next sync):", err));
+  } else {
+    console.warn("[EdgeServer] No session — config will download after registration");
+  }
+}
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 

@@ -29,6 +29,7 @@ interface ConfigResponse {
   menuAddons: any[];
   venuePrices: any[];
   venueAvailability: any[];
+  users: any[];
 }
 
 export async function downloadFullConfig(): Promise<{ success: boolean; error?: string; tablesLoaded?: number }> {
@@ -251,6 +252,20 @@ export async function downloadFullConfig(): Promise<{ success: boolean; error?: 
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(venue_id, menu_item_id) DO UPDATE SET is_available=excluded.is_available
       `).run(va.id, va.venueId, va.menuItemId, va.restaurantId, va.isAvailable !== false ? 1 : 0);
+      totalRows++;
+    }
+
+    // ── Users (staff accounts for offline PIN verification) ────────────────
+    for (const u of config.users || []) {
+      db.query(`INSERT INTO users (id, name, pin, role, is_active, outlet_id, permissions, synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch())
+        ON CONFLICT(id) DO UPDATE SET name=excluded.name, pin=excluded.pin, role=excluded.role,
+        is_active=excluded.is_active, permissions=excluded.permissions, synced_at=unixepoch()
+      `).run(
+        u.id, u.name, u.pin || null, u.role,
+        u.isActive !== false ? 1 : 0, u.outletId || restaurantId,
+        JSON.stringify(u.permissions || {})
+      );
       totalRows++;
     }
 
@@ -506,6 +521,19 @@ function applyChange(db: any, change: any): boolean {
       `).run(row.id, row.venueId, row.menuItemId, row.restaurantId, row.isAvailable !== false ? 1 : 0);
       return true;
 
+    // ── User ─────────────────────────────────────────────────────────────────
+    case "user":
+      db.query(`INSERT INTO users (id, name, pin, role, is_active, outlet_id, permissions, synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch())
+        ON CONFLICT(id) DO UPDATE SET name=excluded.name, pin=excluded.pin, role=excluded.role,
+        is_active=excluded.is_active, permissions=excluded.permissions, synced_at=unixepoch()
+      `).run(
+        row.id, row.name, row.pin || null, row.role,
+        row.isActive !== false ? 1 : 0, row.outletId,
+        JSON.stringify(row.permissions || {})
+      );
+      return true;
+
     default:
       console.warn(`[Config] Unknown table for incremental sync: ${table}`);
       return false;
@@ -528,6 +556,7 @@ const TABLE_NAME_MAP: Record<string, string> = {
   menu_item_addon: "menu_item_addon",
   venue_price: "venue_price",
   venue_menu_item_availability: "venue_menu_item_availability",
+  user: "users",
 };
 
 // ── Apply a batch of changes (used by socket real-time push) ─────────────────

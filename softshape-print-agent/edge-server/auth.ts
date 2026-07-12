@@ -83,3 +83,30 @@ export function getSessionToken(): string | null {
   const session = loadSession();
   return session?.sessionToken ?? null;
 }
+
+// ── Device identity ──────────────────────────────────────────────────────────
+// Each edge server instance gets a unique deviceId on first launch.
+// Persisted in edge_config, used to tag sync pushes so the cloud can track
+// which device originated each change and which bill-number series it owns.
+
+let cachedDeviceId: string | null = null;
+
+export function getDeviceId(): string {
+  if (cachedDeviceId) return cachedDeviceId;
+
+  const stored = getConfig("device_id");
+  if (stored) {
+    cachedDeviceId = stored;
+    return stored;
+  }
+
+  // Generate a new deviceId — crypto.randomUUID if available, fallback to timestamp+random
+  const newId = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+    ? crypto.randomUUID()
+    : `edge-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+  setConfig("device_id", newId);
+  cachedDeviceId = newId;
+  console.log(`[Auth] Generated new device ID: ${newId}`);
+  return newId;
+}

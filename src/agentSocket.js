@@ -226,11 +226,7 @@ export function setPrinterStatus(status) {
 function getPrinterStatusForType(type) {
   if (type === "KOT" || type === "TABLE_SWAP") return printerStatus.kitchen || "unknown";
   if (type === "BAR_KOT") return printerStatus.bar || "unknown";
-<<<<<<< HEAD
   if (type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "BILL" || type === "VOUCHER" || type === "EXPENDITURE") return printerStatus.bill || "unknown";
-=======
-  if (type === "FINAL_BILL" || type === "BILL" || type === "VOUCHER" || type === "EXPENDITURE") return printerStatus.bill || "unknown";
->>>>>>> 77bd5b6 (dont know what i di)
   if (type === "CANCEL_KOT" || type === "CANCEL_ORDER") {
     // Cancel routing depends on item type — check both
     return printerStatus.kitchen || printerStatus.bar || "unknown";
@@ -241,7 +237,6 @@ function getPrinterStatusForType(type) {
 // ── EventId dedup ────────────────────────────────────────────────────────────
 // Prevents double-printing when the agent reconnects: the backend re-delivers
 // buffered PENDING jobs via socket while the agent's own offline localStorage
-<<<<<<< HEAD
 // queue may also hold the same job.  We use the shared Rust dedup state from
 // the HTTP server so both socket and HTTP paths share the same dedup set.
 async function isEventIdSeen(id) {
@@ -253,13 +248,6 @@ async function isEventIdSeen(id) {
     return false;
   }
 }
-=======
-// queue may also hold the same job.  We track seen eventIds in a bounded Set
-// so duplicates are skipped and a success ack is sent immediately.
-const SEEN_EVENT_IDS_MAX = 500;
-const seenEventIds = new Set();
-const ackedEventIds = new Set();
->>>>>>> 77bd5b6 (dont know what i di)
 
 async function markEventIdSeen(id) {
   const invoke = getTauriInvoke();
@@ -494,11 +482,7 @@ export async function handlePrintJob(envelope) {
   if (!targetPrinter) {
     if (type === "KOT") targetPrinter = printerMapping.kitchen;
     else if (type === "BAR_KOT") targetPrinter = printerMapping.bar;
-<<<<<<< HEAD
     else if (type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "BILL" || type === "VOUCHER" || type === "EXPENDITURE") targetPrinter = printerMapping.bill;
-=======
-    else if (type === "FINAL_BILL" || type === "BILL" || type === "VOUCHER" || type === "EXPENDITURE") targetPrinter = printerMapping.bill;
->>>>>>> 77bd5b6 (dont know what i di)
     else if (type === "CANCEL_KOT" || type === "CANCEL_ORDER") {
       // Route cancel slips to the correct printer based on the cancelled item's type
       const cancelItem = data?.item || data?.items?.[0];
