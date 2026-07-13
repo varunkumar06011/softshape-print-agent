@@ -16,7 +16,8 @@ import { io } from "socket.io-client";
 // Backend URL — must be injected at build time via VITE_BACKEND_URL
 const BACKEND_URL = typeof import.meta !== "undefined" && import.meta.env?.VITE_BACKEND_URL;
 if (!BACKEND_URL) {
-  throw new Error("VITE_BACKEND_URL is not set. The print agent cannot connect without a backend URL.");
+  console.error("VITE_BACKEND_URL is not set. The print agent cannot connect to the backend. " +
+    "Set VITE_BACKEND_URL in your environment before building.");
 }
 
 // Resolve the Tauri invoke function regardless of API shape. Tauri v1 with
@@ -397,7 +398,14 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
 
   socket.on("connect", () => {
     isOnline = true;
-    socket.emit("agent:join", { restaurantId, sessionToken });
+    // Send stations and printerNames so the backend can route print_job events
+    // to printer-specific rooms instead of broadcasting to all agents.
+    const stations = ["KOT", "BAR_KOT", "CANCEL_KOT", "FINAL_BILL", "TABLE_SWAP", "EXPENDITURE"];
+    const printerNames = [];
+    if (printerMapping.kitchen) printerNames.push(printerMapping.kitchen);
+    if (printerMapping.bar) printerNames.push(printerMapping.bar);
+    if (printerMapping.bill) printerNames.push(printerMapping.bill);
+    socket.emit("agent:join", { restaurantId, sessionToken, stations, printerNames: [...new Set(printerNames)] });
     onStatusChangeCb?.("connected");
     // Flush any print jobs that were queued while offline
     flushOfflineQueue();
@@ -456,12 +464,15 @@ export async function handlePrintJob(envelope) {
   // job is printed exactly once.
   if (envelope.eventId && await isEventIdSeen(envelope.eventId)) {
     console.log(`[Agent] Duplicate eventId skipped: ${envelope.eventId}`);
-    socket?.emit("print:ack", {
-      restaurantId,
-      eventId: envelope.eventId,
-      requestId: data?.requestId,
-      status: "success",
-    });
+    if (!ackedEventIds.has(envelope.eventId)) {
+      socket?.emit("print:ack", {
+        restaurantId,
+        eventId: envelope.eventId,
+        requestId: data?.requestId,
+        status: "success",
+      });
+      ackedEventIds.add(envelope.eventId);
+    }
     return;
   }
   if (envelope.eventId) await markEventIdSeen(envelope.eventId);
@@ -538,6 +549,8 @@ export async function handlePrintJob(envelope) {
   const encoder = new TextEncoder();
   const bytes = encoder.encode(rawString);
 
+  const PRINT_TIMEOUT_MS = 10000;
+
   try {
     // Invoke Tauri Rust command
     const invoke = getTauriInvoke();
@@ -545,23 +558,28 @@ export async function handlePrintJob(envelope) {
       // Detect network printer (IP:port format, e.g. "192.168.1.100:9100")
       const netMatch = targetPrinter.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)$/);
       if (netMatch) {
-        await invoke("print_network", {
-          ip: netMatch[1],
-          port: parseInt(netMatch[2], 10),
-          bytes: Array.from(bytes),
-        });
+        await Promise.race([
+          invoke("print_network", {
+            ip: netMatch[1],
+            port: parseInt(netMatch[2], 10),
+            bytes: Array.from(bytes),
+          }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Print timeout")), PRINT_TIMEOUT_MS)),
+        ]);
       } else {
-        await invoke("print_raw", {
-          printerName: targetPrinter,
-          bytes: Array.from(bytes),
-        });
+        await Promise.race([
+          invoke("print_raw", {
+            printerName: targetPrinter,
+            bytes: Array.from(bytes),
+          }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Print timeout")), PRINT_TIMEOUT_MS)),
+        ]);
       }
     } else {
       console.log(`[Agent] (dev mode) Would print [${type}] → ${targetPrinter} (${bytes.length} bytes)`);
     }
     console.log(`[Agent] Printed [${type}] → ${targetPrinter}`);
-
-    // Acknowledge to backend
+    if (envelope.eventId) ackedEventIds.add(envelope.eventId);
     socket?.emit("print:ack", {
       restaurantId,
       eventId: envelope.eventId,
@@ -570,6 +588,7 @@ export async function handlePrintJob(envelope) {
     });
   } catch (err) {
     console.error(`[Agent] Print failed [${type}] → ${targetPrinter}:`, err);
+    if (envelope.eventId) ackedEventIds.add(envelope.eventId);
     socket?.emit("print:ack", {
       restaurantId,
       eventId: envelope.eventId,
