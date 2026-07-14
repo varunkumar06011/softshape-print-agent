@@ -159,7 +159,7 @@ export function startSocketSync(): void {
         if (sets.length === 1) return; // Only updated_at — nothing to update
 
         params.push(t.id);
-        db.query(`UPDATE table SET ${sets.join(", ")} WHERE id = ?`).run(...params);
+        db.query(`UPDATE "table" SET ${sets.join(", ")} WHERE id = ?`).run(...params);
         setSyncState("last_socket_sync", new Date().toISOString());
         console.log(`[SocketSync] Table ${t.id} updated (${sets.length - 1} fields)`);
       }

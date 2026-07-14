@@ -168,7 +168,7 @@ export async function downloadFullConfig(): Promise<{ success: boolean; error?: 
 
     // ── Tables ───────────────────────────────────────────────────────────────
     for (const t of config.tables) {
-      db.query(`INSERT INTO table (id, number, capacity, status, section_id, restaurant_id, workflow_status, captain_id, guests, session_started_at, current_bill, kot_history, discount, section_tag, last_waiter_call_at, updated_at)
+      db.query(`INSERT INTO "table" (id, number, capacity, status, section_id, restaurant_id, workflow_status, captain_id, guests, session_started_at, current_bill, kot_history, discount, section_tag, last_waiter_call_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET number=excluded.number, capacity=excluded.capacity, status=excluded.status,
         section_id=excluded.section_id, workflow_status=excluded.workflow_status, captain_id=excluded.captain_id,
@@ -441,7 +441,7 @@ function applyChange(db: any, change: any): boolean {
 
     // ── Table ───────────────────────────────────────────────────────────────
     case "table":
-      db.query(`INSERT INTO table (id, number, capacity, status, section_id, restaurant_id, workflow_status, captain_id, guests, session_started_at, current_bill, kot_history, discount, section_tag, last_waiter_call_at, updated_at)
+      db.query(`INSERT INTO "table" (id, number, capacity, status, section_id, restaurant_id, workflow_status, captain_id, guests, session_started_at, current_bill, kot_history, discount, section_tag, last_waiter_call_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET number=excluded.number, capacity=excluded.capacity, status=excluded.status,
         section_id=excluded.section_id, workflow_status=excluded.workflow_status, captain_id=excluded.captain_id,
@@ -549,7 +549,7 @@ const TABLE_NAME_MAP: Record<string, string> = {
   venue: "venue",
   floor: "floor",
   section: "section",
-  table: "table",
+  table: "\"table\"",
   category: "category",
   menu_item: "menu_item",
   menu_item_variant: "menu_item_variant",

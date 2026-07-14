@@ -152,7 +152,7 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_section_floor ON section(floor_id);
 
     -- ── Tables ──────────────────────────────────────────────────────────────
-    CREATE TABLE IF NOT EXISTS table (
+    CREATE TABLE IF NOT EXISTS "table" (
       id                TEXT PRIMARY KEY,
       number            INTEGER NOT NULL,
       capacity          INTEGER DEFAULT 4,
@@ -170,8 +170,8 @@ function initSchema(database: Database) {
       last_waiter_call_at INTEGER,  -- epoch ms
       updated_at        INTEGER NOT NULL DEFAULT (unixepoch())
     );
-    CREATE INDEX IF NOT EXISTS idx_table_restaurant_status ON table(restaurant_id, status);
-    CREATE INDEX IF NOT EXISTS idx_table_section ON table(section_id);
+    CREATE INDEX IF NOT EXISTS idx_table_restaurant_status ON "table"(restaurant_id, status);
+    CREATE INDEX IF NOT EXISTS idx_table_section ON "table"(section_id);
 
     -- ── Categories ───────────────────────────────────────────────────────────
     CREATE TABLE IF NOT EXISTS category (

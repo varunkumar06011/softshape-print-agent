@@ -15,7 +15,7 @@
 import { Database } from "bun:sqlite";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
-import { existsSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync } from "node:fs";
 
 const DB_PATH = process.env.EDGE_DB_PATH || join(homedir(), ".softshape", "edge.db");
 
@@ -31,6 +31,9 @@ export function openDatabaseWithRecovery(): { db: Database; recovery: RecoveryRe
     corruptPath: null,
     message: "",
   };
+
+  // Ensure parent directory exists — SQLite {create:true} does not create it
+  mkdirSync(dirname(DB_PATH), { recursive: true });
 
   // Try opening the existing DB
   try {

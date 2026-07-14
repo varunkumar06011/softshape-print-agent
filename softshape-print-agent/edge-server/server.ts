@@ -30,9 +30,9 @@
 
 import { getDb, closeDb, getConfig, setConfig, getSyncState, enqueueSync, getRecoveryStatus } from "./db.ts";
 import { runDailyMaintenance } from "./backup.ts";
-import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getRestaurantId, getDeviceId } from "./auth.ts";
+import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { downloadFullConfig, pullIncrementalChanges } from "./config.ts";
-import { createOrder, cancelKotItem, reprintKot } from "./orderService.ts";
+import { createOrder, updateOrderItems, cancelKotItem, reprintKot } from "./orderService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings } from "./reads.ts";
 import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters } from "./sync.ts";
 import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat } from "./socketSync.ts";
@@ -44,7 +44,7 @@ const PORT = parseInt(process.env.EDGE_PORT || "3100", 10);
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Edge-Key",
 };
 
 function jsonResponse(data: any, status = 200, extraHeaders: Record<string, string> = {}): Response {
@@ -64,6 +64,29 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   // ── CORS preflight ──────────────────────────────────────────────────────────
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+
+  // ── LAN API key auth (staged rollout) ────────────────────────────────────────
+  // Public routes that don't require the edge API key. Everything else must either
+  // present the correct X-Edge-Key header or wait until the restaurant has flipped
+  // enforcement via EDGE_REQUIRE_KEY=true.
+  const PUBLIC_LAN_PATHS = new Set([
+    "/health",
+    "/api/edge/register",
+    "/api/edge/onboard",
+  ]);
+
+  if (!PUBLIC_LAN_PATHS.has(url.pathname)) {
+    const configuredKey = getEdgeApiKey();
+    const requireKey = process.env.EDGE_REQUIRE_KEY === "true";
+    const provided = req.headers.get("X-Edge-Key");
+
+    if (configuredKey && provided && provided !== configuredKey) {
+      return errorResponse("Invalid edge API key", 401);
+    }
+    if (requireKey && (!provided || provided !== configuredKey)) {
+      return errorResponse("Missing or invalid edge API key", 401);
+    }
   }
 
   // ── GET /health ─────────────────────────────────────────────────────────────
@@ -98,7 +121,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Count local rows for status
     const db = getDb();
-    const tableCount = (db.query("SELECT COUNT(*) as c FROM table").get() as any)?.c || 0;
+    const tableCount = (db.query("SELECT COUNT(*) as c FROM \"table\"").get() as any)?.c || 0;
     const menuItemCount = (db.query("SELECT COUNT(*) as c FROM menu_item WHERE is_deleted = 0").get() as any)?.c || 0;
     const orderCount = (db.query("SELECT COUNT(*) as c FROM order_record WHERE is_deleted = 0").get() as any)?.c || 0;
     const pendingSyncCount = (db.query("SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0").get() as any)?.c || 0;
@@ -161,7 +184,11 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         restaurantCode: restaurantCode || "",
         backendUrl,
         expiresAt,
+        edgeApiKey: data.edgeApiKey,
       });
+      if (data.edgeApiKey) {
+        saveEdgeApiKey(data.edgeApiKey);
+      }
 
       // Trigger initial config download
       const configResult = await downloadFullConfig();
@@ -236,6 +263,41 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     }
 
     const result = await createOrder(restaurantId, {
+      tableId: body.tableId,
+      items: body.items || [],
+      captainId: body.captainId,
+      captainName: body.captainName,
+      createdByUserId: body.createdByUserId || body.userId,
+      platform: body.platform,
+      requestId: body.requestId,
+      orderByRole: body.orderByRole,
+    });
+
+    if (!result.success) {
+      return jsonResponse(result, result.statusCode || 400);
+    }
+
+    return jsonResponse(result);
+  }
+
+  // ── POST /api/edge/order/update — add items to existing order + print new KOT ──
+  if (url.pathname === "/api/edge/order/update" && req.method === "POST") {
+    if (!isSessionValid()) {
+      return errorResponse("No valid session", 401);
+    }
+
+    const body = await req.json().catch(() => ({}));
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) {
+      return errorResponse("No restaurant ID in session", 500);
+    }
+
+    if (!body.orderId) {
+      return errorResponse("orderId is required", 400);
+    }
+
+    const result = await updateOrderItems(restaurantId, {
+      orderId: body.orderId,
       tableId: body.tableId,
       items: body.items || [],
       captainId: body.captainId,

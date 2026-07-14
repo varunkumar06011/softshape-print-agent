@@ -114,7 +114,7 @@ function loadRecordData(tableName: string, recordId: string): any | null {
     }
 
     case "table": {
-      const table = db.query("SELECT * FROM table WHERE id = ?").get(recordId) as any;
+      const table = db.query("SELECT * FROM \"table\" WHERE id = ?").get(recordId) as any;
       if (!table) return null;
       return {
         id: table.id,

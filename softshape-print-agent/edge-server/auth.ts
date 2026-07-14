@@ -19,6 +19,7 @@ interface StoredSession {
   restaurantCode: string;
   backendUrl: string;
   expiresAt: number;
+  edgeApiKey?: string;
 }
 
 let cachedSession: StoredSession | null = null;
@@ -32,6 +33,7 @@ export function loadSession(): StoredSession | null {
   const restaurantCode = getConfig("restaurant_code");
   const backendUrl = getConfig("backend_url");
   const expiresAt = getConfig("session_expires_at");
+  const edgeApiKey = getConfig("edge_api_key");
 
   if (!token || !restaurantId || !backendUrl) return null;
 
@@ -42,6 +44,7 @@ export function loadSession(): StoredSession | null {
     restaurantCode: restaurantCode || "",
     backendUrl,
     expiresAt: expiresAt ? parseInt(expiresAt, 10) : 0,
+    edgeApiKey: edgeApiKey || undefined,
   };
   return cachedSession;
 }
@@ -53,12 +56,15 @@ export function saveSession(session: StoredSession): void {
   setConfig("restaurant_code", session.restaurantCode);
   setConfig("backend_url", session.backendUrl);
   setConfig("session_expires_at", String(session.expiresAt));
+  if (session.edgeApiKey) {
+    setConfig("edge_api_key", session.edgeApiKey);
+  }
   cachedSession = session;
 }
 
 export function clearSession(): void {
   const db = getDb();
-  db.query("DELETE FROM edge_config WHERE key IN ('session_token', 'restaurant_id', 'restaurant_name', 'restaurant_code', 'backend_url', 'session_expires_at')").run();
+  db.query("DELETE FROM edge_config WHERE key IN ('session_token', 'restaurant_id', 'restaurant_name', 'restaurant_code', 'backend_url', 'session_expires_at', 'edge_api_key')").run();
   cachedSession = null;
 }
 
@@ -89,6 +95,15 @@ export function getRestaurantId(): string | null {
 export function getSessionToken(): string | null {
   const session = loadSession();
   return session?.sessionToken ?? null;
+}
+
+export function getEdgeApiKey(): string | null {
+  const session = loadSession();
+  return session?.edgeApiKey ?? getConfig("edge_api_key") ?? null;
+}
+
+export function saveEdgeApiKey(key: string): void {
+  setConfig("edge_api_key", key);
 }
 
 // ── Device identity ──────────────────────────────────────────────────────────

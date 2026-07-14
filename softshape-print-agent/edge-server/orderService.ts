@@ -51,6 +51,16 @@ export interface CreateOrderResult {
   statusCode?: number;
 }
 
+// ─── Helper: Safe JSON parse ──────────────────────────────────────────────────
+
+function safeParseJson<T>(raw: any, fallback: T): T {
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
 // ─── Helper: Get outlet settings from local DB ───────────────────────────────
 
 function getOutlet(restaurantId: string): any | null {
@@ -59,8 +69,8 @@ function getOutlet(restaurantId: string): any | null {
   if (!row) return null;
   return {
     ...row,
-    printerConfig: row.printer_config ? JSON.parse(row.printer_config) : {},
-    enabledModules: row.enabled_modules ? JSON.parse(row.enabled_modules) : {},
+    printerConfig: safeParseJson(row.printer_config, {}),
+    enabledModules: safeParseJson(row.enabled_modules, {}),
     pricesIncludeGst: !!row.prices_include_gst,
     gstRegistered: !!row.gst_registered,
   };
@@ -74,7 +84,7 @@ function getTableWithSection(tableId: string): any | null {
     SELECT t.*, s.name as section_name, s.venue_id, s.floor_id,
            v.name as venue_name, v.venue_type, v.kot_enabled, v.kot_printer_name, v.bill_printer_name,
            v.price_profile_id, v.tax_profile_id
-    FROM table t
+    FROM "table" t
     LEFT JOIN section s ON t.section_id = s.id
     LEFT JOIN venue v ON s.venue_id = v.id
     WHERE t.id = ?
@@ -246,15 +256,21 @@ export async function createOrder(
     }
 
     // 5. Update table status
-    db.query(`UPDATE table SET status = 'OCCUPIED', workflow_status = 'Preparing', current_bill = current_bill + ?, updated_at = ? WHERE id = ?`)
+    db.query(`UPDATE "table" SET status = 'OCCUPIED', workflow_status = 'Preparing', current_bill = current_bill + ?, updated_at = ? WHERE id = ?`)
       .run(totalAmount, now, tableId);
 
-    // 6. Update KOT history on table
-    const currentHistory = JSON.parse(table.kot_history || "[]") as any[];
+    // 6. Update KOT history on table (safe parse — corrupted JSON should not crash the transaction)
+    let currentHistory: any[] = [];
+    try {
+      currentHistory = JSON.parse(table.kot_history || "[]") as any[];
+      if (!Array.isArray(currentHistory)) currentHistory = [];
+    } catch {
+      currentHistory = [];
+    }
     // Map by index to handle duplicate menuItemIds correctly
     const kotEntry = buildKotHistoryEntry(kotNumber, items.map((i, idx) => ({ ...i, orderItemId: orderItems[idx]?.id })));
     currentHistory.push(kotEntry);
-    db.query(`UPDATE table SET kot_history = ? WHERE id = ?`).run(JSON.stringify(currentHistory), tableId);
+    db.query(`UPDATE "table" SET kot_history = ? WHERE id = ?`).run(JSON.stringify(currentHistory), tableId);
 
     // 7. Enqueue sync records for cloud push
     enqueueSync("order", orderId, "insert");
@@ -371,7 +387,7 @@ export async function createOrder(
   // ── Return result ──────────────────────────────────────────────────────────
   const updatedTable = db.query(`
     SELECT t.*, s.name as section_name
-    FROM table t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?
+    FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?
   `).get(tableId) as any;
 
   const orderItems = db.query("SELECT * FROM order_item WHERE order_id = ?").all(orderId) as any[];
@@ -392,7 +408,305 @@ export async function createOrder(
     },
     table: {
       ...updatedTable,
-      kot_history: JSON.parse(updatedTable.kot_history || "[]"),
+      kot_history: safeParseKotHistory(updatedTable.kot_history),
+    },
+    printResults,
+  };
+}
+
+// ─── Helper: safe-parse kot_history JSON ─────────────────────────────────────
+
+function safeParseKotHistory(raw: any): any[] {
+  try {
+    const parsed = JSON.parse(raw || "[]");
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+// ─── Update Order Items (add items to existing order) ────────────────────────
+
+export interface UpdateOrderItemsInput {
+  orderId: string;
+  tableId: string;
+  items: Array<{
+    menuItemId: string;
+    name: string;
+    price: number;
+    quantity: number;
+    notes?: string | null;
+    menuType?: string;
+  }>;
+  captainId?: string;
+  captainName?: string;
+  createdByUserId?: string;
+  platform?: string;
+  requestId?: string;
+  orderByRole?: string;
+}
+
+export interface UpdateOrderItemsResult {
+  success: boolean;
+  orderId?: string;
+  kotNumber?: number;
+  kotId?: string;
+  table?: any;
+  order?: any;
+  printResults?: any[];
+  error?: string;
+  statusCode?: number;
+}
+
+export async function updateOrderItems(
+  restaurantId: string,
+  input: UpdateOrderItemsInput
+): Promise<UpdateOrderItemsResult> {
+  const { orderId, tableId, items, captainId, captainName, createdByUserId, platform, requestId, orderByRole } = input;
+
+  if (!items || items.length === 0) {
+    return { success: false, error: "No items to add", statusCode: 400 };
+  }
+
+  // Validate item data — reject negative prices or quantities
+  for (const item of items) {
+    if (!item.menuItemId || !item.name) {
+      return { success: false, error: "Each item must have menuItemId and name", statusCode: 400 };
+    }
+    if (Number(item.price) < 0 || Number(item.quantity) <= 0) {
+      return { success: false, error: `Invalid price/quantity for item: ${item.name}`, statusCode: 400 };
+    }
+  }
+
+  const db = getDb();
+
+  // ── Idempotency check ──────────────────────────────────────────────────────
+  if (requestId) {
+    const existing = db.query("SELECT * FROM order_record WHERE last_request_id = ?").get(requestId) as any;
+    if (existing) {
+      const existingItems = db.query("SELECT * FROM order_item WHERE order_id = ?").all(existing.id) as any[];
+      return {
+        success: true,
+        orderId: existing.id,
+        kotNumber: 0,
+        order: { ...existing, items: existingItems },
+        error: "Duplicate request — returning existing order",
+      };
+    }
+  }
+
+  // ── Look up existing order ──────────────────────────────────────────────────
+  const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
+  if (!order) {
+    return { success: false, error: "Order not found", statusCode: 404 };
+  }
+
+  // ── Get table + outlet info ────────────────────────────────────────────────
+  const table = getTableWithSection(tableId);
+  if (!table) {
+    return { success: false, error: "Table not found", statusCode: 404 };
+  }
+
+  const outlet = getOutlet(restaurantId);
+  if (!outlet) {
+    return { success: false, error: "Outlet not found in local DB", statusCode: 404 };
+  }
+
+  // ── Get menu items with categories for printer routing ─────────────────────
+  const menuItemIds = items.map((i) => i.menuItemId).filter(Boolean);
+  const menuItemMap = getMenuItemsWithCategories(menuItemIds);
+
+  // ── Calculate additional total ──────────────────────────────────────────────
+  const additionalAmount = items.reduce((sum, i) => sum + Number(i.price) * i.quantity, 0);
+
+  // ── Generate new KOT for just the new items ─────────────────────────────────
+  const kotId = crypto.randomUUID();
+  const kotNumber = getNextKotNumber(restaurantId);
+
+  // ── Transaction: insert new items + new KOT + update order total ───────────
+  const tx = db.transaction(() => {
+    const now = Date.now();
+
+    const newOrderItemIds: string[] = [];
+
+    // 1. Insert new order items
+    for (const item of items) {
+      const orderItemId = crypto.randomUUID();
+      newOrderItemIds.push(orderItemId);
+      db.query(`INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, notes, menu_type, cloud_synced)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+      `).run(orderItemId, orderId, item.menuItemId, item.name, Number(item.price), item.quantity, item.notes || null, item.menuType || "FOOD");
+    }
+
+    // 2. Create new KOT for the new items
+    db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, created_at, cloud_synced)
+      VALUES (?, ?, ?, ?, ?, ?, 0)
+    `).run(kotId, restaurantId, tableId, orderId, kotNumber, now);
+
+    // 3. Create KOT items for just the new items
+    for (let i = 0; i < items.length; i++) {
+      const kotItemId = crypto.randomUUID();
+      db.query(`INSERT INTO kot_item (id, kot_id, order_item_id, menu_item_id, name, quantity, price, notes, status, created_at, cloud_synced)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'SENT', ?, 0)
+      `).run(kotItemId, kotId, newOrderItemIds[i], items[i].menuItemId, items[i].name, items[i].quantity, Number(items[i].price), items[i].notes || null, now);
+    }
+
+    // 4. Bump order total + update timestamp
+    const newTotal = Number(order.total_amount) + additionalAmount;
+    db.query("UPDATE order_record SET total_amount = ?, updated_at = ?, last_request_id = ? WHERE id = ?")
+      .run(newTotal, now, requestId || null, orderId);
+
+    // 5. Update table current_bill
+    db.query(`UPDATE "table" SET current_bill = current_bill + ?, updated_at = ? WHERE id = ?`)
+      .run(additionalAmount, now, tableId);
+
+    // 6. Update KOT history on table (safe parse — corrupted JSON should not crash the transaction)
+    let currentHistory: any[] = [];
+    try {
+      currentHistory = JSON.parse(table.kot_history || "[]") as any[];
+      if (!Array.isArray(currentHistory)) currentHistory = [];
+    } catch {
+      currentHistory = [];
+    }
+    const kotEntry = buildKotHistoryEntry(kotNumber, items.map((i, idx) => ({ ...i, orderItemId: newOrderItemIds[idx] })));
+    currentHistory.push(kotEntry);
+    db.query(`UPDATE "table" SET kot_history = ? WHERE id = ?`).run(JSON.stringify(currentHistory), tableId);
+
+    // 7. Enqueue sync records
+    enqueueSync("order", orderId, "update");
+    enqueueSync("kot", kotId, "insert");
+    enqueueSync("table", tableId, "update");
+    for (const oiId of newOrderItemIds) {
+      enqueueSync("order_item", oiId, "insert");
+    }
+  });
+
+  try {
+    tx();
+  } catch (err: any) {
+    if (err.message && err.message.includes("UNIQUE")) {
+      return { success: false, error: "Duplicate request — order already updated", statusCode: 409 };
+    }
+    throw err;
+  }
+
+  // ── Build ESC/POS and print (same logic as createOrder) ────────────────────
+  const formattedTableNumber = formatTableNumber(table);
+  const restaurantName = outlet.receipt_header || outlet.name;
+  const sectionName = table.section_name || "Main Hall";
+  const sectionTag = table.section_tag;
+  const printerConfig = outlet.printerConfig || {};
+
+  const mappedItems = items.map((i) => {
+    const cat = menuItemMap.get(i.menuItemId) || {};
+    const resolvedPrinterName = resolvePrinterName(
+      cat.printer_name || null,
+      cat.printer_target || null,
+      cat.category_printer_target || null,
+      printerConfig
+    );
+    return {
+      ...i,
+      printerName: resolvedPrinterName,
+      printerTarget: cat.printer_target || cat.category_printer_target,
+    };
+  });
+
+  // Group items by printer
+  const groupedByPrinter = new Map<string | undefined, typeof mappedItems>();
+  for (const item of mappedItems) {
+    const key = item.printerName;
+    if (!groupedByPrinter.has(key)) groupedByPrinter.set(key, []);
+    groupedByPrinter.get(key)!.push(item);
+  }
+
+  const printGroups: Array<{ printerName: string; escposData: any[] }> = [];
+  const kotOrderData: OrderData = {
+    tableNumber: formattedTableNumber,
+    orderId,
+    items: mappedItems.map((i) => ({
+      name: i.name,
+      quantity: i.quantity,
+      price: Number(i.price),
+      notes: i.notes ?? null,
+      type: (i.menuType === "LIQUOR" ? "liquor" : "food") as "food" | "liquor",
+    })),
+    restaurantName,
+    kotId: String(kotNumber),
+    sectionName,
+    captainName: captainName || "Captain",
+    orderByRole: orderByRole || "CASHIER",
+    sectionTag: sectionTag || undefined,
+  };
+
+  for (const [printerName, groupItems] of groupedByPrinter) {
+    if (!printerName) {
+      const kitchenItems = groupItems.filter((i) => i.printerTarget !== "BAR_PRINTER" && i.menuType !== "LIQUOR");
+      const barItems = groupItems.filter((i) => i.printerTarget === "BAR_PRINTER" || i.menuType === "LIQUOR");
+
+      if (kitchenItems.length > 0) {
+        const kitchenPrintItems = kitchenItems.map((i) => ({
+          name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null, type: "food" as const,
+        }));
+        const escpos = buildFoodKOT({ ...kotOrderData, items: kitchenPrintItems });
+        if (escpos.length > 0) {
+          const fallbackPrinter = table.kot_printer_name || resolvePrinterName(null, "KOT_PRINTER", null, printerConfig);
+          if (fallbackPrinter) printGroups.push({ printerName: fallbackPrinter, escposData: escpos });
+        }
+      }
+      if (barItems.length > 0) {
+        const barPrintItems = barItems.map((i) => ({
+          name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null, type: "liquor" as const,
+        }));
+        const escpos = buildLiquorKOT({ ...kotOrderData, items: barPrintItems });
+        if (escpos.length > 0) {
+          const fallbackPrinter = resolvePrinterName(null, "BAR_PRINTER", null, printerConfig);
+          if (fallbackPrinter) printGroups.push({ printerName: fallbackPrinter, escposData: escpos });
+        }
+      }
+    } else {
+      const isAllLiquor = groupItems.every((i) => i.menuType === "LIQUOR");
+      const builder = isAllLiquor ? buildLiquorKOT : buildFoodKOT;
+      const printItems = groupItems.map((i) => ({
+        name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null,
+        type: (i.menuType === "LIQUOR" ? "liquor" : "food") as "food" | "liquor",
+      }));
+      const escpos = builder({ ...kotOrderData, items: printItems });
+      if (escpos.length > 0) {
+        printGroups.push({ printerName, escposData: escpos });
+      }
+    }
+  }
+
+  // ── Print all groups ────────────────────────────────────────────────────────
+  const printResults = await printGrouped(printGroups);
+
+  // ── Return result ──────────────────────────────────────────────────────────
+  const updatedTable = db.query(`
+    SELECT t.*, s.name as section_name
+    FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?
+  `).get(tableId) as any;
+
+  const orderItems = db.query("SELECT * FROM order_item WHERE order_id = ?").all(orderId) as any[];
+  const updatedOrder = db.query("SELECT * FROM order_record WHERE id = ?").get(orderId) as any;
+
+  return {
+    success: true,
+    orderId,
+    kotNumber,
+    kotId,
+    order: {
+      id: orderId,
+      tableId,
+      status: updatedOrder.status,
+      totalAmount: Number(updatedOrder.total_amount),
+      items: orderItems,
+      captainId,
+      platform: platform || "DINE_IN",
+    },
+    table: {
+      ...updatedTable,
+      kot_history: safeParseKotHistory(updatedTable.kot_history),
     },
     printResults,
   };

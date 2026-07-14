@@ -44,7 +44,7 @@ export function getTablesForRestaurant(): any[] {
     const tables = db.query(`
       SELECT t.*,
              (SELECT COUNT(*) FROM order_record o WHERE o.table_id = t.id AND o.status IN (${ACTIVE_ORDER_STATUSES.map(() => "?").join(",")}) AND o.is_deleted = 0) as active_order_count
-      FROM table t
+      FROM "table" t
       WHERE t.section_id = ? AND t.restaurant_id = ?
       ORDER BY t.number ASC
     `).all(...ACTIVE_ORDER_STATUSES, section.id, restaurantId) as any[];
@@ -84,7 +84,7 @@ export function getTablesFlat(): any[] {
   const tables = db.query(`
     SELECT t.*, s.name as section_name, s.venue_id,
            v.name as venue_name, v.venue_type, v.kot_enabled
-    FROM table t
+    FROM "table" t
     LEFT JOIN section s ON t.section_id = s.id
     LEFT JOIN venue v ON s.venue_id = v.id
     WHERE t.restaurant_id = ?
@@ -238,7 +238,7 @@ export function getSections(): any[] {
 
   return sections.map((s) => {
     const tables = db.query(`
-      SELECT * FROM table WHERE section_id = ? AND restaurant_id = ?
+      SELECT * FROM "table" WHERE section_id = ? AND restaurant_id = ?
       ORDER BY number ASC
     `).all(s.id, restaurantId) as any[];
 
