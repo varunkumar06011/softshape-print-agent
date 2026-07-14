@@ -12,7 +12,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { getDb, getNextKotNumber, enqueueSync } from "./db.ts";
-import { buildFoodKOT, buildLiquorKOT, buildCancelKOT, type PrintItem, type OrderData } from "./escpos.ts";
+import { buildFoodKOT, buildLiquorKOT, buildCancelKOT, buildBill, type PrintItem, type OrderData } from "./escpos.ts";
 import { printToPrinter, printGrouped, resolvePrinterName } from "./printer.ts";
 
 // ─── Active order statuses ───────────────────────────────────────────────────
@@ -909,4 +909,492 @@ export async function reprintKot(input: ReprintKotInput): Promise<{ success: boo
 
   const printResults = await printGrouped(printGroups);
   return { success: true, printResults };
+}
+
+// ─── Get next bill number (local counter, atomic) ─────────────────────────────
+
+function getNextBillNumber(restaurantId: string): string {
+  const db = getDb();
+  const today = new Date().toISOString().slice(0, 10);
+
+  db.query("INSERT INTO daily_counter (id, restaurant_id, counter_date, bill_count) VALUES (?, ?, ?, 0) ON CONFLICT(restaurant_id, counter_date) DO NOTHING")
+    .run(crypto.randomUUID(), restaurantId, today);
+
+  const row = db.query("UPDATE daily_counter SET bill_count = bill_count + 1 WHERE restaurant_id = ? AND counter_date = ? RETURNING bill_count")
+    .get(restaurantId, today) as { bill_count: number };
+
+  const dateStr = today.replace(/-/g, "");
+  return `B${dateStr}${String(row.bill_count).padStart(4, "0")}`;
+}
+
+// ─── Request Billing (mark order as billing requested) ────────────────────────
+
+export async function requestBillingEdge(
+  restaurantId: string,
+  orderId: string,
+): Promise<{ success: boolean; error?: string; order?: any }> {
+  const db = getDb();
+  const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
+  if (!order) {
+    return { success: false, error: "Order not found" };
+  }
+
+  const now = Date.now();
+  db.query("UPDATE order_record SET billing_requested = 1, billing_requested_at = ?, updated_at = ?, status = 'BILLING_REQUESTED' WHERE id = ?")
+    .run(now, now, orderId);
+
+  // Update table workflow status
+  db.query(`UPDATE "table" SET workflow_status = 'Waiting Bill', updated_at = ? WHERE id = ?`)
+    .run(now, order.table_id);
+
+  enqueueSync("order", orderId, "update");
+  enqueueSync("table", order.table_id, "update");
+
+  return { success: true, order: { id: orderId, status: "BILLING_REQUESTED" } };
+}
+
+// ─── Print Bill (assign bill number + print) ──────────────────────────────────
+
+export interface PrintBillInput {
+  orderId: string;
+  restaurantId: string;
+  tableNumber?: number;
+  discountPercent?: number;
+  kotNumbers?: string;
+  localPrinted?: boolean;
+  billEventId?: string;
+}
+
+export async function printBillEdge(input: PrintBillInput): Promise<{ success: boolean; error?: string; billNumber?: string; printResults?: any[] }> {
+  const db = getDb();
+  const { orderId, restaurantId, discountPercent } = input;
+
+  const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
+  if (!order) {
+    return { success: false, error: "Order not found" };
+  }
+
+  // Assign bill number if not already assigned
+  let billNumber = order.bill_number;
+  if (!billNumber) {
+    billNumber = getNextBillNumber(restaurantId);
+    db.query("UPDATE order_record SET bill_number = ?, updated_at = ? WHERE id = ?")
+      .run(billNumber, Date.now(), orderId);
+    enqueueSync("order", orderId, "update");
+  }
+
+  // Get table + outlet for print context
+  const table = getTableWithSection(order.table_id);
+  const outlet = getOutlet(restaurantId);
+  if (!table || !outlet) {
+    return { success: true, billNumber };
+  }
+
+  // Get order items (excluding fully cancelled and removed from bill)
+  const orderItems = db.query("SELECT * FROM order_item WHERE order_id = ? AND (cancelled_quantity IS NULL OR cancelled_quantity < quantity) AND (removed_from_bill IS NULL OR removed_from_bill = 0)").all(orderId) as any[];
+
+  const formattedTableNumber = formatTableNumber(table);
+  const sectionTag = table.section_tag;
+
+  // Calculate total
+  const subtotal = orderItems.reduce((sum, oi) => {
+    const effectiveQty = oi.quantity - (oi.cancelled_quantity || 0);
+    return sum + Number(oi.price) * effectiveQty;
+  }, 0);
+
+  const discount = discountPercent ? subtotal * (discountPercent / 100) : 0;
+  const afterDiscount = subtotal - discount;
+  const serviceChargePercent = outlet.service_charge_percent || 0;
+  const serviceCharge = afterDiscount * (serviceChargePercent / 100);
+  const totalAmount = afterDiscount + serviceCharge;
+
+  // Build bill ESC/POS
+  const billItems = orderItems.map(oi => ({
+    name: oi.name,
+    quantity: oi.quantity - (oi.cancelled_quantity || 0),
+    price: Number(oi.price),
+    menuType: oi.menu_type === "LIQUOR" ? "LIQUOR" as const : "FOOD" as const,
+  }));
+
+  const escposData = buildBill({
+    tableNumber: formattedTableNumber,
+    items: billItems,
+    totalAmount,
+    restaurant: {
+      name: outlet.name,
+      receiptHeader: outlet.receipt_header,
+      receiptSubHeader: outlet.receipt_sub_header,
+      address: outlet.address,
+      phone: outlet.phone,
+      gstin: outlet.gstin,
+    },
+    sectionTag,
+    gstCategory: outlet.gst_category,
+    gstRate: outlet.gst_rate,
+    gstRegistered: outlet.gst_registered,
+    pricesIncludeGst: outlet.prices_include_gst,
+    discountPercent: discountPercent || 0,
+    serviceChargePercent,
+  });
+
+  // Resolve bill printer
+  const printerConfig = outlet.printerConfig || {};
+  const billPrinterName = resolvePrinterName(null, "BILL_PRINTER", null, printerConfig);
+
+  let printResults: any[] = [];
+  if (billPrinterName) {
+    printResults = await printGrouped([{ printerName: billPrinterName, escposData }]);
+  }
+
+  return { success: true, billNumber, printResults };
+}
+
+// ─── Settle Order (mark as settled, free the table) ───────────────────────────
+
+export interface SettleOrderInput {
+  orderId: string;
+  restaurantId: string;
+  paymentMethod?: string;
+  cashAmount?: number;
+  cardAmount?: number;
+  tipAmount?: number;
+  cashTipAmount?: number;
+  cardTipAmount?: number;
+  discountPercent?: number;
+  localTxnId?: string;
+  requestId?: string;
+}
+
+export async function settleOrderEdge(input: SettleOrderInput): Promise<{ success: boolean; error?: string; order?: any; table?: any }> {
+  const db = getDb();
+  const { orderId, restaurantId, paymentMethod, localTxnId, requestId } = input;
+
+  // Idempotency check
+  if (requestId) {
+    const existing = db.query("SELECT * FROM order_record WHERE last_request_id = ?").get(requestId) as any;
+    if (existing && existing.status === "SETTLED") {
+      return { success: true, order: existing, error: "Duplicate request — already settled" };
+    }
+  }
+
+  const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
+  if (!order) {
+    return { success: false, error: "Order not found" };
+  }
+
+  const now = Date.now();
+  const tx = db.transaction(() => {
+    // Mark order as settled
+    db.query("UPDATE order_record SET status = 'SETTLED', paid_at = ?, updated_at = ?, last_request_id = ? WHERE id = ?")
+      .run(now, now, requestId || null, orderId);
+
+    // Free the table
+    db.query(`UPDATE "table" SET status = 'AVAILABLE', workflow_status = 'Free', captain_id = NULL, guests = 0, session_started_at = NULL, current_bill = 0, kot_history = '[]', discount = NULL, updated_at = ? WHERE id = ?`)
+      .run(now, order.table_id);
+
+    // Store payment details for sync worker to create cloud transaction
+    if (localTxnId || paymentMethod) {
+      const paymentKey = `settle:${localTxnId || orderId}`;
+      const paymentData = JSON.stringify({
+        orderId,
+        restaurantId,
+        paymentMethod: paymentMethod || "CASH",
+        cashAmount: input.cashAmount,
+        cardAmount: input.cardAmount,
+        tipAmount: input.tipAmount,
+        cashTipAmount: input.cashTipAmount,
+        cardTipAmount: input.cardTipAmount,
+        discountPercent: input.discountPercent,
+        localTxnId,
+        requestId,
+        settledAt: now,
+      });
+      db.query("INSERT INTO edge_config (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?")
+        .run(paymentKey, paymentData, now, paymentData, now);
+    }
+
+    // Enqueue sync
+    enqueueSync("order", orderId, "update");
+    enqueueSync("table", order.table_id, "update");
+    if (localTxnId) enqueueSync("transaction", localTxnId, "insert");
+  });
+
+  try {
+    tx();
+  } catch (err: any) {
+    if (err.message && err.message.includes("UNIQUE")) {
+      return { success: false, error: "Duplicate settle request", statusCode: 409 };
+    }
+    throw err;
+  }
+
+  const updatedOrder = db.query("SELECT * FROM order_record WHERE id = ?").get(orderId) as any;
+  const updatedTable = db.query(`SELECT t.*, s.name as section_name FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?`).get(order.table_id) as any;
+
+  return {
+    success: true,
+    order: updatedOrder,
+    table: { ...updatedTable, kot_history: safeParseKotHistory(updatedTable.kot_history) },
+  };
+}
+
+// ─── Swap Table (move order from one table to another) ────────────────────────
+
+export async function swapTableEdge(
+  restaurantId: string,
+  sourceTableId: string,
+  targetTableId: string,
+  swappedBy: string,
+): Promise<{ success: boolean; error?: string; sourceTable?: any; targetTable?: any }> {
+  const db = getDb();
+
+  const sourceTable = db.query(`SELECT * FROM "table" WHERE id = ? AND restaurant_id = ?`).get(sourceTableId, restaurantId) as any;
+  const targetTable = db.query(`SELECT * FROM "table" WHERE id = ? AND restaurant_id = ?`).get(targetTableId, restaurantId) as any;
+
+  if (!sourceTable || !targetTable) {
+    return { success: false, error: "Source or target table not found" };
+  }
+
+  // Find active order on source table
+  const activeOrder = db.query("SELECT * FROM order_record WHERE table_id = ? AND restaurant_id = ? AND status IN (?, ?) AND is_deleted = 0")
+    .get(sourceTableId, restaurantId, "PENDING", "PREPARING") as any;
+
+  const now = Date.now();
+  const tx = db.transaction(() => {
+    if (activeOrder) {
+      // Move order to target table
+      db.query("UPDATE order_record SET table_id = ?, updated_at = ? WHERE id = ?")
+        .run(targetTableId, now, activeOrder.id);
+      enqueueSync("order", activeOrder.id, "update");
+    }
+
+    // Swap table statuses, captain, guests, kot history, current bill
+    db.query(`UPDATE "table" SET status = ?, workflow_status = ?, captain_id = ?, guests = ?, session_started_at = ?, current_bill = ?, kot_history = ?, discount = ?, updated_at = ? WHERE id = ?`)
+      .run(targetTable.status, targetTable.workflow_status, targetTable.captain_id, targetTable.guests, targetTable.session_started_at, targetTable.current_bill, targetTable.kot_history, targetTable.discount, now, sourceTableId);
+    db.query(`UPDATE "table" SET status = ?, workflow_status = ?, captain_id = ?, guests = ?, session_started_at = ?, current_bill = ?, kot_history = ?, discount = ?, updated_at = ? WHERE id = ?`)
+      .run(sourceTable.status, sourceTable.workflow_status, sourceTable.captain_id, sourceTable.guests, sourceTable.session_started_at, sourceTable.current_bill, sourceTable.kot_history, sourceTable.discount, now, targetTableId);
+
+    enqueueSync("table", sourceTableId, "update");
+    enqueueSync("table", targetTableId, "update");
+  });
+
+  tx();
+
+  const updatedSource = db.query(`SELECT t.*, s.name as section_name FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?`).get(sourceTableId) as any;
+  const updatedTarget = db.query(`SELECT t.*, s.name as section_name FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?`).get(targetTableId) as any;
+
+  return {
+    success: true,
+    sourceTable: { ...updatedSource, kot_history: safeParseKotHistory(updatedSource.kot_history) },
+    targetTable: { ...updatedTarget, kot_history: safeParseKotHistory(updatedTarget.kot_history) },
+  };
+}
+
+// ─── Transfer Items (move items between tables) ───────────────────────────────
+
+export async function transferItemsEdge(
+  restaurantId: string,
+  sourceTableId: string,
+  targetTableId: string,
+  orderItemIds: string[],
+  transferredBy: string,
+): Promise<{ success: boolean; error?: string; sourceTable?: any; targetTable?: any }> {
+  const db = getDb();
+
+  if (!orderItemIds || orderItemIds.length === 0) {
+    return { success: false, error: "No items to transfer" };
+  }
+
+  // Find active orders on both tables
+  const sourceOrder = db.query("SELECT * FROM order_record WHERE table_id = ? AND restaurant_id = ? AND status IN (?, ?) AND is_deleted = 0")
+    .get(sourceTableId, restaurantId, "PENDING", "PREPARING") as any;
+  if (!sourceOrder) {
+    return { success: false, error: "No active order on source table" };
+  }
+
+  let targetOrder = db.query("SELECT * FROM order_record WHERE table_id = ? AND restaurant_id = ? AND status IN (?, ?) AND is_deleted = 0")
+    .get(targetTableId, restaurantId, "PENDING", "PREPARING") as any;
+
+  const now = Date.now();
+  const tx = db.transaction(() => {
+    // Create target order if it doesn't exist
+    if (!targetOrder) {
+      const newOrderId = crypto.randomUUID();
+      db.query("INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at, cloud_synced) VALUES (?, ?, ?, 'PREPARING', 0, ?, ?, 0)")
+        .run(newOrderId, targetTableId, restaurantId, now, now);
+      enqueueSync("order", newOrderId, "insert");
+      targetOrder = { id: newOrderId, table_id: targetTableId, total_amount: 0 };
+    }
+
+    // Move items
+    let transferredAmount = 0;
+    for (const itemId of orderItemIds) {
+      const item = db.query("SELECT * FROM order_item WHERE id = ? AND order_id = ?").get(itemId, sourceOrder.id) as any;
+      if (!item) continue;
+
+      // Create new order item on target order
+      const newItemId = crypto.randomUUID();
+      db.query("INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, notes, menu_type, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)")
+        .run(newItemId, targetOrder.id, item.menu_item_id, item.name, item.price, item.quantity, item.notes, item.menu_type);
+
+      // Mark original item as removed
+      db.query("UPDATE order_item SET removed_from_bill = 1, removed_by = ?, removed_at = ? WHERE id = ?")
+        .run(transferredBy, now, itemId);
+
+      transferredAmount += Number(item.price) * item.quantity;
+      enqueueSync("order_item", newItemId, "insert");
+      enqueueSync("order_item", itemId, "update");
+    }
+
+    // Update order totals
+    db.query("UPDATE order_record SET total_amount = total_amount - ?, updated_at = ? WHERE id = ?")
+      .run(transferredAmount, now, sourceOrder.id);
+    db.query("UPDATE order_record SET total_amount = total_amount + ?, updated_at = ? WHERE id = ?")
+      .run(transferredAmount, now, targetOrder.id);
+
+    // Update table current bills
+    db.query(`UPDATE "table" SET current_bill = MAX(0, current_bill - ?), updated_at = ? WHERE id = ?`)
+      .run(transferredAmount, now, sourceTableId);
+    db.query(`UPDATE "table" SET current_bill = current_bill + ?, updated_at = ? WHERE id = ?`)
+      .run(transferredAmount, now, targetTableId);
+
+    enqueueSync("order", sourceOrder.id, "update");
+    enqueueSync("order", targetOrder.id, "update");
+    enqueueSync("table", sourceTableId, "update");
+    enqueueSync("table", targetTableId, "update");
+  });
+
+  tx();
+
+  const updatedSource = db.query(`SELECT t.*, s.name as section_name FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?`).get(sourceTableId) as any;
+  const updatedTarget = db.query(`SELECT t.*, s.name as section_name FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?`).get(targetTableId) as any;
+
+  return {
+    success: true,
+    sourceTable: { ...updatedSource, kot_history: safeParseKotHistory(updatedSource.kot_history) },
+    targetTable: { ...updatedTarget, kot_history: safeParseKotHistory(updatedTarget.kot_history) },
+  };
+}
+
+// ─── Edit Bill (remove items, edit quantities before settlement) ──────────────
+
+export async function editBillEdge(
+  restaurantId: string,
+  orderId: string,
+  edits: { removedItemIds?: string[]; editQuantities?: Record<string, number>; addedItems?: any[]; editedBy?: string },
+): Promise<{ success: boolean; error?: string; order?: any }> {
+  const db = getDb();
+  const { removedItemIds, editQuantities, addedItems, editedBy } = edits;
+
+  const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
+  if (!order) {
+    return { success: false, error: "Order not found" };
+  }
+
+  const now = Date.now();
+  const tx = db.transaction(() => {
+    // Remove items
+    if (removedItemIds && removedItemIds.length > 0) {
+      for (const itemId of removedItemIds) {
+        db.query("UPDATE order_item SET removed_from_bill = 1, removed_by = ?, removed_at = ? WHERE id = ? AND order_id = ?")
+          .run(editedBy || "Cashier", now, itemId, orderId);
+        enqueueSync("order_item", itemId, "update");
+      }
+    }
+
+    // Edit quantities
+    if (editQuantities) {
+      for (const [itemId, newQty] of Object.entries(editQuantities)) {
+        const item = db.query("SELECT * FROM order_item WHERE id = ? AND order_id = ?").get(itemId, orderId) as any;
+        if (!item) continue;
+        const oldQty = item.quantity;
+        const qtyDiff = newQty - oldQty;
+        db.query("UPDATE order_item SET quantity = ?, edited_quantity = ? WHERE id = ?")
+          .run(newQty, newQty, itemId);
+        // Adjust order total
+        db.query("UPDATE order_record SET total_amount = total_amount + ?, updated_at = ? WHERE id = ?")
+          .run(Number(item.price) * qtyDiff, now, orderId);
+        enqueueSync("order_item", itemId, "update");
+      }
+    }
+
+    // Add new items
+    if (addedItems && addedItems.length > 0) {
+      for (const item of addedItems) {
+        const newItemId = crypto.randomUUID();
+        db.query("INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, notes, menu_type, added_by_cashier, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0)")
+          .run(newItemId, orderId, item.menuItemId || item.id || null, item.name, Number(item.price), item.quantity || 1, item.notes || null, item.menuType || "FOOD");
+        db.query("UPDATE order_record SET total_amount = total_amount + ?, updated_at = ? WHERE id = ?")
+          .run(Number(item.price) * (item.quantity || 1), now, orderId);
+        enqueueSync("order_item", newItemId, "insert");
+      }
+    }
+
+    db.query("UPDATE order_record SET updated_at = ? WHERE id = ?").run(now, orderId);
+    enqueueSync("order", orderId, "update");
+  });
+
+  tx();
+
+  const updatedOrder = db.query("SELECT * FROM order_record WHERE id = ?").get(orderId) as any;
+  return { success: true, order: updatedOrder };
+}
+
+// ─── Confirm Payment (record payment for a settled order) ─────────────────────
+
+export async function confirmPaymentEdge(
+  restaurantId: string,
+  transactionId: string,
+  paymentDetails: { paymentMethod?: string; cashAmount?: number; cardAmount?: number; tipAmount?: number; cashTipAmount?: number; cardTipAmount?: number },
+): Promise<{ success: boolean; error?: string }> {
+  const db = getDb();
+
+  // Store payment details in edge_config for sync to cloud
+  const paymentKey = `payment:${transactionId}`;
+  const paymentData = JSON.stringify({ ...paymentDetails, restaurantId, confirmedAt: Date.now() });
+  db.query("INSERT INTO edge_config (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?")
+    .run(paymentKey, paymentData, Date.now(), paymentData, Date.now());
+
+  // Enqueue sync for the payment confirmation
+  enqueueSync("transaction", transactionId, "update");
+
+  return { success: true };
+}
+
+// ─── Update Order Status ──────────────────────────────────────────────────────
+
+export async function updateOrderStatusEdge(
+  restaurantId: string,
+  orderId: string,
+  status: string,
+): Promise<{ success: boolean; error?: string; order?: any }> {
+  const db = getDb();
+
+  const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
+  if (!order) {
+    return { success: false, error: "Order not found" };
+  }
+
+  const now = Date.now();
+  db.query("UPDATE order_record SET status = ?, updated_at = ? WHERE id = ?")
+    .run(status, now, orderId);
+
+  // Update table workflow status to match
+  const workflowMap: Record<string, string> = {
+    "PREPARING": "Preparing",
+    "READY": "Prepared",
+    "BILLING_REQUESTED": "Waiting Bill",
+    "SETTLED": "Free",
+  };
+  const workflowStatus = workflowMap[status];
+  if (workflowStatus) {
+    db.query(`UPDATE "table" SET workflow_status = ?, updated_at = ? WHERE id = ?`)
+      .run(workflowStatus, now, order.table_id);
+    enqueueSync("table", order.table_id, "update");
+  }
+
+  enqueueSync("order", orderId, "update");
+
+  const updatedOrder = db.query("SELECT * FROM order_record WHERE id = ?").get(orderId) as any;
+  return { success: true, order: updatedOrder };
 }

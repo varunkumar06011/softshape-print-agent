@@ -13,6 +13,14 @@
 //   POST /api/edge/order        — create order + KOT (local DB + direct print)
 //   POST /api/edge/order/cancel — cancel KOT item (print cancel ticket)
 //   POST /api/edge/kot/reprint  — reprint KOT for an order
+//   POST /api/edge/order/request-billing — mark order as billing requested
+//   POST /api/edge/order/print-bill     — assign bill number + print bill
+//   POST /api/edge/order/settle         — settle order + free table
+//   POST /api/edge/order/swap-table     — swap two tables
+//   POST /api/edge/order/transfer-items — transfer items between tables
+//   POST /api/edge/order/edit-bill      — edit bill before settlement
+//   POST /api/edge/order/confirm-payment — confirm payment for order
+//   POST /api/edge/order/status         — update order status
 //   GET  /api/edge/tables       — sections with nested tables + active orders
 //   GET  /api/edge/tables/flat  — flat list of all tables
 //   GET  /api/edge/sections     — sections with venue + floor info
@@ -29,10 +37,11 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { getDb, closeDb, getConfig, setConfig, getSyncState, enqueueSync, getRecoveryStatus } from "./db.ts";
+import os from "os";
 import { runDailyMaintenance } from "./backup.ts";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { downloadFullConfig, pullIncrementalChanges } from "./config.ts";
-import { createOrder, updateOrderItems, cancelKotItem, reprintKot } from "./orderService.ts";
+import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge } from "./orderService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings } from "./reads.ts";
 import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters } from "./sync.ts";
 import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode } from "./socketSync.ts";
@@ -94,16 +103,32 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   if (url.pathname === "/health" && req.method === "GET") {
     const session = loadSession();
     const recovery = getRecoveryStatus();
+    // Include LAN IP so captain devices can verify they found the right edge server
+    let lanIp = null;
+    try {
+      const nets = os.networkInterfaces();
+      for (const iface of Object.values(nets)) {
+        for (const addr of iface || []) {
+          if (addr.family === "IPv4" && !addr.internal) {
+            lanIp = addr.address;
+            break;
+          }
+        }
+        if (lanIp) break;
+      }
+    } catch { /* ignore */ }
     return jsonResponse({
       status: "ok",
       service: "softshape-edge-server",
-      version: "14.0.0",
+      version: "15.0.0",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
       uptime: process.uptime(),
       databaseRecovered: recovery.recovered,
       recoveryMessage: recovery.message || null,
+      lanIp,
+      edgePort: PORT,
     });
   }
 
@@ -345,6 +370,34 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse(result);
   }
 
+  // ── POST /api/edge/order/cancel-items — cancel multiple KOT items ───────────
+  if (url.pathname === "/api/edge/order/cancel-items" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("No valid session", 401);
+    const body = await req.json().catch(() => ({}));
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const items = body.items || [];
+    if (!items.length) return errorResponse("No items to cancel", 400);
+
+    const results = [];
+    for (const item of items) {
+      const result = await cancelKotItem({
+        orderId: body.orderId,
+        restaurantId,
+        orderItemId: item.orderItemId,
+        cancelQuantity: item.cancelQuantity || 1,
+        cancelledBy: body.cancelledBy || "Staff",
+        tableNumber: body.tableNumber,
+        requestId: body.requestId,
+      });
+      results.push({ orderItemId: item.orderItemId, success: result.success, error: result.error });
+    }
+
+    const allSuccess = results.every(r => r.success);
+    return jsonResponse({ success: allSuccess, results });
+  }
+
   // ── POST /api/edge/kot/reprint — reprint KOT for an order ──────────────────
   if (url.pathname === "/api/edge/kot/reprint" && req.method === "POST") {
     if (!isLocalReady()) {
@@ -367,6 +420,135 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return errorResponse(result.error || "Reprint failed", 400);
     }
 
+    return jsonResponse(result);
+  }
+
+  // ── POST /api/edge/order/request-billing — mark order as billing requested ──
+  if (url.pathname === "/api/edge/order/request-billing" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("No valid session", 401);
+    const body = await req.json().catch(() => ({}));
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const result = await requestBillingEdge(restaurantId, body.orderId);
+    if (!result.success) return errorResponse(result.error || "Request billing failed", 400);
+    return jsonResponse(result);
+  }
+
+  // ── POST /api/edge/order/print-bill — assign bill number + print bill ───────
+  if (url.pathname === "/api/edge/order/print-bill" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("No valid session", 401);
+    const body = await req.json().catch(() => ({}));
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const result = await printBillEdge({
+      orderId: body.orderId,
+      restaurantId,
+      tableNumber: body.tableNumber,
+      discountPercent: body.discountPercent,
+      kotNumbers: body.kotNumbers,
+      localPrinted: body.localPrinted,
+      billEventId: body.billEventId,
+    });
+    if (!result.success) return errorResponse(result.error || "Print bill failed", 400);
+    return jsonResponse(result);
+  }
+
+  // ── POST /api/edge/order/settle — settle order + free table ─────────────────
+  if (url.pathname === "/api/edge/order/settle" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("No valid session", 401);
+    const body = await req.json().catch(() => ({}));
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    // Handle removed items before settling (edit-bill during settlement)
+    if (body.removedItemIds && body.removedItemIds.length > 0) {
+      await editBillEdge(restaurantId, body.orderId, {
+        removedItemIds: body.removedItemIds,
+        editedBy: body.removedBy || "Cashier",
+      });
+    }
+
+    const result = await settleOrderEdge({
+      orderId: body.orderId,
+      restaurantId,
+      paymentMethod: body.paymentMethod,
+      cashAmount: body.cashAmount,
+      cardAmount: body.cardAmount,
+      tipAmount: body.tipAmount,
+      cashTipAmount: body.cashTipAmount,
+      cardTipAmount: body.cardTipAmount,
+      discountPercent: body.discountPercent,
+      localTxnId: body.localTxnId,
+      requestId: body.requestId,
+    });
+    if (!result.success) return errorResponse(result.error || "Settle failed", 400);
+    return jsonResponse(result);
+  }
+
+  // ── POST /api/edge/order/swap-table — swap two tables ───────────────────────
+  if (url.pathname === "/api/edge/order/swap-table" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("No valid session", 401);
+    const body = await req.json().catch(() => ({}));
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const result = await swapTableEdge(restaurantId, body.sourceTableId, body.targetTableId, body.swappedBy || "Cashier");
+    if (!result.success) return errorResponse(result.error || "Swap failed", 400);
+    return jsonResponse(result);
+  }
+
+  // ── POST /api/edge/order/transfer-items — transfer items between tables ─────
+  if (url.pathname === "/api/edge/order/transfer-items" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("No valid session", 401);
+    const body = await req.json().catch(() => ({}));
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const result = await transferItemsEdge(restaurantId, body.sourceTableId, body.targetTableId, body.orderItemIds || [], body.transferredBy || "Cashier");
+    if (!result.success) return errorResponse(result.error || "Transfer failed", 400);
+    return jsonResponse(result);
+  }
+
+  // ── POST /api/edge/order/edit-bill — edit bill before settlement ────────────
+  if (url.pathname === "/api/edge/order/edit-bill" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("No valid session", 401);
+    const body = await req.json().catch(() => ({}));
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const result = await editBillEdge(restaurantId, body.orderId, {
+      removedItemIds: body.removedItemIds,
+      editQuantities: body.editQuantities,
+      addedItems: body.addedItems,
+      editedBy: body.editedBy,
+    });
+    if (!result.success) return errorResponse(result.error || "Edit bill failed", 400);
+    return jsonResponse(result);
+  }
+
+  // ── POST /api/edge/order/confirm-payment — confirm payment for order ────────
+  if (url.pathname === "/api/edge/order/confirm-payment" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("No valid session", 401);
+    const body = await req.json().catch(() => ({}));
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const result = await confirmPaymentEdge(restaurantId, body.transactionId, {
+      paymentMethod: body.paymentMethod,
+      cashAmount: body.cashAmount,
+      cardAmount: body.cardAmount,
+      tipAmount: body.tipAmount,
+      cashTipAmount: body.cashTipAmount,
+      cardTipAmount: body.cardTipAmount,
+    });
+    if (!result.success) return errorResponse(result.error || "Confirm payment failed", 400);
+    return jsonResponse(result);
+  }
+
+  // ── POST /api/edge/order/status — update order status ───────────────────────
+  if (url.pathname === "/api/edge/order/status" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("No valid session", 401);
+    const body = await req.json().catch(() => ({}));
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const result = await updateOrderStatusEdge(restaurantId, body.orderId, body.status);
+    if (!result.success) return errorResponse(result.error || "Status update failed", 400);
     return jsonResponse(result);
   }
 
