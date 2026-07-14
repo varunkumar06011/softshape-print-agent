@@ -10,11 +10,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { Database } from "bun:sqlite";
-import { join } from "node:path";
-import { homedir } from "node:os";
-import { openDatabaseWithRecovery, type RecoveryResult } from "./recovery.ts";
-
-const DB_PATH = process.env.EDGE_DB_PATH || join(homedir(), ".softshape", "edge.db");
+import { openDatabaseWithRecovery, getDbPath, type RecoveryResult } from "./recovery.ts";
 
 let db: Database | null = null;
 let recoveryStatus: RecoveryResult = { recovered: false, corruptPath: null, message: "" };
@@ -36,7 +32,7 @@ export function getRecoveryStatus(): RecoveryResult {
 
 function initSchema(database: Database) {
   database.exec(`
-    -- ── Outlet (restaurant settings, branding, tax config) ──────────────────
+    -- Outlet (restaurant settings, branding, tax config)
     CREATE TABLE IF NOT EXISTS outlet (
       id                  TEXT PRIMARY KEY,
       name                TEXT NOT NULL,
@@ -69,7 +65,7 @@ function initSchema(database: Database) {
       synced_at           INTEGER NOT NULL DEFAULT (unixepoch())
     );
 
-    -- ── Tax Profiles ────────────────────────────────────────────────────────
+    -- Tax Profiles
     CREATE TABLE IF NOT EXISTS tax_profile (
       id                    TEXT PRIMARY KEY,
       restaurant_id         TEXT NOT NULL,
@@ -83,7 +79,7 @@ function initSchema(database: Database) {
     );
     CREATE INDEX IF NOT EXISTS idx_tax_profile_restaurant ON tax_profile(restaurant_id);
 
-    -- ── Price Profiles ──────────────────────────────────────────────────────
+    -- Price Profiles
     CREATE TABLE IF NOT EXISTS price_profile (
       id              TEXT PRIMARY KEY,
       restaurant_id   TEXT NOT NULL,
@@ -93,7 +89,7 @@ function initSchema(database: Database) {
     );
     CREATE INDEX IF NOT EXISTS idx_price_profile_restaurant ON price_profile(restaurant_id);
 
-    -- ── Price Profile Items (per-menu-item price overrides) ─────────────────
+    -- Price Profile Items (per-menu-item price overrides)
     CREATE TABLE IF NOT EXISTS price_profile_item (
       id                TEXT PRIMARY KEY,
       price_profile_id  TEXT NOT NULL,
@@ -106,7 +102,7 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_ppi_menu_item ON price_profile_item(menu_item_id);
     CREATE INDEX IF NOT EXISTS idx_ppi_restaurant ON price_profile_item(restaurant_id);
 
-    -- ── Venues ──────────────────────────────────────────────────────────────
+    -- Venues
     CREATE TABLE IF NOT EXISTS venue (
       id                TEXT PRIMARY KEY,
       restaurant_id     TEXT NOT NULL,
@@ -124,7 +120,7 @@ function initSchema(database: Database) {
     );
     CREATE INDEX IF NOT EXISTS idx_venue_restaurant ON venue(restaurant_id);
 
-    -- ── Floors ──────────────────────────────────────────────────────────────
+    -- Floors
     CREATE TABLE IF NOT EXISTS floor (
       id              TEXT PRIMARY KEY,
       venue_id        TEXT NOT NULL,
@@ -137,7 +133,7 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_floor_venue ON floor(venue_id);
     CREATE INDEX IF NOT EXISTS idx_floor_restaurant ON floor(restaurant_id);
 
-    -- ── Sections ────────────────────────────────────────────────────────────
+    -- Sections
     CREATE TABLE IF NOT EXISTS section (
       id              TEXT PRIMARY KEY,
       name            TEXT NOT NULL,
@@ -151,7 +147,7 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_section_venue ON section(venue_id);
     CREATE INDEX IF NOT EXISTS idx_section_floor ON section(floor_id);
 
-    -- ── Tables ──────────────────────────────────────────────────────────────
+    -- Tables
     CREATE TABLE IF NOT EXISTS "table" (
       id                TEXT PRIMARY KEY,
       number            INTEGER NOT NULL,
@@ -173,7 +169,7 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_table_restaurant_status ON "table"(restaurant_id, status);
     CREATE INDEX IF NOT EXISTS idx_table_section ON "table"(section_id);
 
-    -- ── Categories ───────────────────────────────────────────────────────────
+    -- Categories
     CREATE TABLE IF NOT EXISTS category (
       id              TEXT PRIMARY KEY,
       name            TEXT NOT NULL,
@@ -185,7 +181,7 @@ function initSchema(database: Database) {
     );
     CREATE INDEX IF NOT EXISTS idx_category_restaurant ON category(restaurant_id);
 
-    -- ── Menu Items ───────────────────────────────────────────────────────────
+    -- Menu Items
     CREATE TABLE IF NOT EXISTS menu_item (
       id              TEXT PRIMARY KEY,
       name            TEXT NOT NULL,
@@ -214,7 +210,7 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_menu_item_restaurant ON menu_item(restaurant_id);
     CREATE INDEX IF NOT EXISTS idx_menu_item_available ON menu_item(restaurant_id, is_available, is_deleted);
 
-    -- ── Menu Item Variants ───────────────────────────────────────────────────
+    -- Menu Item Variants
     CREATE TABLE IF NOT EXISTS menu_item_variant (
       id              TEXT PRIMARY KEY,
       name            TEXT NOT NULL,
@@ -228,7 +224,7 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_variant_menu_item ON menu_item_variant(menu_item_id);
     CREATE INDEX IF NOT EXISTS idx_variant_restaurant ON menu_item_variant(restaurant_id);
 
-    -- ── Menu Item Addons ─────────────────────────────────────────────────────
+    -- Menu Item Addons
     CREATE TABLE IF NOT EXISTS menu_item_addon (
       id              TEXT PRIMARY KEY,
       name            TEXT NOT NULL,
@@ -241,7 +237,7 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_addon_menu_item ON menu_item_addon(menu_item_id);
     CREATE INDEX IF NOT EXISTS idx_addon_restaurant ON menu_item_addon(restaurant_id);
 
-    -- ── Venue Prices (per-venue menu item price overrides) ───────────────────
+    -- Venue Prices (per-venue menu item price overrides)
     CREATE TABLE IF NOT EXISTS venue_price (
       id              TEXT PRIMARY KEY,
       venue_id        TEXT NOT NULL,
@@ -254,7 +250,7 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_venue_price_venue ON venue_price(venue_id);
     CREATE INDEX IF NOT EXISTS idx_venue_price_menu_item ON venue_price(menu_item_id);
 
-    -- ── Venue Menu Item Availability ─────────────────────────────────────────
+    -- Venue Menu Item Availability
     CREATE TABLE IF NOT EXISTS venue_menu_item_availability (
       id              TEXT PRIMARY KEY,
       venue_id        TEXT NOT NULL,
@@ -265,7 +261,7 @@ function initSchema(database: Database) {
     );
     CREATE INDEX IF NOT EXISTS idx_vmaa_venue ON venue_menu_item_availability(venue_id);
 
-    -- ── Orders ───────────────────────────────────────────────────────────────
+    -- Orders
     CREATE TABLE IF NOT EXISTS order_record (
       id                  TEXT PRIMARY KEY,
       table_id            TEXT NOT NULL,
@@ -292,7 +288,7 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_order_table_status ON order_record(table_id, status);
     CREATE INDEX IF NOT EXISTS idx_order_cloud_synced ON order_record(cloud_synced) WHERE cloud_synced = 0;
 
-    -- ── Order Items ──────────────────────────────────────────────────────────
+    -- Order Items
     CREATE TABLE IF NOT EXISTS order_item (
       id                  TEXT PRIMARY KEY,
       order_id            TEXT NOT NULL,
@@ -315,7 +311,7 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_order_item_menu_item ON order_item(menu_item_id);
     CREATE INDEX IF NOT EXISTS idx_order_item_synced ON order_item(cloud_synced) WHERE cloud_synced = 0;
 
-    -- ── KOTs (Kitchen Order Tickets) ─────────────────────────────────────────
+    -- KOTs (Kitchen Order Tickets)
     CREATE TABLE IF NOT EXISTS kot (
       id              TEXT PRIMARY KEY,
       restaurant_id   TEXT NOT NULL,
@@ -330,7 +326,7 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_kot_restaurant_order ON kot(restaurant_id, order_id);
     CREATE INDEX IF NOT EXISTS idx_kot_synced ON kot(cloud_synced) WHERE cloud_synced = 0;
 
-    -- ── KOT Items ────────────────────────────────────────────────────────────
+    -- KOT Items
     CREATE TABLE IF NOT EXISTS kot_item (
       id              TEXT PRIMARY KEY,
       kot_id          TEXT NOT NULL,
@@ -348,7 +344,7 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_kot_item_order_item ON kot_item(order_item_id);
     CREATE INDEX IF NOT EXISTS idx_kot_item_synced ON kot_item(cloud_synced) WHERE cloud_synced = 0;
 
-    -- ── Daily Counter (KOT/bill/txn counts per day) ──────────────────────────
+    -- Daily Counter (KOT/bill/txn counts per day)
     CREATE TABLE IF NOT EXISTS daily_counter (
       id              TEXT PRIMARY KEY,
       restaurant_id   TEXT NOT NULL,
@@ -360,7 +356,7 @@ function initSchema(database: Database) {
     );
     CREATE INDEX IF NOT EXISTS idx_daily_counter_restaurant_date ON daily_counter(restaurant_id, counter_date);
 
-    -- ── Sync Queue (edge → cloud push queue) ─────────────────────────────────
+    -- Sync Queue (edge to cloud push queue)
     CREATE TABLE IF NOT EXISTS sync_queue (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
       table_name      TEXT NOT NULL,       -- 'order', 'order_item', 'kot', 'kot_item', 'table'
@@ -373,21 +369,21 @@ function initSchema(database: Database) {
     );
     CREATE INDEX IF NOT EXISTS idx_sync_queue_pending ON sync_queue(synced) WHERE synced = 0;
 
-    -- ── Sync State (cloud → edge pull tracking) ──────────────────────────────
+    -- Sync State (cloud to edge pull tracking)
     CREATE TABLE IF NOT EXISTS sync_state (
       key             TEXT PRIMARY KEY,
       value           TEXT NOT NULL,
       updated_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
     );
 
-    -- ── Edge Config (local settings, printer mapping, session) ───────────────
+    -- Edge Config (local settings, printer mapping, session)
     CREATE TABLE IF NOT EXISTS edge_config (
       key             TEXT PRIMARY KEY,
       value           TEXT NOT NULL,
       updated_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
     );
 
-    -- ── Users (staff accounts for offline PIN verification) ────────────────
+    -- Users (staff accounts for offline PIN verification)
     CREATE TABLE IF NOT EXISTS users (
       id              TEXT PRIMARY KEY,
       name            TEXT NOT NULL,

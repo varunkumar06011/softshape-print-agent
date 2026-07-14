@@ -14,15 +14,32 @@
 
 import { Database } from "bun:sqlite";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { existsSync, mkdirSync, renameSync } from "node:fs";
 
-const DB_PATH = process.env.EDGE_DB_PATH || join(homedir(), ".softshape", "edge.db");
+const DEFAULT_DB_PATH = process.env.EDGE_DB_PATH || join(homedir(), ".softshape", "edge.db");
+
+// Mutable — can be patched if the default path is not writable
+let resolvedDbPath = DEFAULT_DB_PATH;
+
+export function getDbPath(): string {
+  return resolvedDbPath;
+}
 
 export interface RecoveryResult {
   recovered: boolean;
   corruptPath: string | null;
   message: string;
+}
+
+function ensureDbDir(path: string): boolean {
+  const dir = dirname(path);
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch (err) {
+    console.error("[Recovery] mkdirSync failed for", dir, ":", err);
+  }
+  return existsSync(dir);
 }
 
 export function openDatabaseWithRecovery(): { db: Database; recovery: RecoveryResult } {
@@ -32,13 +49,36 @@ export function openDatabaseWithRecovery(): { db: Database; recovery: RecoveryRe
     message: "",
   };
 
-  // Ensure parent directory exists — SQLite {create:true} does not create it
-  mkdirSync(dirname(DB_PATH), { recursive: true });
+  // Ensure parent directory exists — SQLite {create:true} does not create it.
+  // In compiled Bun binaries, mkdirSync can fail silently if the path resolution
+  // differs from the runtime environment. Try default path first, then fallback.
+  if (!ensureDbDir(DEFAULT_DB_PATH)) {
+    // Fallback: try creating relative to process working directory
+    const fallbackPath = join(process.cwd(), ".softshape", "edge.db");
+    if (ensureDbDir(fallbackPath)) {
+      console.warn("[Recovery] Using fallback DB path:", fallbackPath);
+      resolvedDbPath = fallbackPath;
+    } else {
+      // Last resort: temp directory
+      const tmpDir = join(tmpdir(), ".softshape");
+      try {
+        mkdirSync(tmpDir, { recursive: true });
+        if (existsSync(tmpDir)) {
+          console.warn("[Recovery] Using temp DB path:", tmpDir);
+          resolvedDbPath = join(tmpDir, "edge.db");
+        }
+      } catch (tmpErr) {
+        console.error("[Recovery] All directory creation attempts failed:", tmpErr);
+      }
+    }
+  }
+
+  const dbPath = resolvedDbPath;
 
   // Try opening the existing DB
   try {
-    if (existsSync(DB_PATH)) {
-      const testDb = new Database(DB_PATH, { readonly: true });
+    if (existsSync(dbPath)) {
+      const testDb = new Database(dbPath, { readonly: true });
       // Quick integrity check
       const result = testDb.query("PRAGMA integrity_check").get() as any;
       testDb.close();
@@ -48,7 +88,7 @@ export function openDatabaseWithRecovery(): { db: Database; recovery: RecoveryRe
       }
     }
     // DB is healthy — open normally
-    const db = new Database(DB_PATH, { create: true });
+    const db = new Database(dbPath, { create: true });
     db.exec("PRAGMA journal_mode = WAL;");
     db.exec("PRAGMA foreign_keys = ON;");
     db.exec("PRAGMA busy_timeout = 5000;");
@@ -57,10 +97,10 @@ export function openDatabaseWithRecovery(): { db: Database; recovery: RecoveryRe
     console.error("[Recovery] Database appears corrupt:", err);
 
     // Rename corrupt DB
-    const corruptPath = `${DB_PATH}.corrupt-${Date.now()}`;
+    const corruptPath = `${dbPath}.corrupt-${Date.now()}`;
     try {
-      if (existsSync(DB_PATH)) {
-        renameSync(DB_PATH, corruptPath);
+      if (existsSync(dbPath)) {
+        renameSync(dbPath, corruptPath);
         recovery.corruptPath = corruptPath;
       }
     } catch (renameErr) {
@@ -68,7 +108,7 @@ export function openDatabaseWithRecovery(): { db: Database; recovery: RecoveryRe
     }
 
     // Create fresh DB
-    const db = new Database(DB_PATH, { create: true });
+    const db = new Database(dbPath, { create: true });
     db.exec("PRAGMA journal_mode = WAL;");
     db.exec("PRAGMA foreign_keys = ON;");
     db.exec("PRAGMA busy_timeout = 5000;");

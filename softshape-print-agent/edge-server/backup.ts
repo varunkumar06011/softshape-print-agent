@@ -9,11 +9,10 @@
 
 import { Database } from "bun:sqlite";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
 import { existsSync, mkdirSync, readdirSync, unlinkSync, statSync } from "node:fs";
+import { getDbPath } from "./recovery.ts";
 
-const DB_PATH = process.env.EDGE_DB_PATH || join(homedir(), ".softshape", "edge.db");
-const BACKUP_DIR = join(dirname(DB_PATH), "backups");
+const BACKUP_DIR = join(dirname(getDbPath()), "backups");
 const MAX_BACKUP_DAYS = 7;
 const ORDER_RETENTION_DAYS = 90;
 
