@@ -69,6 +69,13 @@ export function isSessionValid(): boolean {
   return true;
 }
 
+export function isLocalReady(): boolean {
+  const session = loadSession();
+  if (!session) return false;
+  const outlet = getDb().query("SELECT id FROM outlet WHERE id = ? LIMIT 1").get(session.restaurantId);
+  return Boolean(outlet);
+}
+
 export function getBackendUrl(): string | null {
   const session = loadSession();
   return session?.backendUrl ?? null;

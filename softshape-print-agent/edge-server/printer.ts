@@ -79,12 +79,14 @@ export async function printToPrinter(
     }
   }
 
-  // ── HTTP fallback: send to existing print agent's /print endpoint ──────────
-  const printAgentUrl = (getConfig("print_agent_http_url") || "http://localhost:3100").replace(/\/+$/, "");
-  const edgePort = process.env.EDGE_PORT || "3100";
-  // Avoid loopback to ourselves — check both localhost and 127.0.0.1 on our port
-  const isSelf = printAgentUrl === `http://localhost:${edgePort}` || printAgentUrl === `http://127.0.0.1:${edgePort}`;
-  if (!isSelf) {
+  // ── HTTP fallback: send to the cashier's internal print bridge ──────────────
+  const printAgentUrl = (
+    process.env.PRINT_BRIDGE_URL ||
+    getConfig("print_bridge_url") ||
+    getConfig("print_agent_http_url") ||
+    "http://127.0.0.1:3101"
+  ).replace(/\/+$/, "");
+  if (printAgentUrl) {
     try {
       const res = await fetch(`${printAgentUrl}/print`, {
         method: "POST",
@@ -97,7 +99,7 @@ export async function printToPrinter(
       });
       const result = await res.json().catch(() => ({}));
       if (result.ok) {
-        console.log(`[Printer] Printed via HTTP fallback → ${printerName} (${rawBytes.length} bytes)`);
+        console.log(`[Printer] Printed via internal bridge → ${printerName} (${rawBytes.length} bytes)`);
         return { ok: true, printerName, bytes: rawBytes.length, method: "http" };
       }
       return { ok: false, printerName, bytes: rawBytes.length, error: result.error || "HTTP print failed", method: "http" };

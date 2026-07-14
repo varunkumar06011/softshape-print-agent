@@ -30,7 +30,7 @@
 
 import { getDb, closeDb, getConfig, setConfig, getSyncState, enqueueSync, getRecoveryStatus } from "./db.ts";
 import { runDailyMaintenance } from "./backup.ts";
-import { loadSession, saveSession, clearSession, isSessionValid, getBackendUrl, getRestaurantId, getDeviceId } from "./auth.ts";
+import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getRestaurantId, getDeviceId } from "./auth.ts";
 import { downloadFullConfig, pullIncrementalChanges } from "./config.ts";
 import { createOrder, cancelKotItem, reprintKot } from "./orderService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings } from "./reads.ts";
@@ -73,7 +73,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse({
       status: "ok",
       service: "softshape-edge-server",
-      version: "10.0.0",
+      version: "12.5.0",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
@@ -225,7 +225,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── POST /api/edge/order — create order + KOT (the hot path) ──────────────
   if (url.pathname === "/api/edge/order" && req.method === "POST") {
-    if (!isSessionValid()) {
+    if (!isLocalReady()) {
       return errorResponse("No valid session", 401);
     }
 
@@ -255,7 +255,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── POST /api/edge/order/cancel — cancel KOT item ──────────────────────────
   if (url.pathname === "/api/edge/order/cancel" && req.method === "POST") {
-    if (!isSessionValid()) {
+    if (!isLocalReady()) {
       return errorResponse("No valid session", 401);
     }
 
@@ -284,7 +284,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── POST /api/edge/kot/reprint — reprint KOT for an order ──────────────────
   if (url.pathname === "/api/edge/kot/reprint" && req.method === "POST") {
-    if (!isSessionValid()) {
+    if (!isLocalReady()) {
       return errorResponse("No valid session", 401);
     }
 
@@ -309,28 +309,28 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── GET /api/edge/tables — sections with nested tables + active orders ────
   if (url.pathname === "/api/edge/tables" && req.method === "GET") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const data = getTablesForRestaurant();
     return jsonResponse(data, 200, { "Cache-Control": "no-store" });
   }
 
   // ── GET /api/edge/tables/flat — flat list of all tables ────────────────────
   if (url.pathname === "/api/edge/tables/flat" && req.method === "GET") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const data = getTablesFlat();
     return jsonResponse(data, 200, { "Cache-Control": "no-store" });
   }
 
   // ── GET /api/edge/sections — sections with venue + floor info ──────────────
   if (url.pathname === "/api/edge/sections" && req.method === "GET") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const data = getSections();
     return jsonResponse(data);
   }
 
   // ── GET /api/edge/menu — full menu with categories, items, variants ────────
   if (url.pathname === "/api/edge/menu" && req.method === "GET") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const venueId = url.searchParams.get("venueId") || undefined;
     const data = getMenu(venueId);
     return jsonResponse(data);
@@ -338,7 +338,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── GET /api/edge/menu/items — lean flat list for POS ──────────────────────
   if (url.pathname === "/api/edge/menu/items" && req.method === "GET") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const venueId = url.searchParams.get("venueId") || undefined;
     const data = getMenuItems(venueId);
     return jsonResponse(data);
@@ -346,14 +346,14 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── GET /api/edge/venues — venues with floors and sections ─────────────────
   if (url.pathname === "/api/edge/venues" && req.method === "GET") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const data = getVenues();
     return jsonResponse(data);
   }
 
   // ── GET /api/edge/outlet — outlet settings ─────────────────────────────────
   if (url.pathname === "/api/edge/outlet" && req.method === "GET") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const data = getOutletSettings();
     if (!data) return errorResponse("Outlet not found in local DB", 404);
     return jsonResponse(data);
@@ -361,7 +361,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── GET /api/edge/staff — list active staff for PIN login screen ───────────
   if (url.pathname === "/api/edge/staff" && req.method === "GET") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const db = getDb();
     const restaurantId = getRestaurantId();
     const staff = db.query(
@@ -372,7 +372,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── POST /api/edge/auth/pin — verify staff PIN (offline device-unlock) ─────
   if (url.pathname === "/api/edge/auth/pin" && req.method === "POST") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
 
     let body: any;
     try {
@@ -420,13 +420,13 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── GET /api/edge/sync/status — sync worker status ────────────────────────
   if (url.pathname === "/api/edge/sync/status" && req.method === "GET") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     return jsonResponse(getSyncStatus());
   }
 
   // ── POST /api/edge/sync/push — manually trigger a sync push ────────────────
   if (url.pathname === "/api/edge/sync/push" && req.method === "POST") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const result = await manualSyncPush();
     return jsonResponse(result);
   }
@@ -435,7 +435,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   // Forces a full sync push, waits for confirmation, returns day summary.
   // The frontend uses this to show a "Close Day" confirmation dialog.
   if (url.pathname === "/api/edge/close-day" && req.method === "POST") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
 
     const db = getDb();
     const restaurantId = getRestaurantId();
@@ -484,14 +484,14 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── POST /api/edge/sync/retry — retry dead-lettered records ────────────────
   if (url.pathname === "/api/edge/sync/retry" && req.method === "POST") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const result = retryDeadLetters();
     return jsonResponse({ success: true, ...result });
   }
 
   // ── GET /api/edge/sync/socket — socket connection status ───────────────────
   if (url.pathname === "/api/edge/sync/socket" && req.method === "GET") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     return jsonResponse(getSocketStatus());
   }
 
@@ -630,8 +630,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── PATCH /api/edge/admin/menu-item/:id — update menu item ──────────────────
   if (url.pathname.startsWith("/api/edge/admin/menu-item/") && req.method === "PATCH") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
-    const itemId = url.pathname.split("/").pop();
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const itemId = url.pathname.split("/").pop()!;
     let body: any;
     try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
 
@@ -660,7 +660,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── POST /api/edge/admin/menu-item — create menu item ───────────────────────
   if (url.pathname === "/api/edge/admin/menu-item" && req.method === "POST") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     let body: any;
     try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
 
@@ -680,8 +680,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── DELETE /api/edge/admin/menu-item/:id — soft delete menu item ─────────────
   if (url.pathname.startsWith("/api/edge/admin/menu-item/") && req.method === "DELETE") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
-    const itemId = url.pathname.split("/").pop();
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const itemId = url.pathname.split("/").pop()!;
 
     const db = getDb();
     const restaurantId = getRestaurantId();
@@ -694,8 +694,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── PATCH /api/edge/admin/table/:id — update table ──────────────────────────
   if (url.pathname.startsWith("/api/edge/admin/table/") && req.method === "PATCH") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
-    const tableId = url.pathname.split("/").pop();
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const tableId = url.pathname.split("/").pop()!;
     let body: any;
     try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
 
@@ -720,7 +720,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── POST /api/edge/admin/table — create table ───────────────────────────────
   if (url.pathname === "/api/edge/admin/table" && req.method === "POST") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     let body: any;
     try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
 
@@ -738,7 +738,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── DELETE /api/edge/admin/table/:id — soft delete table ───────────────────
   if (url.pathname.startsWith("/api/edge/admin/table/") && req.method === "DELETE") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const tableId = url.pathname.split("/").pop()!;
 
     const db = getDb();
@@ -752,7 +752,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── POST /api/edge/admin/category — create category ────────────────────────
   if (url.pathname === "/api/edge/admin/category" && req.method === "POST") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     let body: any;
     try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
 
@@ -771,7 +771,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── PATCH /api/edge/admin/category/:id — update category ───────────────────
   if (url.pathname.startsWith("/api/edge/admin/category/") && req.method === "PATCH") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const categoryId = url.pathname.split("/").pop()!;
     let body: any;
     try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
@@ -796,7 +796,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── DELETE /api/edge/admin/category/:id — soft delete category ──────────────
   if (url.pathname.startsWith("/api/edge/admin/category/") && req.method === "DELETE") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const categoryId = url.pathname.split("/").pop()!;
 
     const db = getDb();
@@ -809,7 +809,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── POST /api/edge/admin/staff — create staff member ────────────────────────
   if (url.pathname === "/api/edge/admin/staff" && req.method === "POST") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     let body: any;
     try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
 
@@ -830,8 +830,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── PATCH /api/edge/admin/staff/:id — update staff member ───────────────────
   if (url.pathname.startsWith("/api/edge/admin/staff/") && req.method === "PATCH") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
-    const userId = url.pathname.split("/").pop();
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const userId = url.pathname.split("/").pop()!;
     let body: any;
     try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
 
@@ -859,7 +859,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── DELETE /api/edge/admin/staff/:id — deactivate staff member ──────────────
   if (url.pathname.startsWith("/api/edge/admin/staff/") && req.method === "DELETE") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const userId = url.pathname.split("/").pop()!;
 
     const db = getDb();
@@ -872,12 +872,13 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── PATCH /api/edge/admin/outlet — update outlet settings ───────────────────
   if (url.pathname === "/api/edge/admin/outlet" && req.method === "PATCH") {
-    if (!isSessionValid()) return errorResponse("No valid session", 401);
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     let body: any;
     try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
 
     const db = getDb();
     const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
     const updates: string[] = [];
     const values: any[] = [];
 

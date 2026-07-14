@@ -64,10 +64,10 @@ function collectBatch(): SyncQueueRow[] {
   // Get pending records, prioritizing oldest first, skipping exhausted ones
   return db.query(`
     SELECT * FROM sync_queue
-    WHERE synced = 0 AND attempts < ?
+    WHERE synced = 0
     ORDER BY created_at ASC, id ASC
     LIMIT ?
-  `).all(MAX_ATTEMPTS, MAX_BATCH_SIZE) as SyncQueueRow[];
+  `).all(MAX_BATCH_SIZE) as SyncQueueRow[];
 }
 
 // ─── Load the full record data for a sync queue entry ────────────────────────
@@ -577,7 +577,7 @@ export function getSyncStatus(): {
   nextSyncInMs: number;
 } {
   const db = getDb();
-  const pendingCount = (db.query("SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0 AND attempts < ?").get(MAX_ATTEMPTS) as any)?.c || 0;
+  const pendingCount = (db.query("SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0").get() as any)?.c || 0;
   const deadLetterCount = (db.query("SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0 AND attempts >= ?").get(MAX_ATTEMPTS) as any)?.c || 0;
 
   return {
