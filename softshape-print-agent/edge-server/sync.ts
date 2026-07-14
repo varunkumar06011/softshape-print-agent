@@ -21,6 +21,7 @@
 
 import { getDb } from "./db.ts";
 import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid, getDeviceId, saveSession, loadSession } from "./auth.ts";
+import { cloudFetch } from "./cloudFetch.ts";
 
 const SYNC_INTERVAL_MS = parseInt(process.env.EDGE_SYNC_INTERVAL_MS || "10000", 10);
 const MAX_BATCH_SIZE = 50;
@@ -435,7 +436,7 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
   }
 
   try {
-    const res = await fetch(`${backendUrl}/api/edge/sync`, {
+    const res = await cloudFetch(`${backendUrl}/api/edge/sync`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,

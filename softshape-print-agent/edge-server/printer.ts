@@ -14,6 +14,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { getConfig } from "./db.ts";
+import { cloudFetch } from "./cloudFetch.ts";
 
 // ── Tauri invoke helper ──────────────────────────────────────────────────────
 
@@ -88,7 +89,7 @@ export async function printToPrinter(
   ).replace(/\/+$/, "");
   if (printAgentUrl) {
     try {
-      const res = await fetch(`${printAgentUrl}/print`, {
+      const res = await cloudFetch(`${printAgentUrl}/print`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -96,6 +97,7 @@ export async function printToPrinter(
           printerName,
           bytes: rawBytes,
         }),
+        timeout: 10_000, // local print bridge — 10s is plenty
       });
       const result = await res.json().catch(() => ({}));
       if (result.ok) {

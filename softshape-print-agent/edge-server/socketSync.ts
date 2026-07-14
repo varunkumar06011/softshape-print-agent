@@ -199,6 +199,12 @@ export function stopSocketSync(): void {
   }
 }
 
+// ─── Check if in fallback polling mode ────────────────────────────────────────
+
+export function isInFallbackMode(): boolean {
+  return fallbackToPolling;
+}
+
 // ─── Get socket connection status ────────────────────────────────────────────
 
 export function getSocketStatus(): {

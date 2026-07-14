@@ -35,7 +35,8 @@ import { downloadFullConfig, pullIncrementalChanges } from "./config.ts";
 import { createOrder, updateOrderItems, cancelKotItem, reprintKot } from "./orderService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings } from "./reads.ts";
 import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters } from "./sync.ts";
-import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat } from "./socketSync.ts";
+import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode } from "./socketSync.ts";
+import { cloudFetch } from "./cloudFetch.ts";
 
 const PORT = parseInt(process.env.EDGE_PORT || "3100", 10);
 
@@ -155,7 +156,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     // Call cloud backend to register the agent
     try {
-      const res = await fetch(`${backendUrl}/api/print/agent-register`, {
+      const res = await cloudFetch(`${backendUrl}/api/print/agent-register`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${setupToken}`,
@@ -1050,17 +1051,29 @@ if (isSessionValid()) {
   startSocketSync();
   startHeartbeat();
 
-  setInterval(async () => {
-    if (!isSessionValid()) return;
-    try {
-      const result = await pullIncrementalChanges();
-      if (result.success && result.changesApplied && result.changesApplied > 0) {
-        console.log(`[EdgeServer] Incremental sync: ${result.changesApplied} changes applied`);
+  // Dynamic poll interval: 15s when socket is in fallback mode, 60s otherwise
+  let pollIntervalId: ReturnType<typeof setInterval> | null = null;
+  function schedulePoll() {
+    if (pollIntervalId) clearInterval(pollIntervalId);
+    const intervalMs = isInFallbackMode() ? 15_000 : 60_000;
+    pollIntervalId = setInterval(async () => {
+      if (!isSessionValid()) return;
+      try {
+        const result = await pullIncrementalChanges();
+        if (result.success && result.changesApplied && result.changesApplied > 0) {
+          console.log(`[EdgeServer] Incremental sync: ${result.changesApplied} changes applied`);
+        }
+      } catch (err) {
+        console.warn('[EdgeServer] Incremental sync failed:', err);
       }
-    } catch (err) {
-      // Silent fail — will retry next cycle
-    }
-  }, 60_000);
+      // Re-evaluate interval after each poll in case fallback mode changed
+      const currentMs = isInFallbackMode() ? 15_000 : 60_000;
+      if (currentMs !== intervalMs) {
+        schedulePoll();
+      }
+    }, intervalMs);
+  }
+  schedulePoll();
 
   // Initial incremental pull on startup
   setTimeout(async () => {

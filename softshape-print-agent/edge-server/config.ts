@@ -13,6 +13,7 @@
 
 import { getDb, setSyncState, getSyncState } from "./db.ts";
 import { getBackendUrl, getSessionToken, getRestaurantId } from "./auth.ts";
+import { cloudFetch } from "./cloudFetch.ts";
 
 interface ConfigResponse {
   outlet: any;
@@ -42,7 +43,7 @@ export async function downloadFullConfig(): Promise<{ success: boolean; error?: 
   }
 
   try {
-    const res = await fetch(`${backendUrl}/api/edge/config`, {
+    const res = await cloudFetch(`${backendUrl}/api/edge/config`, {
       method: "GET",
       headers: {
         Authorization: `Bearer ${token}`,
@@ -292,7 +293,7 @@ export async function pullIncrementalChanges(): Promise<{ success: boolean; chan
   const since = getSyncState("last_incremental_sync") || new Date(0).toISOString();
 
   try {
-    const res = await fetch(`${backendUrl}/api/edge/changes?since=${encodeURIComponent(since)}`, {
+    const res = await cloudFetch(`${backendUrl}/api/edge/changes?since=${encodeURIComponent(since)}`, {
       method: "GET",
       headers: {
         Authorization: `Bearer ${token}`,
