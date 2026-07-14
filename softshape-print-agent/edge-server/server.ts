@@ -711,6 +711,13 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     if (body.printerTarget !== undefined) { updates.push("printer_target = ?"); values.push(body.printerTarget); }
     if (body.isDeleted !== undefined) { updates.push("is_deleted = ?"); values.push(body.isDeleted ? 1 : 0); }
     if (body.description !== undefined) { updates.push("description = ?"); values.push(body.description); }
+    // Persist GST flag; liquor/bar always forced off
+    const edgeMenuType = body.menuType;
+    if (edgeMenuType === "LIQUOR" || edgeMenuType === "BAR") {
+      updates.push("gst_enabled = ?"); values.push(0);
+    } else if (body.gstEnabled !== undefined) {
+      updates.push("gst_enabled = ?"); values.push(body.gstEnabled ? 1 : 0);
+    }
 
     if (updates.length === 0) return errorResponse("No fields to update", 400);
 
@@ -731,11 +738,15 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     const restaurantId = getRestaurantId();
     const itemId = crypto.randomUUID();
 
+    const createMenuType = body.menuType || "FOOD";
+    const createGst = (createMenuType === "LIQUOR" || createMenuType === "BAR")
+      ? 0
+      : (body.gstEnabled === false ? 0 : 1);
     db.query(`INSERT INTO menu_item (id, name, description, is_veg, is_available, sort_order, category_id, restaurant_id,
               base_price, unit, menu_type, gst_enabled, is_deleted)
-              VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, 1, 0)`)
+              VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, 0)`)
       .run(itemId, body.name, body.description || null, body.isVeg ? 1 : 0,
-           body.categoryId, restaurantId, Number(body.basePrice || 0), body.unit || null, body.menuType || "FOOD");
+           body.categoryId, restaurantId, Number(body.basePrice || 0), body.unit || null, createMenuType, createGst);
     enqueueSync("menu_item", itemId, "create");
 
     return jsonResponse({ success: true, id: itemId });
