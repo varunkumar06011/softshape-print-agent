@@ -73,7 +73,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse({
       status: "ok",
       service: "softshape-edge-server",
-      version: "12.6.2",
+      version: "13.0.0",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
