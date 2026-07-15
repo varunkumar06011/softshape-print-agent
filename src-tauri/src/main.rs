@@ -140,10 +140,13 @@ fn mark_event_id_seen(event_id: String) {
 fn main() {
     tauri::Builder::default()
         .setup(|_app| {
-            // Spawn the local HTTP print server on 0.0.0.0:3100
+            // Spawn the local HTTP print server on 0.0.0.0:PRINT_AGENT_PORT
             // so cashier (localhost) and captain tablets (LAN) can reach it.
-            std::thread::spawn(|| {
-                http_server::start("0.0.0.0:3100");
+            // Default 3101 avoids colliding with Restroworks POS which uses 3100.
+            let port = std::env::var("PRINT_AGENT_PORT").unwrap_or_else(|_| "3101".to_string());
+            let addr = format!("0.0.0.0:{}", port);
+            std::thread::spawn(move || {
+                http_server::start(&addr);
             });
             Ok(())
         })

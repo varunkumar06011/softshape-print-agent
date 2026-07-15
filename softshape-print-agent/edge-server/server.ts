@@ -48,7 +48,7 @@ import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDe
 import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode } from "./socketSync.ts";
 import { cloudFetch } from "./cloudFetch.ts";
 
-const PORT = parseInt(process.env.EDGE_PORT || "3100", 10);
+const PORT = parseInt(process.env.EDGE_PORT || "3101", 10);
 let startupState: "starting" | "ready" | "error" = "starting";
 let startupError = "";
 
@@ -108,7 +108,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return jsonResponse({
         status: startupState === "error" ? "error" : "initializing",
         service: "softshape-edge-server",
-        version: "14.0.0",
+        version: "16.0.0",
         uptime: process.uptime(),
         error: startupError || null,
       });
@@ -132,7 +132,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse({
       status: "ok",
       service: "softshape-edge-server",
-      version: "15.0.0",
+      version: "16.0.0",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,

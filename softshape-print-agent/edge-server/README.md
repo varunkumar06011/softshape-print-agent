@@ -5,7 +5,7 @@ Local edge server that runs on the restaurant's billing PC. Handles the **hot pa
 ## Architecture
 
 ```
-Captain/Cashier App (LAN)  ──HTTP──→  Edge Server (localhost:3100)
+Captain/Cashier App (LAN)  ──HTTP──→  Edge Server (localhost:3101)
                                           ├── SQLite (local DB)
                                           ├── Direct USB printing (Tauri)
                                           └── Background sync → Cloud Backend
@@ -38,7 +38,8 @@ bun install
 bun run dev
 ```
 
-The server starts on `http://0.0.0.0:3100` (accessible from any device on the LAN).
+The server starts on `http://0.0.0.0:3101` (accessible from any device on the LAN).
+Port 3101 is used by default to avoid conflicts with Restroworks POS which occupies port 3100.
 
 ## Setup (Production / Restaurant)
 
@@ -95,7 +96,7 @@ The Tauri app launches `edge-server.exe` as a sidecar process on startup.
 ### Registration Example
 
 ```bash
-curl -X POST http://localhost:3100/api/edge/register \
+curl -X POST http://localhost:3101/api/edge/register \
   -H "Content-Type: application/json" \
   -d '{
     "setupToken": "your-setup-token",
@@ -108,7 +109,7 @@ curl -X POST http://localhost:3100/api/edge/register \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `EDGE_PORT` | `3100` | HTTP server port |
+| `EDGE_PORT` | `3101` | HTTP server port (3101 avoids Restroworks POS conflict on 3100) |
 | `EDGE_DB_PATH` | `~/.softshape/edge.db` | SQLite database file path |
 
 ## Database

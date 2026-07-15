@@ -1,7 +1,9 @@
 /// Local HTTP print server for SoftShape Print Agent.
 ///
-/// Runs inside the Tauri process on 0.0.0.0:3100, accepting print jobs
-/// from the Cashier desktop app and Captain tablets on the same LAN.
+/// Runs inside the Tauri process on 0.0.0.0:PRINT_AGENT_PORT (default 3101),
+/// accepting print jobs from the Cashier desktop app and Captain tablets on
+/// the same LAN. Default port 3101 avoids colliding with Restroworks POS
+/// which occupies port 3100.
 ///
 /// Endpoints:
 ///   POST /print   { type, printerName, escposData, eventId, data }
