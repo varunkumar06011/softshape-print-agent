@@ -10,7 +10,7 @@
 // The session token is used for cloud sync, not for LAN API auth.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, getConfig, setConfig } from "./db.ts";
+import { getDb, getConfig, setConfig, getSyncState } from "./db.ts";
 
 interface StoredSession {
   sessionToken: string;
@@ -78,6 +78,7 @@ export function isSessionValid(): boolean {
 export function isLocalReady(): boolean {
   const session = loadSession();
   if (!session) return false;
+  if (getSyncState("config_sync_completed") !== "true") return false;
   const outlet = getDb().query("SELECT id FROM outlet WHERE id = ? LIMIT 1").get(session.restaurantId);
   return Boolean(outlet);
 }

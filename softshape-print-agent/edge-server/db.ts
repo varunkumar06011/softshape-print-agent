@@ -11,6 +11,19 @@
 
 import { Database } from "bun:sqlite";
 import { openDatabaseWithRecovery, getDbPath, type RecoveryResult } from "./recovery.ts";
+import { existsSync, renameSync } from "node:fs";
+
+// ── IST date helper ──────────────────────────────────────────────────────────
+// The cloud backend uses Asia/Kolkata (IST, UTC+5:30) for daily counter dates.
+// The edge server must use the same timezone so that edge-assigned KOT/bill
+// numbers map to the same counter date on the cloud during sync. Using UTC
+// (toISOString().slice(0,10)) caused a 5.5-hour mismatch around midnight where
+// edge and cloud counters were on different dates.
+export function getKolkataDateString(date = new Date()): string {
+  return date.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+}
+
+const CURRENT_SCHEMA_VERSION = 1;
 
 let db: Database | null = null;
 let recoveryStatus: RecoveryResult = { recovered: false, corruptPath: null, message: "" };
@@ -22,7 +35,46 @@ export function getDb(): Database {
   db = result.db;
   recoveryStatus = result.recovery;
 
+  // Schema-version check: a stale on-disk schema (from an older app version
+  // or a previous broken attempt) is treated like corruption — back up + rebuild
+  // — so CREATE TABLE IF NOT EXISTS doesn't silently reuse a mismatched schema.
+  const versionRow = db.query("PRAGMA user_version").get() as { user_version?: number } | undefined;
+  const onDiskVersion = Number(versionRow?.user_version || 0);
+
+  if (onDiskVersion !== 0 && onDiskVersion !== CURRENT_SCHEMA_VERSION) {
+    console.warn(`[DB] Schema version mismatch: on-disk=${onDiskVersion}, expected=${CURRENT_SCHEMA_VERSION}. Rebuilding fresh DB.`);
+    const dbPath = getDbPath();
+    db.close();
+    db = null;
+
+    const backupPath = `${dbPath}.stale-schema-${Date.now()}`;
+    try {
+      if (existsSync(dbPath)) renameSync(dbPath, backupPath);
+    } catch (err) {
+      console.error("[DB] Could not back up stale-schema DB:", err);
+    }
+
+    const fresh = new Database(dbPath, { create: true });
+    fresh.exec("PRAGMA journal_mode = WAL;");
+    fresh.exec("PRAGMA foreign_keys = ON;");
+    fresh.exec("PRAGMA busy_timeout = 5000;");
+    db = fresh;
+
+    recoveryStatus = {
+      recovered: true,
+      corruptPath: backupPath,
+      message: "Local database schema was outdated and has been reset. " +
+        "Menu and settings will be re-downloaded from the cloud when connected.",
+    };
+    console.warn(`[DB] ${recoveryStatus.message}`);
+  }
+
   initSchema(db);
+
+  if (onDiskVersion !== CURRENT_SCHEMA_VERSION) {
+    db.exec(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
+  }
+
   return db;
 }
 
@@ -437,7 +489,7 @@ export function enqueueSync(tableName: string, recordId: string, operation: stri
 
 export function getNextKotNumber(restaurantId: string): number {
   const db = getDb();
-  const today = new Date().toISOString().slice(0, 10);
+  const today = getKolkataDateString();
 
   // Upsert daily counter
   db.query("INSERT INTO daily_counter (id, restaurant_id, counter_date, kot_count) VALUES (?, ?, ?, 0) ON CONFLICT(restaurant_id, counter_date) DO NOTHING")

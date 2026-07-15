@@ -65,6 +65,7 @@ export async function downloadFullConfig(): Promise<{ success: boolean; error?: 
 
     let totalRows = 0;
 
+    const applyConfig = db.transaction(() => {
     // ── Outlet ──────────────────────────────────────────────────────────────
     db.query(`INSERT INTO outlet (
       id, name, slug, restaurant_code, restaurant_type, address, phone, email,
@@ -272,6 +273,12 @@ export async function downloadFullConfig(): Promise<{ success: boolean; error?: 
 
     // ── Record sync timestamp ─────────────────────────────────────────────────
     setSyncState("last_full_config_sync", new Date().toISOString());
+    setSyncState("config_sync_completed", "true");
+
+    return totalRows;
+    });
+
+    totalRows = applyConfig();
 
     return { success: true, tablesLoaded: totalRows };
   } catch (err: any) {

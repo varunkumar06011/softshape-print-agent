@@ -37,7 +37,7 @@
 //   GET  /api/edge/sync/socket  — socket connection status
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, closeDb, getConfig, setConfig, getSyncState, enqueueSync, getRecoveryStatus } from "./db.ts";
+import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enqueueSync, getRecoveryStatus } from "./db.ts";
 import os from "os";
 import { runDailyMaintenance } from "./backup.ts";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
@@ -232,13 +232,24 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       // Trigger initial config download
       const configResult = await downloadFullConfig();
 
+      if (!configResult.success) {
+        // Config download failed — clear the session so the broken first attempt
+        // doesn't become permanently invisible on next launch (isLocalReady would
+        // otherwise see the saved session + a partial outlet row and skip to "ready").
+        clearSession();
+        return errorResponse(
+          `Registration succeeded but config download failed: ${configResult.error || 'unknown error'}. ` +
+          'Please retry — your setup token may still be valid.',
+          500
+        );
+      }
+
       return jsonResponse({
         success: true,
         restaurantId: data.restaurantId,
         restaurantName: data.restaurantName,
-        configDownloaded: configResult.success,
+        configDownloaded: true,
         tablesLoaded: configResult.tablesLoaded || 0,
-        configError: configResult.error,
       });
     } catch (err: any) {
       return errorResponse(err.message || "Failed to connect to backend");
@@ -872,6 +883,9 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         backendUrl: getBackendUrl() || '',
         expiresAt: 0, // no expiry for local onboarding
       });
+
+      // 8. Mark local config as complete so isLocalReady() returns true
+      setSyncState("config_sync_completed", "true");
 
       console.log(`[Onboard] Created restaurant "${restaurantName}" (${restaurantId}) with ${numTables} tables, ${template.categories?.length || 0} categories, owner: ${owner.name}`);
 

@@ -11,7 +11,7 @@
 // Total: 15-40ms from button press to printer starting.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, getNextKotNumber, enqueueSync } from "./db.ts";
+import { getDb, getNextKotNumber, enqueueSync, getKolkataDateString } from "./db.ts";
 import { buildFoodKOT, buildLiquorKOT, buildCancelKOT, buildBill, type PrintItem, type OrderData } from "./escpos.ts";
 import { printToPrinter, printGrouped, resolvePrinterName } from "./printer.ts";
 
@@ -480,9 +480,9 @@ export async function updateOrderItems(
 
   const db = getDb();
 
-  // ── Idempotency check ──────────────────────────────────────────────────────
+  // ── Idempotency check — scoped to the target order to avoid matching other orders ──
   if (requestId) {
-    const existing = db.query("SELECT * FROM order_record WHERE last_request_id = ?").get(requestId) as any;
+    const existing = db.query("SELECT * FROM order_record WHERE id = ? AND last_request_id = ?").get(orderId, requestId) as any;
     if (existing) {
       const existingItems = db.query("SELECT * FROM order_item WHERE order_id = ?").all(existing.id) as any[];
       return {
@@ -728,6 +728,12 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
   const db = getDb();
   const { orderId, restaurantId, orderItemId, cancelQuantity, cancelledBy } = input;
 
+  // Scope by restaurantId to prevent cross-tenant access
+  const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
+  if (!order) {
+    return { success: false, error: "Order not found" };
+  }
+
   const orderItem = db.query("SELECT * FROM order_item WHERE id = ? AND order_id = ?").get(orderItemId, orderId) as any;
   if (!orderItem) {
     return { success: false, error: "Order item not found" };
@@ -735,13 +741,54 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
 
   const qtyToCancel = cancelQuantity || orderItem.quantity;
   const newCancelledQty = (orderItem.cancelled_quantity || 0) + qtyToCancel;
+  const cancelAmount = Number(orderItem.price) * qtyToCancel;
+  const now = Date.now();
 
-  // Update order item
-  db.query("UPDATE order_item SET cancelled_quantity = ? WHERE id = ?").run(newCancelledQty, orderItem.id);
+  const isFullCancel = newCancelledQty >= orderItem.quantity;
+
+  // Wrap all DB updates in a transaction so order total, table bill, KOT item
+  // status, and table status are atomic. If any step fails, none are applied.
+  const tx = db.transaction(() => {
+    // 1. Update cancelled_quantity on the order item
+    db.query("UPDATE order_item SET cancelled_quantity = ? WHERE id = ?")
+      .run(newCancelledQty, orderItem.id);
+
+    // 2. Mark the KOT item as CANCELLED so KDS stops showing it as active
+    if (isFullCancel) {
+      db.query("UPDATE kot_item SET status = 'CANCELLED' WHERE order_item_id = ?")
+        .run(orderItem.id);
+    }
+
+    // 3. Reduce order total_amount
+    db.query("UPDATE order_record SET total_amount = MAX(0, total_amount - ?), updated_at = ? WHERE id = ?")
+      .run(cancelAmount, now, orderId);
+
+    // 4. Check if all items on this order are now fully cancelled
+    const remainingItems = db.query(
+      "SELECT COUNT(*) as cnt FROM order_item WHERE order_id = ? AND (cancelled_quantity IS NULL OR cancelled_quantity < quantity)"
+    ).get(orderId) as { cnt: number };
+
+    const allCancelled = remainingItems.cnt === 0;
+
+    // 5. Reduce table current_bill; free the table if everything is cancelled
+    if (allCancelled) {
+      db.query(`UPDATE "table" SET status = 'AVAILABLE', workflow_status = 'Free', current_bill = 0, captain_id = NULL, guests = 0, session_started_at = NULL, kot_history = '[]', discount = NULL, updated_at = ? WHERE id = ?`)
+        .run(now, order.table_id);
+    } else {
+      db.query(`UPDATE "table" SET current_bill = MAX(0, current_bill - ?), updated_at = ? WHERE id = ?`)
+        .run(cancelAmount, now, order.table_id);
+    }
+
+    // 6. Enqueue sync records
+    enqueueSync("order_item", orderItemId, "update");
+    enqueueSync("order", orderId, "update");
+    enqueueSync("table", order.table_id, "update");
+  });
+
+  tx();
 
   // Get table + outlet for print context
-  const order = db.query("SELECT * FROM order_record WHERE id = ?").get(orderId) as any;
-  const table = order ? getTableWithSection(order.table_id) : null;
+  const table = getTableWithSection(order.table_id);
   const outlet = getOutlet(restaurantId);
 
   if (!table || !outlet) {
@@ -788,13 +835,6 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
   if (printerName) {
     printResult = await printToPrinter(printerName, escposData);
   }
-
-  // Update order's updated_at timestamp
-  db.query("UPDATE order_record SET updated_at = ? WHERE id = ?").run(Date.now(), orderId);
-
-  // Enqueue sync for both order_item and order (so cloud gets updated timestamp)
-  enqueueSync("order_item", orderItemId, "update");
-  enqueueSync("order", orderId, "update");
 
   return { success: true, printResult };
 }
@@ -915,7 +955,7 @@ export async function reprintKot(input: ReprintKotInput): Promise<{ success: boo
 
 function getNextBillNumber(restaurantId: string): string {
   const db = getDb();
-  const today = new Date().toISOString().slice(0, 10);
+  const today = getKolkataDateString();
 
   db.query("INSERT INTO daily_counter (id, restaurant_id, counter_date, bill_count) VALUES (?, ?, ?, 0) ON CONFLICT(restaurant_id, counter_date) DO NOTHING")
     .run(crypto.randomUUID(), restaurantId, today);
@@ -940,15 +980,18 @@ export async function requestBillingEdge(
   }
 
   const now = Date.now();
-  db.query("UPDATE order_record SET billing_requested = 1, billing_requested_at = ?, updated_at = ?, status = 'BILLING_REQUESTED' WHERE id = ?")
-    .run(now, now, orderId);
+  const tx = db.transaction(() => {
+    db.query("UPDATE order_record SET billing_requested = 1, billing_requested_at = ?, updated_at = ?, status = 'BILLING_REQUESTED' WHERE id = ?")
+      .run(now, now, orderId);
 
-  // Update table workflow status
-  db.query(`UPDATE "table" SET workflow_status = 'Waiting Bill', updated_at = ? WHERE id = ?`)
-    .run(now, order.table_id);
+    db.query(`UPDATE "table" SET workflow_status = 'Waiting Bill', updated_at = ? WHERE id = ?`)
+      .run(now, order.table_id);
 
-  enqueueSync("order", orderId, "update");
-  enqueueSync("table", order.table_id, "update");
+    enqueueSync("order", orderId, "update");
+    enqueueSync("table", order.table_id, "update");
+  });
+
+  tx();
 
   return { success: true, order: { id: orderId, status: "BILLING_REQUESTED" } };
 }
@@ -980,8 +1023,10 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
     billNumber = getNextBillNumber(restaurantId);
     db.query("UPDATE order_record SET bill_number = ?, updated_at = ? WHERE id = ?")
       .run(billNumber, Date.now(), orderId);
-    enqueueSync("order", orderId, "update");
   }
+  // Always enqueue sync after bill print so the cloud receives the bill_number,
+  // even if a prior sync cycle pushed the order before the number was assigned.
+  enqueueSync("order", orderId, "update");
 
   // Get table + outlet for print context
   const table = getTableWithSection(order.table_id);
@@ -1065,13 +1110,13 @@ export interface SettleOrderInput {
   requestId?: string;
 }
 
-export async function settleOrderEdge(input: SettleOrderInput): Promise<{ success: boolean; error?: string; order?: any; table?: any }> {
+export async function settleOrderEdge(input: SettleOrderInput): Promise<{ success: boolean; error?: string; order?: any; table?: any; statusCode?: number }> {
   const db = getDb();
   const { orderId, restaurantId, paymentMethod, localTxnId, requestId } = input;
 
-  // Idempotency check
+  // Idempotency check — scoped to the target order to avoid matching other orders
   if (requestId) {
-    const existing = db.query("SELECT * FROM order_record WHERE last_request_id = ?").get(requestId) as any;
+    const existing = db.query("SELECT * FROM order_record WHERE id = ? AND last_request_id = ?").get(orderId, requestId) as any;
     if (existing && existing.status === "SETTLED") {
       return { success: true, order: existing, error: "Duplicate request — already settled" };
     }
@@ -1155,9 +1200,10 @@ export async function swapTableEdge(
     return { success: false, error: "Source or target table not found" };
   }
 
-  // Find active order on source table
-  const activeOrder = db.query("SELECT * FROM order_record WHERE table_id = ? AND restaurant_id = ? AND status IN (?, ?) AND is_deleted = 0")
-    .get(sourceTableId, restaurantId, "PENDING", "PREPARING") as any;
+  // Find active order on source table — use the full active status list
+  const activeOrder = db.query(
+    `SELECT * FROM order_record WHERE table_id = ? AND restaurant_id = ? AND status IN (${ACTIVE_ORDER_STATUSES.map(() => "?").join(",")}) AND is_deleted = 0`
+  ).get(sourceTableId, restaurantId, ...ACTIVE_ORDER_STATUSES) as any;
 
   const now = Date.now();
   const tx = db.transaction(() => {
@@ -1205,15 +1251,17 @@ export async function transferItemsEdge(
     return { success: false, error: "No items to transfer" };
   }
 
-  // Find active orders on both tables
-  const sourceOrder = db.query("SELECT * FROM order_record WHERE table_id = ? AND restaurant_id = ? AND status IN (?, ?) AND is_deleted = 0")
-    .get(sourceTableId, restaurantId, "PENDING", "PREPARING") as any;
+  // Find active orders on both tables — use the full active status list
+  const sourceOrder = db.query(
+    `SELECT * FROM order_record WHERE table_id = ? AND restaurant_id = ? AND status IN (${ACTIVE_ORDER_STATUSES.map(() => "?").join(",")}) AND is_deleted = 0`
+  ).get(sourceTableId, restaurantId, ...ACTIVE_ORDER_STATUSES) as any;
   if (!sourceOrder) {
     return { success: false, error: "No active order on source table" };
   }
 
-  let targetOrder = db.query("SELECT * FROM order_record WHERE table_id = ? AND restaurant_id = ? AND status IN (?, ?) AND is_deleted = 0")
-    .get(targetTableId, restaurantId, "PENDING", "PREPARING") as any;
+  let targetOrder = db.query(
+    `SELECT * FROM order_record WHERE table_id = ? AND restaurant_id = ? AND status IN (${ACTIVE_ORDER_STATUSES.map(() => "?").join(",")}) AND is_deleted = 0`
+  ).get(targetTableId, restaurantId, ...ACTIVE_ORDER_STATUSES) as any;
 
   const now = Date.now();
   const tx = db.transaction(() => {
@@ -1232,16 +1280,19 @@ export async function transferItemsEdge(
       const item = db.query("SELECT * FROM order_item WHERE id = ? AND order_id = ?").get(itemId, sourceOrder.id) as any;
       if (!item) continue;
 
-      // Create new order item on target order
+      const effectiveQty = item.quantity - (item.cancelled_quantity || 0);
+      if (effectiveQty <= 0) continue;
+
+      // Create new order item on target order with the effective quantity
       const newItemId = crypto.randomUUID();
       db.query("INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, notes, menu_type, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)")
-        .run(newItemId, targetOrder.id, item.menu_item_id, item.name, item.price, item.quantity, item.notes, item.menu_type);
+        .run(newItemId, targetOrder.id, item.menu_item_id, item.name, item.price, effectiveQty, item.notes, item.menu_type);
 
       // Mark original item as removed
       db.query("UPDATE order_item SET removed_from_bill = 1, removed_by = ?, removed_at = ? WHERE id = ?")
         .run(transferredBy, now, itemId);
 
-      transferredAmount += Number(item.price) * item.quantity;
+      transferredAmount += Number(item.price) * effectiveQty;
       enqueueSync("order_item", newItemId, "insert");
       enqueueSync("order_item", itemId, "update");
     }
@@ -1293,9 +1344,15 @@ export async function editBillEdge(
 
   const now = Date.now();
   const tx = db.transaction(() => {
+    let billDelta = 0;
+
     // Remove items
     if (removedItemIds && removedItemIds.length > 0) {
       for (const itemId of removedItemIds) {
+        const item = db.query("SELECT * FROM order_item WHERE id = ? AND order_id = ?").get(itemId, orderId) as any;
+        if (!item) continue;
+        const effectiveQty = item.quantity - (item.cancelled_quantity || 0);
+        billDelta -= Number(item.price) * effectiveQty;
         db.query("UPDATE order_item SET removed_from_bill = 1, removed_by = ?, removed_at = ? WHERE id = ? AND order_id = ?")
           .run(editedBy || "Cashier", now, itemId, orderId);
         enqueueSync("order_item", itemId, "update");
@@ -1309,6 +1366,7 @@ export async function editBillEdge(
         if (!item) continue;
         const oldQty = item.quantity;
         const qtyDiff = newQty - oldQty;
+        billDelta += Number(item.price) * qtyDiff;
         db.query("UPDATE order_item SET quantity = ?, edited_quantity = ? WHERE id = ?")
           .run(newQty, newQty, itemId);
         // Adjust order total
@@ -1322,12 +1380,21 @@ export async function editBillEdge(
     if (addedItems && addedItems.length > 0) {
       for (const item of addedItems) {
         const newItemId = crypto.randomUUID();
+        const itemTotal = Number(item.price) * (item.quantity || 1);
+        billDelta += itemTotal;
         db.query("INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, notes, menu_type, added_by_cashier, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0)")
           .run(newItemId, orderId, item.menuItemId || item.id || null, item.name, Number(item.price), item.quantity || 1, item.notes || null, item.menuType || "FOOD");
         db.query("UPDATE order_record SET total_amount = total_amount + ?, updated_at = ? WHERE id = ?")
-          .run(Number(item.price) * (item.quantity || 1), now, orderId);
+          .run(itemTotal, now, orderId);
         enqueueSync("order_item", newItemId, "insert");
       }
+    }
+
+    // Sync table current_bill with the net bill delta
+    if (billDelta !== 0) {
+      db.query(`UPDATE "table" SET current_bill = MAX(0, current_bill + ?), updated_at = ? WHERE id = ?`)
+        .run(billDelta, now, order.table_id);
+      enqueueSync("table", order.table_id, "update");
     }
 
     db.query("UPDATE order_record SET updated_at = ? WHERE id = ?").run(now, orderId);
@@ -1376,24 +1443,28 @@ export async function updateOrderStatusEdge(
   }
 
   const now = Date.now();
-  db.query("UPDATE order_record SET status = ?, updated_at = ? WHERE id = ?")
-    .run(status, now, orderId);
+  const tx = db.transaction(() => {
+    db.query("UPDATE order_record SET status = ?, updated_at = ? WHERE id = ?")
+      .run(status, now, orderId);
 
-  // Update table workflow status to match
-  const workflowMap: Record<string, string> = {
-    "PREPARING": "Preparing",
-    "READY": "Prepared",
-    "BILLING_REQUESTED": "Waiting Bill",
-    "SETTLED": "Free",
-  };
-  const workflowStatus = workflowMap[status];
-  if (workflowStatus) {
-    db.query(`UPDATE "table" SET workflow_status = ?, updated_at = ? WHERE id = ?`)
-      .run(workflowStatus, now, order.table_id);
-    enqueueSync("table", order.table_id, "update");
-  }
+    // Update table workflow status to match
+    const workflowMap: Record<string, string> = {
+      "PREPARING": "Preparing",
+      "READY": "Prepared",
+      "BILLING_REQUESTED": "Waiting Bill",
+      "SETTLED": "Free",
+    };
+    const workflowStatus = workflowMap[status];
+    if (workflowStatus) {
+      db.query(`UPDATE "table" SET workflow_status = ?, updated_at = ? WHERE id = ?`)
+        .run(workflowStatus, now, order.table_id);
+      enqueueSync("table", order.table_id, "update");
+    }
 
-  enqueueSync("order", orderId, "update");
+    enqueueSync("order", orderId, "update");
+  });
+
+  tx();
 
   const updatedOrder = db.query("SELECT * FROM order_record WHERE id = ?").get(orderId) as any;
   return { success: true, order: updatedOrder };
