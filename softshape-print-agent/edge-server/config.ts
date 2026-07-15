@@ -72,7 +72,7 @@ export async function downloadFullConfig(): Promise<{ success: boolean; error?: 
       printer_config, bar_unit_ml, full_bottle_ml, half_bottle_ml, fssai,
       prices_include_gst, gst_category, gst_rate, gst_registered, service_charge_percent,
       enabled_modules, shared_kitchen_outlet_id, organization_id, is_active, synced_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
     ON CONFLICT(id) DO UPDATE SET
       name=excluded.name, slug=excluded.slug, restaurant_code=excluded.restaurant_code,
       restaurant_type=excluded.restaurant_type, address=excluded.address, phone=excluded.phone,
@@ -102,7 +102,7 @@ export async function downloadFullConfig(): Promise<{ success: boolean; error?: 
       config.outlet.serviceChargePercent || 0,
       JSON.stringify(config.outlet.enabledModules || {}),
       config.outlet.sharedKitchenOutletId || null,
-      config.outlet.organizationId, config.outlet.isActive !== false ? 1 : 0
+      config.outlet.organizationId || null, config.outlet.isActive !== false ? 1 : 0
     );
     totalRows++;
 
@@ -381,7 +381,7 @@ function applyChange(db: any, change: any): boolean {
         row.pricesIncludeGst ? 1 : 0, row.gstCategory || "NON_AC", row.gstRate || null,
         row.gstRegistered !== false ? 1 : 0, row.serviceChargePercent || 0,
         JSON.stringify(row.enabledModules || {}), row.sharedKitchenOutletId || null,
-        row.organizationId, row.isActive !== false ? 1 : 0
+        row.organizationId || null, row.isActive !== false ? 1 : 0
       );
       return true;
 

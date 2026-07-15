@@ -60,7 +60,7 @@ function initSchema(database: Database) {
       service_charge_percent INTEGER DEFAULT 0,
       enabled_modules     TEXT,  -- JSON
       shared_kitchen_outlet_id TEXT,
-      organization_id     TEXT NOT NULL,
+      organization_id     TEXT,
       is_active           INTEGER DEFAULT 1,
       synced_at           INTEGER NOT NULL DEFAULT (unixepoch())
     );
