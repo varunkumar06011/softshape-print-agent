@@ -108,7 +108,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return jsonResponse({
         status: startupState === "error" ? "error" : "initializing",
         service: "softshape-edge-server",
-        version: "16.0.0",
+        version: "16.5.0",
         uptime: process.uptime(),
         error: startupError || null,
       });
@@ -132,7 +132,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse({
       status: "ok",
       service: "softshape-edge-server",
-      version: "16.0.0",
+      version: "16.5.0",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
