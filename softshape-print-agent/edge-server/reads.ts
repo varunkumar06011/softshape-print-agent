@@ -20,6 +20,62 @@ import { getRestaurantId } from "./auth.ts";
 
 const ACTIVE_ORDER_STATUSES = ["PENDING", "CONFIRMED", "PREPARING", "READY", "BILLING_REQUESTED"];
 
+// ─── GET /api/edge/orders — active orders with items (for KDS) ────────────────
+
+export function getActiveOrders(statusFilter?: string): any[] {
+  const restaurantId = getRestaurantId();
+  if (!restaurantId) return [];
+
+  const db = getDb();
+  const statuses = statusFilter
+    ? [statusFilter.toUpperCase()]
+    : ACTIVE_ORDER_STATUSES;
+
+  const orders = db.query(`
+    SELECT o.* FROM order_record o
+    WHERE o.restaurant_id = ? AND o.status IN (${statuses.map(() => "?").join(",")}) AND o.is_deleted = 0
+    ORDER BY o.updated_at DESC
+  `).all(restaurantId, ...statuses) as any[];
+
+  return orders.map((order) => {
+    const items = db.query(`
+      SELECT oi.*, m.gst_enabled, m.menu_type as mi_menu_type
+      FROM order_item oi
+      LEFT JOIN menu_item m ON oi.menu_item_id = m.id
+      WHERE oi.order_id = ? AND oi.removed_from_bill = 0 AND oi.quantity > 0
+      ORDER BY oi.id ASC
+    `).all(order.id) as any[];
+
+    return {
+      id: order.id,
+      tableId: order.table_id,
+      restaurantId: order.restaurant_id,
+      status: order.status,
+      totalAmount: Number(order.total_amount),
+      captainId: order.captain_id,
+      platform: order.platform,
+      createdAt: new Date(order.created_at).toISOString(),
+      updatedAt: new Date(order.updated_at).toISOString(),
+      items: items.map((i) => ({
+        id: i.id,
+        orderId: i.order_id,
+        menuItemId: i.menu_item_id,
+        name: i.name,
+        price: Number(i.price),
+        quantity: i.quantity,
+        notes: i.notes,
+        menuType: i.menu_type,
+        cancelledQuantity: i.cancelled_quantity || 0,
+        removedFromBill: !!i.removed_from_bill,
+        menuItem: {
+          gstEnabled: !!i.gst_enabled,
+          menuType: i.mi_menu_type || i.menu_type,
+        },
+      })),
+    };
+  });
+}
+
 // ─── GET /api/edge/tables — sections with nested tables (matches cloud shape) ─
 
 export function getTablesForRestaurant(): any[] {

@@ -21,6 +21,7 @@
 //   POST /api/edge/order/edit-bill      — edit bill before settlement
 //   POST /api/edge/order/confirm-payment — confirm payment for order
 //   POST /api/edge/order/status         — update order status
+//   GET  /api/edge/orders       — active orders with items (for KDS)
 //   GET  /api/edge/tables       — sections with nested tables + active orders
 //   GET  /api/edge/tables/flat  — flat list of all tables
 //   GET  /api/edge/sections     — sections with venue + floor info
@@ -42,12 +43,14 @@ import { runDailyMaintenance } from "./backup.ts";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { downloadFullConfig, pullIncrementalChanges } from "./config.ts";
 import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge } from "./orderService.ts";
-import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings } from "./reads.ts";
+import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders } from "./reads.ts";
 import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters } from "./sync.ts";
 import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode } from "./socketSync.ts";
 import { cloudFetch } from "./cloudFetch.ts";
 
 const PORT = parseInt(process.env.EDGE_PORT || "3100", 10);
+let startupState: "starting" | "ready" | "error" = "starting";
+let startupError = "";
 
 // ── CORS headers for LAN access (captain/cashier apps on other devices) ──────
 
@@ -101,6 +104,15 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── GET /health ─────────────────────────────────────────────────────────────
   if (url.pathname === "/health" && req.method === "GET") {
+    if (startupState !== "ready") {
+      return jsonResponse({
+        status: startupState === "error" ? "error" : "initializing",
+        service: "softshape-edge-server",
+        version: "14.0.0",
+        uptime: process.uptime(),
+        error: startupError || null,
+      });
+    }
     const session = loadSession();
     const recovery = getRecoveryStatus();
     // Include LAN IP so captain devices can verify they found the right edge server
@@ -129,6 +141,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       recoveryMessage: recovery.message || null,
       lanIp,
       edgePort: PORT,
+      maintenanceError: startupError || null,
     });
   }
 
@@ -421,6 +434,14 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     }
 
     return jsonResponse(result);
+  }
+
+  // ── GET /api/edge/orders — active orders with items (for KDS) ──────────────
+  if (url.pathname === "/api/edge/orders" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const status = url.searchParams.get("status") || undefined;
+    const data = getActiveOrders(status);
+    return jsonResponse(data, 200, { "Cache-Control": "no-store" });
   }
 
   // ── POST /api/edge/order/request-billing — mark order as billing requested ──
@@ -1185,30 +1206,34 @@ console.log(`[EdgeServer] SoftShape Edge Server running on http://0.0.0.0:${serv
 console.log(`[EdgeServer] Health check: http://localhost:${server.port}/health`);
 
 // ── Startup maintenance: backup + prune ──────────────────────────────────────
-try {
-  runDailyMaintenance(getDb());
-} catch (err) {
-  console.error("[EdgeServer] Startup maintenance failed:", err);
-}
+setTimeout(() => {
+  try {
+    runDailyMaintenance(getDb());
+  } catch (err: any) {
+    startupError = err?.message || String(err);
+    console.error("[EdgeServer] Startup maintenance failed (non-fatal):", err);
+  }
+
+  const recovery = getRecoveryStatus();
+  if (recovery.recovered) {
+    console.warn("[EdgeServer] Database was recovered from corruption — attempting full config re-download...");
+    const session = loadSession();
+    if (session?.backendUrl && session?.sessionToken) {
+      downloadFullConfig()
+        .then(() => console.log("[EdgeServer] Config re-download complete"))
+        .catch(err => console.warn("[EdgeServer] Config re-download failed (will retry on next sync):", err));
+    } else {
+      console.warn("[EdgeServer] No session — config will download after registration");
+    }
+  }
+
+  startupState = "ready";
+}, 0);
 
 // Run maintenance every 24 hours
 setInterval(() => {
-  try { runDailyMaintenance(getDb()); } catch {}
+  try { runDailyMaintenance(getDb()); } catch (err) { console.warn("[EdgeServer] Scheduled maintenance failed:", err); }
 }, 24 * 60 * 60 * 1000);
-
-// ── Corruption recovery: trigger config re-download if DB was recovered ──────
-const _recovery = getRecoveryStatus();
-if (_recovery.recovered) {
-  console.warn("[EdgeServer] Database was recovered from corruption — attempting full config re-download...");
-  const session = loadSession();
-  if (session?.backendUrl && session?.sessionToken) {
-    downloadFullConfig()
-      .then(() => console.log("[EdgeServer] Config re-download complete"))
-      .catch(err => console.warn("[EdgeServer] Config re-download failed (will retry on next sync):", err));
-  } else {
-    console.warn("[EdgeServer] No session — config will download after registration");
-  }
-}
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 

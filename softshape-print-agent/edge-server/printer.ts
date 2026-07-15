@@ -21,6 +21,7 @@ import { cloudFetch } from "./cloudFetch.ts";
 function getTauriInvoke(): ((cmd: string, args?: any) => Promise<any>) | null {
   const t = (globalThis as any).window?.__TAURI__;
   if (!t) return null;
+  if (t.core && typeof t.core.invoke === "function") return t.core.invoke.bind(t.core);
   if (typeof t.invoke === "function") return t.invoke.bind(t);
   if (t.tauri && typeof t.tauri.invoke === "function") return t.tauri.invoke.bind(t.tauri);
   return null;
@@ -50,6 +51,7 @@ export async function printToPrinter(
   escposData: { type: string; format: string; data: string }[]
 ): Promise<PrintResult> {
   const rawBytes = escposToBytes(escposData);
+  let tauriError: string | null = null;
 
   if (rawBytes.length === 0) {
     return { ok: false, printerName, bytes: 0, error: "Empty print data", method: "noop" };
@@ -58,8 +60,8 @@ export async function printToPrinter(
   // ── Try Tauri first (direct USB) ──────────────────────────────────────────
   const invoke = getTauriInvoke();
   if (invoke) {
+    const netMatch = printerName.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)$/);
     try {
-      const netMatch = printerName.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)$/);
       if (netMatch) {
         await invoke("print_network", {
           ip: netMatch[1],
@@ -75,8 +77,13 @@ export async function printToPrinter(
       console.log(`[Printer] Printed via Tauri → ${printerName} (${rawBytes.length} bytes)`);
       return { ok: true, printerName, bytes: rawBytes.length, method: "tauri" };
     } catch (err: any) {
-      console.error(`[Printer] Tauri print failed → ${printerName}:`, err?.message || err);
-      // Fall through to HTTP fallback
+      const errorMsg = err?.message || String(err);
+      const isNetwork = netMatch !== null;
+      const errorType = isNetwork ? "network" : "usb";
+      console.error(`[Printer] Tauri ${errorType} print failed → ${printerName}:`, errorMsg);
+      tauriError = isNetwork
+        ? `Network printer connection failed (${printerName}): ${errorMsg}`
+        : `USB/local printer error (${printerName}): ${errorMsg}`;
     }
   }
 
@@ -115,7 +122,7 @@ export async function printToPrinter(
     ok: false,
     printerName,
     bytes: rawBytes.length,
-    error: "No printer available (Tauri not found, HTTP fallback unavailable)",
+    error: tauriError || "No printer available (Tauri not found, HTTP fallback unavailable)",
     method: "noop",
   };
 }
