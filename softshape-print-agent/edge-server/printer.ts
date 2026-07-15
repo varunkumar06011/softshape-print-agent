@@ -92,7 +92,7 @@ export async function printToPrinter(
     process.env.PRINT_BRIDGE_URL ||
     getConfig("print_bridge_url") ||
     getConfig("print_agent_http_url") ||
-    "http://127.0.0.1:3101"
+    "http://127.0.0.1:3102"
   ).replace(/\/+$/, "");
   if (printAgentUrl) {
     try {
