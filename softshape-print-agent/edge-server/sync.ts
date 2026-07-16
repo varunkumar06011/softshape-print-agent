@@ -164,6 +164,7 @@ function loadRecordData(tableName: string, recordId: string): any | null {
         gstRegistered: !!o.gst_registered,
         serviceChargePercent: o.service_charge_percent || 0,
         enabledModules: o.enabled_modules,
+        organizationId: o.organization_id,
       };
     }
 
@@ -370,6 +371,7 @@ async function ensureCloudSession(): Promise<boolean> {
         restaurantType: outlet.restaurant_type,
         restaurantCode: outlet.restaurant_code,
         slug: outlet.slug,
+        organizationId: outlet.organization_id || undefined,
         owner: owner ? { name: owner.name, pin: owner.pin } : undefined,
       }),
       signal: AbortSignal.timeout(10000),
