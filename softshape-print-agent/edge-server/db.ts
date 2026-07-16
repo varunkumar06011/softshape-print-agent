@@ -510,3 +510,14 @@ export function closeDb(): void {
     db = null;
   }
 }
+
+// ── Test-only: inject an in-memory database for unit tests ───────────────────
+// ESM exports are readonly, so tests cannot monkey-patch getDb directly.
+// Call setDb(testDb) before importing modules that call getDb(), and
+// closeDb() after each test to reset state.
+export function setDb(testDb: Database | null): void {
+  if (db && db !== testDb) {
+    try { db.close(); } catch {}
+  }
+  db = testDb;
+}

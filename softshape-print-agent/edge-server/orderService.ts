@@ -1010,7 +1010,7 @@ export interface PrintBillInput {
 
 export async function printBillEdge(input: PrintBillInput): Promise<{ success: boolean; error?: string; billNumber?: string; printResults?: any[] }> {
   const db = getDb();
-  const { orderId, restaurantId, discountPercent } = input;
+  const { orderId, restaurantId, discountPercent, localPrinted } = input;
 
   const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
   if (!order) {
@@ -1028,6 +1028,11 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
   // even if a prior sync cycle pushed the order before the number was assigned.
   enqueueSync("order", orderId, "update");
 
+  // If the frontend already printed locally, skip edge printing — just assign bill number + sync
+  if (localPrinted) {
+    return { success: true, billNumber, printResults: [] };
+  }
+
   // Get table + outlet for print context
   const table = getTableWithSection(order.table_id);
   const outlet = getOutlet(restaurantId);
@@ -1035,23 +1040,19 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
     return { success: true, billNumber };
   }
 
-  // Get order items (excluding fully cancelled and removed from bill)
-  const orderItems = db.query("SELECT * FROM order_item WHERE order_id = ? AND (cancelled_quantity IS NULL OR cancelled_quantity < quantity) AND (removed_from_bill IS NULL OR removed_from_bill = 0)").all(orderId) as any[];
+  // Get order items with gst_enabled from menu_item (excluding fully cancelled and removed from bill)
+  const orderItems = db.query(
+    `SELECT oi.*, mi.gst_enabled as menu_gst_enabled
+     FROM order_item oi
+     LEFT JOIN menu_item mi ON oi.menu_item_id = mi.id
+     WHERE oi.order_id = ?
+       AND (oi.cancelled_quantity IS NULL OR oi.cancelled_quantity < oi.quantity)
+       AND (oi.removed_from_bill IS NULL OR oi.removed_from_bill = 0)`
+  ).all(orderId) as any[];
 
   const formattedTableNumber = formatTableNumber(table);
   const sectionTag = table.section_tag;
-
-  // Calculate total
-  const subtotal = orderItems.reduce((sum, oi) => {
-    const effectiveQty = oi.quantity - (oi.cancelled_quantity || 0);
-    return sum + Number(oi.price) * effectiveQty;
-  }, 0);
-
-  const discount = discountPercent ? subtotal * (discountPercent / 100) : 0;
-  const afterDiscount = subtotal - discount;
   const serviceChargePercent = outlet.service_charge_percent || 0;
-  const serviceCharge = afterDiscount * (serviceChargePercent / 100);
-  const totalAmount = afterDiscount + serviceCharge;
 
   // Build bill ESC/POS
   const billItems = orderItems.map(oi => ({
@@ -1059,12 +1060,13 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
     quantity: oi.quantity - (oi.cancelled_quantity || 0),
     price: Number(oi.price),
     menuType: oi.menu_type === "LIQUOR" ? "LIQUOR" as const : "FOOD" as const,
+    gstEnabled: oi.menu_gst_enabled !== 0,
   }));
 
   const escposData = buildBill({
     tableNumber: formattedTableNumber,
     items: billItems,
-    totalAmount,
+    totalAmount: 0,
     restaurant: {
       name: outlet.name,
       receiptHeader: outlet.receipt_header,
@@ -1468,4 +1470,105 @@ export async function updateOrderStatusEdge(
 
   const updatedOrder = db.query("SELECT * FROM order_record WHERE id = ?").get(orderId) as any;
   return { success: true, order: updatedOrder };
+}
+
+// ─── Mark Order Paid (simple status update, no settlement) ───────────────────
+
+export async function markOrderPaidEdge(
+  restaurantId: string,
+  orderId: string,
+  paymentMethod: string = "CASH",
+): Promise<{ success: boolean; error?: string; order?: any }> {
+  const db = getDb();
+
+  const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
+  if (!order) {
+    return { success: false, error: "Order not found" };
+  }
+
+  const now = Date.now();
+  const tx = db.transaction(() => {
+    db.query("UPDATE order_record SET status = 'PAID', paid_at = ?, updated_at = ? WHERE id = ?")
+      .run(now, now, orderId);
+    enqueueSync("order", orderId, "update");
+  });
+
+  tx();
+
+  const updatedOrder = db.query("SELECT * FROM order_record WHERE id = ?").get(orderId) as any;
+  return { success: true, order: updatedOrder };
+}
+
+// ─── Save Walk-in Transaction (no order, no table) ───────────────────────────
+
+export async function saveTransactionEdge(
+  restaurantId: string,
+  txnData: {
+    orderId?: string | null;
+    tableNumber?: number | null;
+    captainId?: string | null;
+    amount?: number;
+    method?: string;
+    itemCount?: number;
+    items?: any[];
+    subtotal?: number;
+    discountPercent?: number;
+    discountAmount?: number;
+    cgst?: number;
+    sgst?: number;
+    grandTotal?: number;
+    roundOff?: number;
+    tipAmount?: number;
+    sectionId?: string | null;
+    sectionTag?: string | null;
+    billNumber?: string | null;
+    platform?: string;
+  },
+): Promise<{ success: boolean; transaction?: any; error?: string }> {
+  const db = getDb();
+
+  const localId = `edge-txn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const now = Date.now();
+  const txnDate = getKolkataDateString();
+
+  const fullTxnData = {
+    localId,
+    restaurantId,
+    orderId: txnData.orderId || null,
+    tableNumber: txnData.tableNumber || null,
+    captainId: txnData.captainId || null,
+    amount: Number(txnData.amount || 0),
+    method: (txnData.method || "CASH").toUpperCase(),
+    itemCount: Number(txnData.itemCount || 0),
+    items: txnData.items || [],
+    subtotal: Number(txnData.subtotal || 0),
+    discountPercent: Number(txnData.discountPercent || 0),
+    discountAmount: Number(txnData.discountAmount || 0),
+    cgst: Number(txnData.cgst || 0),
+    sgst: Number(txnData.sgst || 0),
+    grandTotal: Number(txnData.grandTotal || 0),
+    roundOff: Number(txnData.roundOff || 0),
+    tipAmount: Number(txnData.tipAmount || 0),
+    sectionId: txnData.sectionId || null,
+    sectionTag: txnData.sectionTag || null,
+    billNumber: txnData.billNumber || null,
+    platform: txnData.platform || "CASHIER",
+    txnDate,
+    createdAt: now,
+  };
+
+  const txnKey = `walkin_txn:${localId}`;
+  db.query("INSERT INTO edge_config (key, value, updated_at) VALUES (?, ?, ?)")
+    .run(txnKey, JSON.stringify(fullTxnData), now);
+
+  enqueueSync("walkin_transaction", localId, "insert");
+
+  return {
+    success: true,
+    transaction: {
+      id: localId,
+      ...fullTxnData,
+      paidAt: new Date(now).toISOString(),
+    },
+  };
 }

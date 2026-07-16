@@ -42,7 +42,7 @@ import os from "os";
 import { runDailyMaintenance } from "./backup.ts";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { downloadFullConfig, pullIncrementalChanges } from "./config.ts";
-import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge } from "./orderService.ts";
+import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge } from "./orderService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders } from "./reads.ts";
 import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters } from "./sync.ts";
 import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode } from "./socketSync.ts";
@@ -584,6 +584,28 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse(result);
   }
 
+  // ── POST /api/edge/order/pay — mark order as paid (simple status update) ────
+  if (url.pathname === "/api/edge/order/pay" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("No valid session", 401);
+    const body = await req.json().catch(() => ({}));
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const result = await markOrderPaidEdge(restaurantId, body.orderId, body.paymentMethod || "CASH");
+    if (!result.success) return errorResponse(result.error || "Mark paid failed", 400);
+    return jsonResponse(result);
+  }
+
+  // ── POST /api/edge/transaction — save walk-in transaction (no order) ────────
+  if (url.pathname === "/api/edge/transaction" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("No valid session", 401);
+    const body = await req.json().catch(() => ({}));
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const result = await saveTransactionEdge(restaurantId, body);
+    if (!result.success) return errorResponse(result.error || "Save transaction failed", 400);
+    return jsonResponse(result);
+  }
+
   // ── GET /api/edge/tables — sections with nested tables + active orders ────
   if (url.pathname === "/api/edge/tables" && req.method === "GET") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
@@ -596,6 +618,132 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const data = getTablesFlat();
     return jsonResponse(data, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── POST /api/edge/table/:id/session — update table session (offline write) ─
+  // Mirrors cloud PATCH /api/tables/:id/session and /api/bar/tables/:id/session.
+  // Updates workflow_status, captain_id, guests, session_started_at, current_bill
+  // in local SQLite and enqueues a sync record for cloud push.
+  if (url.pathname.startsWith("/api/edge/table/") && url.pathname.endsWith("/session") && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const tableId = url.pathname.split("/")[4];
+    if (!tableId) return errorResponse("Table ID is required", 400);
+
+    let body: any;
+    try { body = await req.json(); } catch { return errorResponse("Invalid JSON body", 400); }
+
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const db = getDb();
+    const existing = db.query('SELECT * FROM "table" WHERE id = ? AND restaurant_id = ?').get(tableId, restaurantId) as any;
+    if (!existing) return errorResponse("Table not found", 404);
+
+    const workflowStatus = body.status ?? existing.workflow_status ?? "Free";
+    const isFree = workflowStatus === "Free";
+
+    // Cloud maps workflowStatus to table.status the same way it maps to backend status
+    const backendStatus = (() => {
+      switch (workflowStatus) {
+        case "Occupied":
+        case "Preparing":
+        case "Ready":
+          return "OCCUPIED";
+        case "Waiting Bill":
+          return "BILLING_REQUESTED";
+        case "Reserved":
+          return "RESERVED";
+        case "Cleaning":
+          return "CLEANING";
+        case "Free":
+        default:
+          return "AVAILABLE";
+      }
+    })();
+
+    // Parse sessionStartedAt — accept ISO string, numeric timestamp, or relative
+    let sessionStartedAt: number | null = existing.session_started_at;
+    if (isFree) {
+      sessionStartedAt = null;
+    } else if (body.time !== undefined && body.time !== null) {
+      if (typeof body.time === "number") {
+        sessionStartedAt = body.time;
+      } else if (typeof body.time === "string") {
+        if (/^\d+$/.test(body.time)) {
+          sessionStartedAt = Number(body.time);
+        } else {
+          const d = new Date(body.time);
+          sessionStartedAt = isNaN(d.getTime()) ? Date.now() : d.getTime();
+        }
+      }
+    }
+
+    const now = Date.now();
+    db.query(`UPDATE "table" SET
+      status = ?,
+      workflow_status = ?,
+      captain_id = ?,
+      guests = ?,
+      session_started_at = ?,
+      current_bill = ?,
+      kot_history = ?,
+      updated_at = ?
+      WHERE id = ? AND restaurant_id = ?
+    `).run(
+      backendStatus,
+      workflowStatus,
+      isFree ? null : (body.captainId ?? existing.captain_id ?? null),
+      isFree ? 0 : (body.guests ?? existing.guests ?? 0),
+      sessionStartedAt,
+      isFree ? 0 : (body.currentBill ?? existing.current_bill ?? 0),
+      isFree ? "[]" : existing.kot_history,
+      now,
+      tableId,
+      restaurantId,
+    );
+
+    // Terminating a session clears live KOTs (same as cloud)
+    if (isFree) {
+      db.query("DELETE FROM kot WHERE table_id = ?").run(tableId);
+    }
+
+    enqueueSync("table", tableId, "update");
+    return jsonResponse({ success: true, id: tableId });
+  }
+
+  // ── DELETE /api/edge/table/:id/session — terminate table session ───────────
+  // Mirrors cloud DELETE /api/bar/tables/:id/session. Resets the table to Free,
+  // clears KOTs, and enqueues sync.
+  if (url.pathname.startsWith("/api/edge/table/") && url.pathname.endsWith("/session") && req.method === "DELETE") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const tableId = url.pathname.split("/")[4];
+    if (!tableId) return errorResponse("Table ID is required", 400);
+
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const db = getDb();
+    const existing = db.query('SELECT * FROM "table" WHERE id = ? AND restaurant_id = ?').get(tableId, restaurantId) as any;
+    if (!existing) return errorResponse("Table not found", 404);
+
+    const now = Date.now();
+    db.query(`UPDATE "table" SET
+      status = 'AVAILABLE',
+      workflow_status = 'Free',
+      captain_id = NULL,
+      guests = 0,
+      session_started_at = NULL,
+      current_bill = 0,
+      kot_history = '[]',
+      updated_at = ?
+      WHERE id = ? AND restaurant_id = ?
+    `).run(now, tableId, restaurantId);
+
+    // Clear KOTs for this table
+    db.query("DELETE FROM kot WHERE table_id = ?").run(tableId);
+
+    enqueueSync("table", tableId, "update");
+    return jsonResponse({ success: true, id: tableId });
   }
 
   // ── GET /api/edge/sections — sections with venue + floor info ──────────────
@@ -691,6 +839,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         id: user.id,
         name: user.name,
         role: user.role,
+        restaurantId: getRestaurantId(),
       },
     });
   }
@@ -997,13 +1146,46 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     if (body.number !== undefined) { updates.push("number = ?"); values.push(Number(body.number)); }
     if (body.capacity !== undefined) { updates.push("capacity = ?"); values.push(Number(body.capacity)); }
-    if (body.status !== undefined) { updates.push("status = ?"); values.push(body.status); }
     if (body.sectionId !== undefined) { updates.push("section_id = ?"); values.push(body.sectionId); }
+
+    // If a status is provided, also derive workflow_status and reset session fields
+    // when status is AVAILABLE, matching cloud PATCH /api/tables/:id/status.
+    const isAvailable = body.status === "AVAILABLE";
+    if (body.status !== undefined) {
+      updates.push("status = ?"); values.push(body.status);
+      const workflowStatus = (() => {
+        switch (body.status) {
+          case "OCCUPIED":
+          case "BILLING_REQUESTED":
+          case "RESERVED":
+          case "CLEANING":
+            return "Occupied";
+          case "AVAILABLE":
+          default:
+            return "Free";
+        }
+      })();
+      updates.push("workflow_status = ?"); values.push(workflowStatus);
+      if (isAvailable) {
+        updates.push("captain_id = NULL");
+        updates.push("guests = 0");
+        updates.push("session_started_at = NULL");
+        updates.push("current_bill = 0");
+        updates.push("kot_history = '[]'");
+      }
+    }
 
     if (updates.length === 0) return errorResponse("No fields to update", 400);
 
+    const now = Date.now();
+    updates.push("updated_at = ?"); values.push(now);
     values.push(tableId);
     db.query(`UPDATE "table" SET ${updates.join(", ")} WHERE id = ? AND restaurant_id = ?`).run(...values, restaurantId);
+
+    if (isAvailable) {
+      db.query("DELETE FROM kot WHERE table_id = ?").run(tableId);
+    }
+
     enqueueSync("table", tableId, "update");
 
     return jsonResponse({ success: true, id: tableId });
@@ -1028,7 +1210,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   }
 
   // ── DELETE /api/edge/admin/table/:id — soft delete table ───────────────────
-  if (url.pathname.startsWith("/api/edge/admin/table/") && req.method === "DELETE") {
+  if (url.pathname.startsWith("/api/edge/admin/table/") && req.method === "DELETE" && !url.pathname.endsWith("/session")) {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const tableId = url.pathname.split("/").pop()!;
 
@@ -1039,6 +1221,79 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     enqueueSync("table", tableId, "update");
 
     return jsonResponse({ success: true, id: tableId });
+  }
+
+  // ── POST /api/edge/admin/tables/bulk — create multiple tables at once ───────
+  if (url.pathname === "/api/edge/admin/tables/bulk" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    let body: any;
+    try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
+
+    const { sectionId, count, capacity, startNumber } = body;
+    const parsedCount = Number(count);
+    const parsedCapacity = capacity ?? 4;
+    const parsedStart = startNumber ?? 1;
+
+    if (!Number.isInteger(parsedCount) || parsedCount <= 0 || parsedCount > 100) {
+      return errorResponse("count must be an integer between 1 and 100", 400);
+    }
+    if (!sectionId?.trim()) return errorResponse("sectionId is required", 400);
+
+    const db = getDb();
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const section = db.query("SELECT * FROM section WHERE id = ? AND restaurant_id = ?").get(sectionId, restaurantId) as any;
+    if (!section) return errorResponse("Section not found", 404);
+
+    // Find max table number to avoid collisions, mirroring cloud behavior
+    const maxRow = db.query("SELECT MAX(number) as max_number FROM \"table\" WHERE restaurant_id = ?").get(restaurantId) as any;
+    const baseNumber = Math.max(maxRow?.max_number ?? 0, parsedStart - 1);
+
+    const createdTables: any[] = [];
+    for (let i = 0; i < parsedCount; i++) {
+      const tableId = crypto.randomUUID();
+      const number = baseNumber + 1 + i;
+      db.query(`INSERT INTO "table" (id, number, capacity, section_id, restaurant_id, status, workflow_status)
+                VALUES (?, ?, ?, ?, ?, 'AVAILABLE', 'Free')`)
+        .run(tableId, number, parsedCapacity, sectionId, restaurantId);
+      enqueueSync("table", tableId, "create");
+      createdTables.push({ id: tableId, number, capacity: parsedCapacity, sectionId, restaurantId, status: "AVAILABLE", workflowStatus: "Free" });
+    }
+
+    return jsonResponse({ created: createdTables.length, tables: createdTables }, 201);
+  }
+
+  // ── DELETE /api/edge/admin/tables/all — delete all tables (skip active orders) ─
+  if (url.pathname === "/api/edge/admin/tables/all" && req.method === "DELETE") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+
+    const db = getDb();
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const activeOrderStatuses = ["PENDING", "CONFIRMED", "PREPARING", "READY", "BILLING_REQUESTED"];
+
+    // Find tables with active orders — these will be skipped
+    const occupiedTables = db.query(`
+      SELECT DISTINCT t.id FROM "table" t
+      JOIN order_record o ON o.table_id = t.id
+      WHERE t.restaurant_id = ? AND o.status IN (${activeOrderStatuses.map(() => "?").join(", ")})
+    `).all(restaurantId, ...activeOrderStatuses) as any[];
+    const skipIds = new Set(occupiedTables.map((t) => t.id));
+
+    // Find all tables to delete (not in skipIds)
+    const allTables = db.query(`SELECT id FROM "table" WHERE restaurant_id = ? AND status != 'REMOVED'`).all(restaurantId) as any[];
+    const toDelete = allTables.filter((t) => !skipIds.has(t.id));
+
+    const now = Date.now();
+    for (const t of toDelete) {
+      db.query("UPDATE \"table\" SET status = 'REMOVED', workflow_status = 'Removed', updated_at = ? WHERE id = ?")
+        .run(now, t.id);
+      enqueueSync("table", t.id, "update");
+    }
+
+    return jsonResponse({ deleted: toDelete.length, skipped: skipIds.size });
   }
 
   // ── POST /api/edge/admin/category — create category ────────────────────────

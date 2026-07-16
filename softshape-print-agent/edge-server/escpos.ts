@@ -288,7 +288,7 @@ export function buildCancelKOT(input: CancelKotPrintInput): { type: string; form
 
 export interface BillPrintInput {
   tableNumber: string | number;
-  items: Array<{ name: string; quantity: number; price: number; menuType?: "FOOD" | "LIQUOR" }>;
+  items: Array<{ name: string; quantity: number; price: number; menuType?: "FOOD" | "LIQUOR"; gstEnabled?: boolean }>;
   totalAmount: number;
   restaurant?: BillPrintRestaurant;
   sectionTag?: string | null;
@@ -307,20 +307,19 @@ function getEffectiveGstRate(gstRate: number | null | undefined, gstCategory: st
   return category === 'AC' ? 18 : 5;
 }
 
-function getGstBreakdownWithRate(taxableAmount: number, ratePercent: number, pricesIncludeGst: boolean) {
+function getGstBreakdownWithRate(taxableAmount: number, ratePercent: number, _pricesIncludeGst: boolean) {
   const amount = Math.max(0, Number(taxableAmount) || 0);
+
+  if (ratePercent <= 0) {
+    return { cgst: 0, sgst: 0, tax: 0, baseAmount: amount };
+  }
+
   const totalRate = ratePercent / 100;
   const halfRate = totalRate / 2;
-  if (ratePercent <= 0) return { cgst: 0, sgst: 0, tax: 0, baseAmount: amount };
-  if (pricesIncludeGst) {
-    const baseAmount = Math.round((amount / (1 + totalRate)) * 100) / 100;
-    const cgst = Math.round(baseAmount * halfRate * 100) / 100;
-    const sgst = Math.round(baseAmount * halfRate * 100) / 100;
-    return { cgst, sgst, tax: cgst + sgst, baseAmount };
-  }
-  const cgst = Math.round(amount * halfRate * 100) / 100;
-  const sgst = Math.round(amount * halfRate * 100) / 100;
-  return { cgst, sgst, tax: cgst + sgst, baseAmount: amount };
+  const tax = amount * totalRate;
+  const cgst = amount * halfRate;
+  const sgst = amount * halfRate;
+  return { cgst, sgst, tax, baseAmount: amount };
 }
 
 export function buildBill(input: BillPrintInput): { type: string; format: string; data: string }[] {
@@ -352,29 +351,41 @@ export function buildBill(input: BillPrintInput): { type: string; format: string
     cmds.push(pad(name, 24) + pad(qty, 6) + amt.padStart(12) + '\n');
   });
 
-  const foodSubtotal = items.filter((i) => i.menuType === 'FOOD').reduce((s, i) => s + Number(i.price || 0) * (i.quantity || 1), 0);
-  const liquorSubtotal = items.filter((i) => i.menuType !== 'FOOD').reduce((s, i) => s + Number(i.price || 0) * (i.quantity || 1), 0);
-  const effectiveRate = getEffectiveGstRate(input.gstRate, input.gstCategory, input.gstRegistered);
-  const { cgst, sgst, tax, baseAmount } = getGstBreakdownWithRate(foodSubtotal, effectiveRate, !!input.pricesIncludeGst);
-  const displayedSubtotal = Math.round((baseAmount + liquorSubtotal) * 100) / 100;
+  const foodItems = items.filter((i) => i.menuType === 'FOOD');
+  const liquorItems = items.filter((i) => i.menuType !== 'FOOD');
+  const foodSubtotal = foodItems.reduce((s, i) => s + Number(i.price || 0) * (i.quantity || 1), 0);
+  const liquorSubtotal = liquorItems.reduce((s, i) => s + Number(i.price || 0) * (i.quantity || 1), 0);
+  const totalSubtotal = foodSubtotal + liquorSubtotal;
 
-  // Service charge — on (subtotal + GST), matching the DB schema's serviceChargePercent field
+  // Food: GST-exempt when gstEnabled=false. Liquor/bar: always GST-exempt.
+  const gstExemptFood = foodItems.filter((i) => i.gstEnabled === false).reduce((s, i) => s + Number(i.price || 0) * (i.quantity || 1), 0);
+  const gstExemptLiquor = liquorItems.reduce((s, i) => s + Number(i.price || 0) * (i.quantity || 1), 0);
+  const gstExemptTotal = gstExemptFood + gstExemptLiquor;
+
+  // Discount on raw subtotal first (proportional) — matches settlement
+  const discPercent = Number(input.discountPercent || 0);
+  const discountAmount = discPercent > 0
+    ? Math.round(totalSubtotal * (discPercent / 100) * 100) / 100
+    : 0;
+
+  const discountedSubtotal = Math.max(0, totalSubtotal - discountAmount);
+  const gstExemptAfterDiscount = Math.max(0, gstExemptTotal - (discountAmount > 0 && totalSubtotal > 0 ? discountAmount * (gstExemptTotal / totalSubtotal) : 0));
+  const taxableAmount = Math.max(0, discountedSubtotal - gstExemptAfterDiscount);
+
+  const effectiveRate = getEffectiveGstRate(input.gstRate, input.gstCategory, input.gstRegistered);
+  const { cgst, sgst, tax } = getGstBreakdownWithRate(taxableAmount, effectiveRate, !!input.pricesIncludeGst);
+
+  // Service charge on (discountedSubtotal + GST) — matches settlement
   const scPercent = Number(input.serviceChargePercent || 0);
   const serviceChargeAmount = scPercent > 0
-    ? Math.round((displayedSubtotal + tax) * (scPercent / 100) * 100) / 100
+    ? Math.round((discountedSubtotal + tax) * (scPercent / 100) * 100) / 100
     : 0;
 
-  // Discount — on overall bill total (subtotal + GST + service charge), matching backend's print.ts calculation
-  const discPercent = Number(input.discountPercent || 0);
-  const preDiscountTotal = displayedSubtotal + tax + serviceChargeAmount;
-  const discountAmount = discPercent > 0
-    ? Math.round(preDiscountTotal * (discPercent / 100) * 100) / 100
-    : 0;
-  const total = Math.round(Math.max(0, preDiscountTotal - discountAmount) * 100) / 100;
+  const total = Math.round(Math.max(0, discountedSubtotal + tax + serviceChargeAmount) * 100) / 100;
 
   // ── Render totals ──────────────────────────────────────────────────────
   cmds.push(separator());
-  cmds.push(padRight('Subtotal', 'Rs.' + displayedSubtotal.toFixed(2)) + '\n');
+  cmds.push(padRight('Subtotal', 'Rs.' + totalSubtotal.toFixed(2)) + '\n');
 
   // GST breakdown (CGST + SGST) — matches backend's buildFinalBill format
   if (tax > 0) {

@@ -33,7 +33,19 @@ interface ConfigResponse {
   users: any[];
 }
 
+let _downloadInProgress: Promise<{ success: boolean; error?: string; tablesLoaded?: number }> | null = null;
+
 export async function downloadFullConfig(): Promise<{ success: boolean; error?: string; tablesLoaded?: number }> {
+  if (_downloadInProgress) return _downloadInProgress;
+  _downloadInProgress = _downloadFullConfigImpl();
+  try {
+    return await _downloadInProgress;
+  } finally {
+    _downloadInProgress = null;
+  }
+}
+
+async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: string; tablesLoaded?: number }> {
   const backendUrl = getBackendUrl();
   const token = getSessionToken();
   const restaurantId = getRestaurantId();

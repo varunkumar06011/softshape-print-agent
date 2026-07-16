@@ -296,6 +296,17 @@ function loadRecordData(tableName: string, recordId: string): any | null {
       }
     }
 
+    case "walkin_transaction": {
+      // Walk-in transactions are stored in edge_config with key `walkin_txn:${localId}`
+      const row = db.query("SELECT value FROM edge_config WHERE key = ?").get(`walkin_txn:${recordId}`) as any;
+      if (!row || !row.value) return null;
+      try {
+        return JSON.parse(row.value);
+      } catch {
+        return null;
+      }
+    }
+
     default:
       return null;
   }

@@ -9,6 +9,8 @@
 //   5. Sync queue ordering preserves insertion order
 //   6. Real sync push via pushSyncBatch with mocked fetch
 //   7. Two-device sync conflict detection (cloud rejects stale edge data)
+//   8. Offline -> online transition: writes land in queue, cloud unreachable, then
+//      reachable, manualSyncPush pushes, and no duplicates are sent.
 //
 // Run with: bun test offline-edge-cases.test.ts
 // ─────────────────────────────────────────────────────────────────────────────
@@ -27,43 +29,58 @@ function createTestDb(): Database {
       id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL,
       restaurant_code TEXT NOT NULL, restaurant_type TEXT,
       gst_category TEXT DEFAULT 'NON_AC', gst_rate REAL DEFAULT 5.0,
-      gst_registered INTEGER DEFAULT 1, prices_include_gst INTEGER DEFAULT 0
+      gst_registered INTEGER DEFAULT 1, prices_include_gst INTEGER DEFAULT 0,
+      receipt_header TEXT, printer_config TEXT DEFAULT '{}',
+      enabled_modules TEXT DEFAULT '{}'
     );
 
     CREATE TABLE IF NOT EXISTS "table" (
       id TEXT PRIMARY KEY, number INTEGER NOT NULL, capacity INTEGER DEFAULT 4,
-      section_id TEXT, restaurant_id TEXT NOT NULL,
+      section_id TEXT NOT NULL, restaurant_id TEXT NOT NULL,
       status TEXT DEFAULT 'AVAILABLE', workflow_status TEXT DEFAULT 'Free',
       captain_id TEXT, guests INTEGER DEFAULT 0,
-      current_bill REAL DEFAULT 0, kot_history TEXT DEFAULT '[]',
-      discount REAL, section_tag TEXT, updated_at INTEGER
+      session_started_at INTEGER, current_bill REAL DEFAULT 0,
+      kot_history TEXT DEFAULT '[]', discount REAL, section_tag TEXT,
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch())
     );
 
     CREATE TABLE IF NOT EXISTS order_record (
-      id TEXT PRIMARY KEY, restaurant_id TEXT NOT NULL,
-      table_id TEXT, table_number INTEGER,
-      kot_number INTEGER, status TEXT DEFAULT 'OPEN',
-      total REAL DEFAULT 0, captain_id TEXT,
-      created_at INTEGER NOT NULL, updated_at INTEGER,
-      cloud_synced INTEGER DEFAULT 0
+      id TEXT PRIMARY KEY, table_id TEXT NOT NULL,
+      restaurant_id TEXT NOT NULL,
+      status TEXT DEFAULT 'PENDING', total_amount REAL DEFAULT 0,
+      billing_requested INTEGER DEFAULT 0, billing_requested_at INTEGER,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      is_deleted INTEGER DEFAULT 0, deleted_at INTEGER,
+      bill_number TEXT, paid_at INTEGER, last_request_id TEXT,
+      inventory_deducted INTEGER DEFAULT 0,
+      captain_id TEXT, platform TEXT DEFAULT 'DINE_IN',
+      created_by_user_id TEXT, cloud_synced INTEGER DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS order_item (
       id TEXT PRIMARY KEY, order_id TEXT NOT NULL,
-      name TEXT NOT NULL, price REAL NOT NULL, qty INTEGER DEFAULT 1,
-      is_veg INTEGER DEFAULT 1, menu_item_id TEXT, kot_id TEXT,
-      status TEXT DEFAULT 'PENDING', notes TEXT, cloud_synced INTEGER DEFAULT 0
+      menu_item_id TEXT NOT NULL, name TEXT NOT NULL,
+      price REAL NOT NULL, quantity INTEGER NOT NULL,
+      notes TEXT, added_by_cashier INTEGER DEFAULT 0,
+      original_quantity INTEGER, cancelled_quantity INTEGER DEFAULT 0,
+      edited_quantity INTEGER DEFAULT 0, removed_from_bill INTEGER DEFAULT 0,
+      removed_by TEXT, removed_at INTEGER,
+      menu_type TEXT DEFAULT 'FOOD', cloud_synced INTEGER DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS kot (
-      id TEXT PRIMARY KEY, order_id TEXT NOT NULL,
-      kot_number INTEGER NOT NULL, restaurant_id TEXT NOT NULL,
-      status TEXT DEFAULT 'PRINTED', created_at INTEGER NOT NULL
+      id TEXT PRIMARY KEY, restaurant_id TEXT NOT NULL,
+      table_id TEXT NOT NULL, order_id TEXT NOT NULL,
+      kot_number INTEGER NOT NULL, created_at INTEGER NOT NULL,
+      cloud_synced INTEGER DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS kot_item (
       id TEXT PRIMARY KEY, kot_id TEXT NOT NULL,
-      name TEXT NOT NULL, qty INTEGER NOT NULL, price REAL NOT NULL
+      order_item_id TEXT NOT NULL, menu_item_id TEXT NOT NULL,
+      name TEXT NOT NULL, quantity INTEGER NOT NULL, price REAL NOT NULL,
+      notes TEXT, status TEXT DEFAULT 'SENT',
+      created_at INTEGER NOT NULL, cloud_synced INTEGER DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS sync_queue (
@@ -75,12 +92,35 @@ function createTestDb(): Database {
 
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, pin TEXT,
-      role TEXT NOT NULL, outlet_id TEXT NOT NULL, is_active INTEGER DEFAULT 1
+      role TEXT NOT NULL, outlet_id TEXT NOT NULL, is_active INTEGER DEFAULT 1,
+      permissions TEXT
     );
 
     CREATE TABLE IF NOT EXISTS section (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, restaurant_id TEXT NOT NULL,
-      floor_id TEXT, sort_order INTEGER DEFAULT 0
+      floor_id TEXT, venue_id TEXT, sort_order INTEGER DEFAULT 0,
+      is_active INTEGER DEFAULT 1
+    );
+
+    CREATE TABLE IF NOT EXISTS category (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL,
+      restaurant_id TEXT NOT NULL, sort_order INTEGER DEFAULT 0,
+      is_active INTEGER DEFAULT 1, printer_target TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS menu_item (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL,
+      category_id TEXT NOT NULL, restaurant_id TEXT NOT NULL,
+      base_price REAL DEFAULT 0, menu_type TEXT DEFAULT 'FOOD',
+      is_available INTEGER DEFAULT 1, is_deleted INTEGER DEFAULT 0,
+      printer_target TEXT, printer_name TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS daily_counter (
+      id TEXT PRIMARY KEY, restaurant_id TEXT NOT NULL,
+      counter_date TEXT NOT NULL,
+      kot_count INTEGER DEFAULT 0, bill_count INTEGER DEFAULT 0, txn_count INTEGER DEFAULT 0,
+      UNIQUE(restaurant_id, counter_date)
     );
 
     CREATE TABLE IF NOT EXISTS edge_config (
@@ -119,13 +159,15 @@ test("concurrent table edits — last write wins, no crash", () => {
 test("power loss mid-order — order data preserved, KOT missing", () => {
   const db = createTestDb();
   db.exec(`INSERT INTO outlet (id, name, slug, restaurant_code) VALUES ('${RESTAURANT_ID}', 'Test', 'test', 'TEST002')`);
+  db.exec(`INSERT INTO section (id, name, restaurant_id) VALUES ('sec-pl', 'Main', '${RESTAURANT_ID}')`);
+  db.exec(`INSERT INTO "table" (id, number, section_id, restaurant_id, status, workflow_status) VALUES ('tbl-pl', 1, 'sec-pl', '${RESTAURANT_ID}', 'AVAILABLE', 'Free')`);
 
   const orderId = "order-power-loss";
-  db.query(`INSERT INTO order_record (id, restaurant_id, table_number, status, total, created_at) VALUES (?, ?, 1, 'OPEN', 0, ?)`)
-    .run(orderId, RESTAURANT_ID, Date.now());
+  db.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at) VALUES (?, ?, ?, 'OPEN', 0, ?, ?)`)
+    .run(orderId, 'tbl-pl', RESTAURANT_ID, Date.now(), Date.now());
 
-  db.query(`INSERT INTO order_item (id, order_id, name, price, qty, is_veg, status) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-    .run("item1", orderId, "Chicken Biryani", 250, 2, 0, "PENDING");
+  db.query(`INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run("item1", orderId, "menu-1", "Chicken Biryani", 250, 2);
 
   const order = db.query(`SELECT * FROM order_record WHERE id = ?`).get(orderId) as any;
   const items = db.query(`SELECT * FROM order_item WHERE order_id = ?`).all(orderId) as any[];
@@ -142,7 +184,9 @@ test("power loss mid-order — order data preserved, KOT missing", () => {
 // synced=1 manually, proving nothing about the sync code itself.
 let testDb: Database;
 
-beforeEach(() => {
+beforeEach(async () => {
+  const { setDb } = await import("../db.ts");
+  setDb(null);
   testDb = createTestDb();
 });
 
@@ -160,8 +204,8 @@ test("full shift offline — 50 orders synced via real pushSyncBatch with mocked
   for (let i = 0; i < 50; i++) {
     const oid = `shift-order-${i}`;
     const createdAt = shiftStart + i * 10 * 60 * 1000;
-    testDb.query(`INSERT INTO order_record (id, restaurant_id, table_number, status, total, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
-      .run(oid, RESTAURANT_ID, (i % 10) + 1, i < 45 ? 'SETTLED' : 'OPEN', 100 + i * 10, createdAt);
+    testDb.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(oid, `table-${(i % 10) + 1}`, RESTAURANT_ID, i < 45 ? 'SETTLED' : 'OPEN', 100 + i * 10, createdAt, createdAt);
 
     testDb.query(`INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)`)
       .run("order", oid, "create", createdAt);
@@ -182,22 +226,12 @@ test("full shift offline — 50 orders synced via real pushSyncBatch with mocked
   globalThis.fetch = fetchMock as any;
 
   // Dynamically import sync.ts so it picks up our mocked fetch and test DB
-  const { pushSyncBatch } = await import("../sync.ts");
-  const { getDb } = await import("../db.ts");
+  const { setDb } = await import("../db.ts");
+  setDb(testDb);
 
-  // Override getDb to return our in-memory test DB
-  (getDb as any).mock?.mockReturnValue?.(testDb);
-  // If not a mock, monkey-patch the module
-  const dbModule = await import("../db.ts");
-  const originalGetDb = dbModule.getDb;
-  // @ts-ignore — override for test
-  dbModule.getDb = () => testDb;
+  const { pushSyncBatch } = await import("../sync.ts");
 
   const result = await pushSyncBatch();
-
-  // Restore
-  // @ts-ignore
-  dbModule.getDb = originalGetDb;
 
   expect(result.ok).toBe(true);
   expect(result.pushed).toBe(50);
@@ -215,6 +249,9 @@ test("full shift offline — 50 orders synced via real pushSyncBatch with mocked
 
   const syncedCount = testDb.query(`SELECT COUNT(*) as count FROM sync_queue WHERE synced = 1`).get() as any;
   expect(syncedCount.count).toBe(50);
+
+  // Restore
+  setDb(null);
 });
 
 // ── Test 4: Tenant scoping under sync load (regression test) ─────────────────
@@ -226,10 +263,10 @@ test("tenant scoping — sync batch payload preserves restaurant_id per record",
   testDb.exec(`INSERT INTO outlet (id, name, slug, restaurant_code) VALUES ('rest-A', 'Rest A', 'rest-a', 'AAA001')`);
   testDb.exec(`INSERT INTO outlet (id, name, slug, restaurant_code) VALUES ('rest-B', 'Rest B', 'rest-b', 'BBB002')`);
 
-  testDb.query(`INSERT INTO order_record (id, restaurant_id, table_number, status, total, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
-    .run("order-A1", "rest-A", 1, "SETTLED", 500, Date.now());
-  testDb.query(`INSERT INTO order_record (id, restaurant_id, table_number, status, total, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
-    .run("order-B1", "rest-B", 1, "SETTLED", 300, Date.now());
+  testDb.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run("order-A1", "table-a", "rest-A", "SETTLED", 500, Date.now(), Date.now());
+  testDb.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run("order-B1", "table-b", "rest-B", "SETTLED", 300, Date.now(), Date.now());
 
   testDb.query(`INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)`).run("order", "order-A1", "create", Date.now());
   testDb.query(`INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)`).run("order", "order-B1", "create", Date.now());
@@ -253,16 +290,12 @@ test("tenant scoping — sync batch payload preserves restaurant_id per record",
   testDb.query(`INSERT INTO edge_config (key, value, updated_at) VALUES ('session_expires_at', '${Date.now() + 3600000}', ?)`).run(Date.now());
   testDb.query(`INSERT INTO edge_config (key, value, updated_at) VALUES ('device_id', '${DEVICE_A}', ?)`).run(Date.now());
 
+  const { setDb } = await import("../db.ts");
+  setDb(testDb);
+
   const { pushSyncBatch } = await import("../sync.ts");
-  const dbModule = await import("../db.ts");
-  const originalGetDb = dbModule.getDb;
-  // @ts-ignore
-  dbModule.getDb = () => testDb;
 
   await pushSyncBatch();
-
-  // @ts-ignore
-  dbModule.getDb = originalGetDb;
 
   // Verify the payload contains both records with correct restaurant_ids
   expect(capturedPayload).not.toBeNull();
@@ -275,6 +308,9 @@ test("tenant scoping — sync batch payload preserves restaurant_id per record",
   expect(orderAItem.data.restaurant_id).toBe("rest-A");
   expect(orderBItem.data.restaurant_id).toBe("rest-B");
   expect(orderAItem.data.restaurant_id).not.toBe(orderBItem.data.restaurant_id);
+
+  // Restore
+  setDb(null);
 });
 
 // ── Test 5: Sync queue ordering preserves insertion order ────────────────────
@@ -310,8 +346,8 @@ test("two-device sync conflict — cloud rejects stale edge data, edge retries",
   const edgeUpdatedAt = Date.now() - 60_000; // Edge's data is 1 minute stale
   const cloudUpdatedAt = Date.now(); // Cloud has a newer version
 
-  testDb.query(`INSERT INTO order_record (id, restaurant_id, table_number, status, total, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-    .run(orderId, RESTAURANT_ID, 5, "SETTLED", 500, Date.now() - 120_000, edgeUpdatedAt);
+  testDb.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(orderId, "table-5", RESTAURANT_ID, "SETTLED", 500, Date.now() - 120_000, edgeUpdatedAt);
   testDb.query(`INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)`)
     .run("order", orderId, "create", Date.now());
 
@@ -338,16 +374,12 @@ test("two-device sync conflict — cloud rejects stale edge data, edge retries",
   });
   globalThis.fetch = fetchMock as any;
 
+  const { setDb } = await import("../db.ts");
+  setDb(testDb);
+
   const { pushSyncBatch } = await import("../sync.ts");
-  const dbModule = await import("../db.ts");
-  const originalGetDb = dbModule.getDb;
-  // @ts-ignore
-  dbModule.getDb = () => testDb;
 
   const result = await pushSyncBatch();
-
-  // @ts-ignore
-  dbModule.getDb = originalGetDb;
 
   // The push should succeed at the HTTP level but all records rejected
   expect(result.ok).toBe(true);
@@ -364,4 +396,137 @@ test("two-device sync conflict — cloud rejects stale edge data, edge retries",
   expect(queueRow.synced).toBe(0);
   expect(queueRow.attempts).toBe(1);
   expect(queueRow.last_error).toContain("Conflict");
+
+  // Restore
+  setDb(null);
+});
+
+// ── Test 8: Offline -> online end-to-end sync through manualSyncPush ─────────
+// Simulates the real flow the frontend exercises: write happens locally (via
+// createOrder or table session update), enqueueSync puts the records into the
+// sync_queue, the cloud is unreachable, the sync worker marks them as attempted,
+// then the cloud comes back, manualSyncPush is called, and the correct records
+// are pushed exactly once in the correct order.
+test("offline -> online end-to-end sync — correct records, no duplicates", async () => {
+  testDb.exec(`INSERT INTO outlet (id, name, slug, restaurant_code) VALUES ('${RESTAURANT_ID}', 'Test', 'test', 'TEST008')`);
+
+  // Seed session config
+  testDb.query(`INSERT INTO edge_config (key, value, updated_at) VALUES ('session_token', 'test-jwt-token', ?)`).run(Date.now());
+  testDb.query(`INSERT INTO edge_config (key, value, updated_at) VALUES ('restaurant_id', '${RESTAURANT_ID}', ?)`).run(Date.now());
+  testDb.query(`INSERT INTO edge_config (key, value, updated_at) VALUES ('backend_url', 'http://mock-backend', ?)`).run(Date.now());
+  testDb.query(`INSERT INTO edge_config (key, value, updated_at) VALUES ('session_expires_at', '${Date.now() + 3600000}', ?)`).run(Date.now());
+  testDb.query(`INSERT INTO edge_config (key, value, updated_at) VALUES ('device_id', '${DEVICE_A}', ?)`).run(Date.now());
+
+  // Seed a table and menu item so loadRecordData can resolve the order
+  testDb.exec(`INSERT INTO section (id, name, restaurant_id, venue_id, sort_order) VALUES ('sec1', 'Main', '${RESTAURANT_ID}', 'venue1', 0)`);
+  testDb.exec(`INSERT INTO "table" (id, number, section_id, restaurant_id, status, workflow_status) VALUES ('table1', 1, 'sec1', '${RESTAURANT_ID}', 'AVAILABLE', 'Free')`);
+  testDb.exec(`INSERT INTO category (id, name, restaurant_id, sort_order) VALUES ('cat1', 'Main', '${RESTAURANT_ID}', 0)`);
+  testDb.exec(`INSERT INTO menu_item (id, name, category_id, restaurant_id, base_price, menu_type) VALUES ('menu1', 'Biryani', 'cat1', '${RESTAURANT_ID}', 250, 'FOOD')`);
+
+  // 1. Simulate the offline write path: create order + items + kot + update table
+  // This mirrors what orderService.createOrder does internally, without blocking
+  // on printer hardware.
+  const orderId = "offline-order-001";
+  const kotId = "offline-kot-001";
+  const orderItemId = "offline-oi-001";
+  const kotItemId = "offline-ki-001";
+  const now = Date.now();
+
+  testDb.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, captain_id, platform, created_at, updated_at, cloud_synced) VALUES (?, ?, ?, 'PREPARING', 250, 'captain-1', 'DINE_IN', ?, ?, 0)`)
+    .run(orderId, 'table1', RESTAURANT_ID, now, now);
+  testDb.query(`INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, menu_type, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`)
+    .run(orderItemId, orderId, 'menu1', 'Biryani', 250, 1, 'FOOD');
+  testDb.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, created_at, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, 0)`)
+    .run(kotId, RESTAURANT_ID, 'table1', orderId, 1, now);
+  testDb.query(`INSERT INTO kot_item (id, kot_id, order_item_id, menu_item_id, name, quantity, price, status, created_at, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, 'SENT', ?, 0)`)
+    .run(kotItemId, kotId, orderItemId, 'menu1', 'Biryani', 1, 250, now);
+  testDb.query(`UPDATE "table" SET status = 'OCCUPIED', workflow_status = 'Preparing', current_bill = 250, updated_at = ? WHERE id = ?`).run(now, 'table1');
+
+  // Enqueue sync records exactly as orderService does
+  const { setDb, enqueueSync } = await import("../db.ts");
+  setDb(testDb);
+
+  enqueueSync("order", orderId, "insert");
+  enqueueSync("kot", kotId, "insert");
+  enqueueSync("table", 'table1', "update");
+
+  // 2. Verify writes landed in sync_queue
+  const pendingBefore = testDb.query(`SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0`).get() as any;
+  expect(pendingBefore.count).toBe(3);
+  const queueBefore = testDb.query(`SELECT * FROM sync_queue WHERE synced = 0 ORDER BY id ASC`).all() as any[];
+  expect(queueBefore[0].table_name).toBe("order");
+  expect(queueBefore[1].table_name).toBe("kot");
+  expect(queueBefore[2].table_name).toBe("table");
+
+  // 3. Cloud is unreachable: first push fails, records remain in queue, attempts incremented
+  globalThis.fetch = (() => { throw new Error("Network error: cloud unreachable"); }) as any;
+
+  const { manualSyncPush } = await import("../sync.ts");
+  const offlineResult = await manualSyncPush();
+
+  expect(offlineResult.ok).toBe(false);
+  expect(offlineResult.pushed).toBe(3);
+  expect(offlineResult.accepted).toBe(0);
+
+  const pendingAfterOffline = testDb.query(`SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0`).get() as any;
+  expect(pendingAfterOffline.count).toBe(3);
+  const attemptsAfterOffline = testDb.query(`SELECT SUM(attempts) as total FROM sync_queue WHERE synced = 0`).get() as any;
+  expect(attemptsAfterOffline.total).toBe(3);
+
+  // 4. Cloud is reachable again: mock the cloud accepting all records
+  let capturedBatches: any[] = [];
+  const acceptFetchMock = mock(async (url: string, opts: any) => {
+    const body = JSON.parse(opts.body);
+    capturedBatches.push(body);
+    const accepted = body.batch.map((b: any) => b.queueId);
+    return new Response(JSON.stringify({ accepted, rejected: [] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  });
+  globalThis.fetch = acceptFetchMock as any;
+
+  const onlineResult = await manualSyncPush();
+
+  expect(onlineResult.ok).toBe(true);
+  expect(onlineResult.pushed).toBe(3);
+  expect(onlineResult.accepted).toBe(3);
+  expect(onlineResult.rejected).toBe(0);
+
+  // 6. Verify sync_queue records are marked synced
+  const pendingAfterOnline = testDb.query(`SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0`).get() as any;
+  expect(pendingAfterOnline.count).toBe(0);
+  const syncedCount = testDb.query(`SELECT COUNT(*) as count FROM sync_queue WHERE synced = 1`).get() as any;
+  expect(syncedCount.count).toBe(3);
+
+  // 7. Verify cloud received the correct records in the correct order with no duplicates
+  expect(acceptFetchMock).toHaveBeenCalledTimes(1);
+  const batch = capturedBatches[0].batch;
+  expect(batch).toHaveLength(3);
+
+  const orderPayload = batch.find((b: any) => b.tableName === "order" && b.recordId === orderId);
+  const kotPayload = batch.find((b: any) => b.tableName === "kot" && b.recordId === kotId);
+  const tablePayload = batch.find((b: any) => b.tableName === "table" && b.recordId === 'table1');
+
+  expect(orderPayload).toBeDefined();
+  expect(kotPayload).toBeDefined();
+  expect(tablePayload).toBeDefined();
+
+  // Order preserved (insert order: order, kot, table)
+  expect(batch[0].tableName).toBe("order");
+  expect(batch[1].tableName).toBe("kot");
+  expect(batch[2].tableName).toBe("table");
+
+  // No duplicates by queue id
+  const queueIds = batch.map((b: any) => b.queueId);
+  expect(new Set(queueIds).size).toBe(queueIds.length);
+
+  // Cloud received the correct record data
+  expect(orderPayload.data.items).toHaveLength(1);
+  expect(orderPayload.data.items[0].name).toBe("Biryani");
+  expect(kotPayload.data.items).toHaveLength(1);
+  expect(tablePayload.data.status).toBe("OCCUPIED");
+
+  // Restore
+  setDb(null);
 });
