@@ -1161,7 +1161,7 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
     // Enqueue sync
     enqueueSync("order", orderId, "update");
     enqueueSync("table", order.table_id, "update");
-    if (localTxnId) enqueueSync("transaction", localTxnId, "insert");
+    if (localTxnId || paymentMethod) enqueueSync("transaction", localTxnId || orderId, "insert");
   });
 
   try {
