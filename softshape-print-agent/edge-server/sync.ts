@@ -628,3 +628,54 @@ export function retryDeadLetters(): { reset: number } {
   const result = db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL WHERE synced = 0 AND attempts >= ?").run(MAX_ATTEMPTS);
   return { reset: result.changes || 0 };
 }
+
+// ─── List dead-lettered records with full details (for recovery UI) ──────────
+
+export function getDeadLetterRecords(): Array<{
+  id: number;
+  tableName: string;
+  recordId: string;
+  operation: string;
+  attempts: number;
+  lastError: string | null;
+  createdAt: number;
+  payload: unknown;
+}> {
+  const db = getDb();
+  const rows = db.query(
+    `SELECT id, table_name, record_id, operation, attempts, last_error, created_at
+     FROM sync_queue
+     WHERE synced = 0 AND attempts >= ?
+     ORDER BY created_at ASC`
+  ).all(MAX_ATTEMPTS) as any[];
+
+  return rows.map((row) => {
+    const payload = loadRecordData(row.table_name, row.record_id);
+    return {
+      id: row.id,
+      tableName: row.table_name,
+      recordId: row.record_id,
+      operation: row.operation,
+      attempts: row.attempts,
+      lastError: row.last_error,
+      createdAt: row.created_at,
+      payload,
+    };
+  });
+}
+
+// ─── Discard a single dead-letter record (with audit trail) ──────────────────
+
+export function discardDeadLetter(queueId: number): { success: boolean } {
+  const db = getDb();
+  const result = db.query("UPDATE sync_queue SET synced = 1, last_error = 'DISCARDED_BY_USER' WHERE id = ? AND synced = 0 AND attempts >= ?").run(queueId, MAX_ATTEMPTS);
+  return { success: (result.changes || 0) > 0 };
+}
+
+// ─── Retry a single dead-letter record ───────────────────────────────────────
+
+export function retrySingleDeadLetter(queueId: number): { success: boolean } {
+  const db = getDb();
+  const result = db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL WHERE id = ? AND synced = 0 AND attempts >= ?").run(queueId, MAX_ATTEMPTS);
+  return { success: (result.changes || 0) > 0 };
+}

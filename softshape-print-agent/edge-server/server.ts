@@ -44,8 +44,9 @@ import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, g
 import { downloadFullConfig, pullIncrementalChanges } from "./config.ts";
 import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge } from "./orderService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders } from "./reads.ts";
-import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters } from "./sync.ts";
+import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
 import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode } from "./socketSync.ts";
+import { acquireInstanceLock, startHeartbeatLoop, stopHeartbeatLoop, releaseInstanceLock, forceReleaseLock, getLockStatus } from "./instanceLock.ts";
 import { cloudFetch } from "./cloudFetch.ts";
 
 const PORT = parseInt(process.env.EDGE_PORT || "3101", 10);
@@ -158,11 +159,12 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     const lastFullSync = getSyncState("last_full_config_sync") || null;
     const lastIncrementalSync = getSyncState("last_incremental_sync") || null;
 
-    // Count local rows for status
+    // Count local rows for status (scoped to this restaurant only)
     const db = getDb();
-    const tableCount = (db.query("SELECT COUNT(*) as c FROM \"table\"").get() as any)?.c || 0;
-    const menuItemCount = (db.query("SELECT COUNT(*) as c FROM menu_item WHERE is_deleted = 0").get() as any)?.c || 0;
-    const orderCount = (db.query("SELECT COUNT(*) as c FROM order_record WHERE is_deleted = 0").get() as any)?.c || 0;
+    const rid = session.restaurantId;
+    const tableCount = (db.query("SELECT COUNT(*) as c FROM \"table\" WHERE restaurant_id = ?").get(rid) as any)?.c || 0;
+    const menuItemCount = (db.query("SELECT COUNT(*) as c FROM menu_item WHERE is_deleted = 0 AND restaurant_id = ?").get(rid) as any)?.c || 0;
+    const orderCount = (db.query("SELECT COUNT(*) as c FROM order_record WHERE is_deleted = 0 AND restaurant_id = ?").get(rid) as any)?.c || 0;
     const pendingSyncCount = (db.query("SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0").get() as any)?.c || 0;
 
     return jsonResponse({
@@ -620,11 +622,12 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse(data, 200, { "Cache-Control": "no-store" });
   }
 
-  // ── POST /api/edge/table/:id/session — update table session (offline write) ─
+  // ── POST|PATCH /api/edge/table/:id/session — update table session (offline write) ─
   // Mirrors cloud PATCH /api/tables/:id/session and /api/bar/tables/:id/session.
   // Updates workflow_status, captain_id, guests, session_started_at, current_bill
   // in local SQLite and enqueues a sync record for cloud push.
-  if (url.pathname.startsWith("/api/edge/table/") && url.pathname.endsWith("/session") && req.method === "POST") {
+  // Accepts both POST (legacy) and PATCH (aligned with cloud method).
+  if (url.pathname.startsWith("/api/edge/table/") && url.pathname.endsWith("/session") && (req.method === "POST" || req.method === "PATCH")) {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const tableId = url.pathname.split("/")[4];
     if (!tableId) return errorResponse("Table ID is required", 400);
@@ -915,6 +918,59 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse({ success: true, ...result });
   }
 
+  // ── GET /api/edge/sync/dead-letter — list dead-lettered records ────────────
+  if (url.pathname === "/api/edge/sync/dead-letter" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const records = getDeadLetterRecords();
+    return jsonResponse({ records, count: records.length });
+  }
+
+  // ── POST /api/edge/sync/dead-letter/:id/retry — retry a single record ──────
+  if (url.pathname.startsWith("/api/edge/sync/dead-letter/") && url.pathname.endsWith("/retry") && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const idStr = url.pathname.split("/")[5];
+    const queueId = parseInt(idStr, 10);
+    if (isNaN(queueId)) return errorResponse("Invalid record ID", 400);
+    const result = retrySingleDeadLetter(queueId);
+    if (!result.success) return errorResponse("Record not found or not dead-lettered", 404);
+    return jsonResponse({ success: true });
+  }
+
+  // ── POST /api/edge/sync/dead-letter/:id/discard — discard a single record ─
+  if (url.pathname.startsWith("/api/edge/sync/dead-letter/") && url.pathname.endsWith("/discard") && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const idStr = url.pathname.split("/")[5];
+    const queueId = parseInt(idStr, 10);
+    if (isNaN(queueId)) return errorResponse("Invalid record ID", 400);
+    const result = discardDeadLetter(queueId);
+    if (!result.success) return errorResponse("Record not found or not dead-lettered", 404);
+    return jsonResponse({ success: true });
+  }
+
+  // ── GET /api/edge/sync/dead-letter/export — export dead-lettered records as JSON ─
+  if (url.pathname === "/api/edge/sync/dead-letter/export" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const records = getDeadLetterRecords();
+    return jsonResponse({
+      exportedAt: new Date().toISOString(),
+      restaurantId: getRestaurantId(),
+      count: records.length,
+      records,
+    });
+  }
+
+  // ── GET /api/edge/instance/lock — check instance lock status ───────────────
+  if (url.pathname === "/api/edge/instance/lock" && req.method === "GET") {
+    return jsonResponse(getLockStatus());
+  }
+
+  // ── POST /api/edge/instance/force-release — force-release the lock ─────────
+  if (url.pathname === "/api/edge/instance/force-release" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const result = forceReleaseLock();
+    return jsonResponse({ ...result, message: "Lock released — restart the edge server to acquire it" });
+  }
+
   // ── GET /api/edge/sync/socket — socket connection status ───────────────────
   if (url.pathname === "/api/edge/sync/socket" && req.method === "GET") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
@@ -944,9 +1000,10 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       const restaurantCode = slug.slice(0, 8).toUpperCase();
 
       // 1. Create outlet (restaurant settings)
-      db.query(`INSERT INTO outlet (id, name, slug, restaurant_code, restaurant_type, gst_category, gst_rate, gst_registered, prices_include_gst)
-                VALUES (?, ?, ?, ?, ?, 'NON_AC', 5.0, 1, 0)`)
-        .run(restaurantId, restaurantName, slug, restaurantCode, restaurantType || 'DINE_IN_VEG');
+      const organizationId = crypto.randomUUID();
+      db.query(`INSERT INTO outlet (id, name, slug, restaurant_code, restaurant_type, gst_category, gst_rate, gst_registered, prices_include_gst, organization_id)
+                VALUES (?, ?, ?, ?, ?, 'NON_AC', 5.0, 1, 0, ?)`)
+        .run(restaurantId, restaurantName, slug, restaurantCode, restaurantType || 'DINE_IN_VEG', organizationId);
       enqueueSync('outlet', restaurantId, 'create');
 
       // 2. Create default venue + floor + section
@@ -1511,6 +1568,7 @@ process.on("SIGINT", () => {
   stopHeartbeat();
   stopSocketSync();
   stopSyncWorker();
+  releaseInstanceLock();
   closeDb();
   server.stop();
   process.exit(0);
@@ -1521,6 +1579,7 @@ process.on("SIGTERM", () => {
   stopHeartbeat();
   stopSocketSync();
   stopSyncWorker();
+  releaseInstanceLock();
   closeDb();
   server.stop();
   process.exit(0);
@@ -1531,12 +1590,21 @@ process.on("SIGTERM", () => {
 if (isSessionValid()) {
   console.log("[EdgeServer] Session valid — starting background sync loop");
 
-  // Start edge → cloud push worker
-  startSyncWorker();
+  // Acquire instance lock — ensures only one edge server instance is active
+  const lockResult = acquireInstanceLock();
+  if (!lockResult.acquired) {
+    console.warn(`[EdgeServer] Another instance is active (${lockResult.holder?.instanceId}). Sync worker disabled.`);
+    console.warn("[EdgeServer] Use POST /api/edge/instance/force-release to take over.");
+  } else {
+    startHeartbeatLoop();
 
-  // Start cloud → edge socket sync (real-time config changes)
-  startSocketSync();
-  startHeartbeat();
+    // Start edge → cloud push worker
+    startSyncWorker();
+
+    // Start cloud → edge socket sync (real-time config changes)
+    startSocketSync();
+    startHeartbeat();
+  }
 
   // Dynamic poll interval: 15s when socket is in fallback mode, 60s otherwise
   let pollIntervalId: ReturnType<typeof setInterval> | null = null;
@@ -1545,6 +1613,7 @@ if (isSessionValid()) {
     const intervalMs = isInFallbackMode() ? 15_000 : 60_000;
     pollIntervalId = setInterval(async () => {
       if (!isSessionValid()) return;
+      if (!lockResult.acquired) return; // Don't poll if we don't have the lock
       try {
         const result = await pullIncrementalChanges();
         if (result.success && result.changesApplied && result.changesApplied > 0) {
@@ -1560,19 +1629,21 @@ if (isSessionValid()) {
       }
     }, intervalMs);
   }
-  schedulePoll();
+  if (lockResult.acquired) {
+    schedulePoll();
 
-  // Initial incremental pull on startup
-  setTimeout(async () => {
-    try {
-      const result = await pullIncrementalChanges();
-      if (result.success) {
-        console.log(`[EdgeServer] Initial sync: ${result.changesApplied || 0} changes applied`);
+    // Initial incremental pull on startup
+    setTimeout(async () => {
+      try {
+        const result = await pullIncrementalChanges();
+        if (result.success) {
+          console.log(`[EdgeServer] Initial sync: ${result.changesApplied || 0} changes applied`);
+        }
+      } catch {
+        // Will retry in the interval
       }
-    } catch {
-      // Will retry in the interval
-    }
-  }, 3_000);
+    }, 3_000);
+  }
 } else {
   console.log("[EdgeServer] No valid session — waiting for registration via POST /api/edge/register");
 }

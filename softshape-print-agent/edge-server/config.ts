@@ -78,6 +78,27 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
     let totalRows = 0;
 
     const applyConfig = db.transaction(() => {
+    // ── Purge stale data for this restaurant ─────────────────────────────────
+    // On re-link, old rows from a previous onboarding would otherwise remain
+    // forever (ON CONFLICT only updates existing IDs; it never removes rows
+    // that are no longer in the cloud config). Delete everything scoped to
+    // this restaurant before inserting the fresh snapshot.
+    const rid = config.outlet.id;
+    db.query(`DELETE FROM venue_menu_item_availability WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM venue_price WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM menu_item_addon WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM menu_item_variant WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM menu_item WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM category WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM "table" WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM section WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM floor WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM venue WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM price_profile_item WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM price_profile WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM tax_profile WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM users WHERE outlet_id = ?`).run(rid);
+
     // ── Outlet ──────────────────────────────────────────────────────────────
     db.query(`INSERT INTO outlet (
       id, name, slug, restaurant_code, restaurant_type, address, phone, email,

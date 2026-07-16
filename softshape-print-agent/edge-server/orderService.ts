@@ -15,6 +15,79 @@ import { getDb, getNextKotNumber, enqueueSync, getKolkataDateString } from "./db
 import { buildFoodKOT, buildLiquorKOT, buildCancelKOT, buildBill, type PrintItem, type OrderData } from "./escpos.ts";
 import { printToPrinter, printGrouped, resolvePrinterName } from "./printer.ts";
 
+// ─── Shared KOT print group builder ─────────────────────────────────────────
+// Consolidates the KOT grouping logic used by both createOrder and updateOrderItems.
+// Groups items by resolved printer name, with legacy menuType fallback.
+
+interface EdgeKotItem {
+  name: string;
+  quantity: number;
+  price: number | string;
+  notes?: string | null;
+  menuType?: string;
+  printerName?: string | null;
+  printerTarget?: string | null;
+}
+
+function buildKotPrintGroups(
+  mappedItems: EdgeKotItem[],
+  kotOrderData: OrderData,
+  table: any,
+  printerConfig: Record<string, any>,
+): Array<{ printerName: string; escposData: any[] }> {
+  const groupedByPrinter = new Map<string | undefined, EdgeKotItem[]>();
+  for (const item of mappedItems) {
+    const key = item.printerName;
+    if (!groupedByPrinter.has(key)) groupedByPrinter.set(key, []);
+    groupedByPrinter.get(key)!.push(item);
+  }
+
+  const printGroups: Array<{ printerName: string; escposData: any[] }> = [];
+
+  for (const [printerName, groupItems] of groupedByPrinter) {
+    if (!printerName) {
+      // Legacy fallback: split by menuType
+      const kitchenItems = groupItems.filter((i) => i.printerTarget !== "BAR_PRINTER" && i.menuType !== "LIQUOR");
+      const barItems = groupItems.filter((i) => i.printerTarget === "BAR_PRINTER" || i.menuType === "LIQUOR");
+
+      if (kitchenItems.length > 0) {
+        const kitchenPrintItems = kitchenItems.map((i) => ({
+          name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null, type: "food" as const,
+        }));
+        const escpos = buildFoodKOT({ ...kotOrderData, items: kitchenPrintItems });
+        if (escpos.length > 0) {
+          const fallbackPrinter = table.kot_printer_name || resolvePrinterName(null, "KOT_PRINTER", null, printerConfig);
+          if (fallbackPrinter) printGroups.push({ printerName: fallbackPrinter, escposData: escpos });
+        }
+      }
+      if (barItems.length > 0) {
+        const barPrintItems = barItems.map((i) => ({
+          name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null, type: "liquor" as const,
+        }));
+        const escpos = buildLiquorKOT({ ...kotOrderData, items: barPrintItems });
+        if (escpos.length > 0) {
+          const fallbackPrinter = resolvePrinterName(null, "BAR_PRINTER", null, printerConfig);
+          if (fallbackPrinter) printGroups.push({ printerName: fallbackPrinter, escposData: escpos });
+        }
+      }
+    } else {
+      // Precise printer routing
+      const isAllLiquor = groupItems.every((i) => i.menuType === "LIQUOR");
+      const builder = isAllLiquor ? buildLiquorKOT : buildFoodKOT;
+      const printItems = groupItems.map((i) => ({
+        name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null,
+        type: (i.menuType === "LIQUOR" ? "liquor" : "food") as "food" | "liquor",
+      }));
+      const escpos = builder({ ...kotOrderData, items: printItems });
+      if (escpos.length > 0) {
+        printGroups.push({ printerName, escposData: escpos });
+      }
+    }
+  }
+
+  return printGroups;
+}
+
 // ─── Active order statuses ───────────────────────────────────────────────────
 
 const ACTIVE_ORDER_STATUSES = ["PENDING", "CONFIRMED", "PREPARING", "READY", "BILLING_REQUESTED"];
@@ -311,16 +384,6 @@ export async function createOrder(
     };
   });
 
-  // Group items by printer (same logic as backend)
-  const groupedByPrinter = new Map<string | undefined, typeof mappedItems>();
-  for (const item of mappedItems) {
-    const key = item.printerName;
-    if (!groupedByPrinter.has(key)) groupedByPrinter.set(key, []);
-    groupedByPrinter.get(key)!.push(item);
-  }
-
-  // Build print groups
-  const printGroups: Array<{ printerName: string; escposData: any[] }> = [];
   const kotOrderData: OrderData = {
     tableNumber: formattedTableNumber,
     orderId,
@@ -339,47 +402,8 @@ export async function createOrder(
     sectionTag: sectionTag || undefined,
   };
 
-  for (const [printerName, groupItems] of groupedByPrinter) {
-    if (!printerName) {
-      // Legacy fallback: split by menuType
-      const kitchenItems = groupItems.filter((i) => i.printerTarget !== "BAR_PRINTER" && i.menuType !== "LIQUOR");
-      const barItems = groupItems.filter((i) => i.printerTarget === "BAR_PRINTER" || i.menuType === "LIQUOR");
-
-      if (kitchenItems.length > 0) {
-        const kitchenPrintItems = kitchenItems.map((i) => ({
-          name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null, type: "food" as const,
-        }));
-        const escpos = buildFoodKOT({ ...kotOrderData, items: kitchenPrintItems });
-        if (escpos.length > 0) {
-          // Use venue KOT printer or first available kitchen printer
-          const fallbackPrinter = table.kot_printer_name || resolvePrinterName(null, "KOT_PRINTER", null, printerConfig);
-          if (fallbackPrinter) printGroups.push({ printerName: fallbackPrinter, escposData: escpos });
-        }
-      }
-      if (barItems.length > 0) {
-        const barPrintItems = barItems.map((i) => ({
-          name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null, type: "liquor" as const,
-        }));
-        const escpos = buildLiquorKOT({ ...kotOrderData, items: barPrintItems });
-        if (escpos.length > 0) {
-          const fallbackPrinter = resolvePrinterName(null, "BAR_PRINTER", null, printerConfig);
-          if (fallbackPrinter) printGroups.push({ printerName: fallbackPrinter, escposData: escpos });
-        }
-      }
-    } else {
-      // Precise printer routing
-      const isAllLiquor = groupItems.every((i) => i.menuType === "LIQUOR");
-      const builder = isAllLiquor ? buildLiquorKOT : buildFoodKOT;
-      const printItems = groupItems.map((i) => ({
-        name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null,
-        type: (i.menuType === "LIQUOR" ? "liquor" : "food") as "food" | "liquor",
-      }));
-      const escpos = builder({ ...kotOrderData, items: printItems });
-      if (escpos.length > 0) {
-        printGroups.push({ printerName, escposData: escpos });
-      }
-    }
-  }
+  // Group items by printer and build print groups (shared logic)
+  const printGroups = buildKotPrintGroups(mappedItems, kotOrderData, table, printerConfig);
 
   // ── Print all groups (synchronous — before HTTP response returns) ──────────
   const printResults = await printGrouped(printGroups);
@@ -612,15 +636,6 @@ export async function updateOrderItems(
     };
   });
 
-  // Group items by printer
-  const groupedByPrinter = new Map<string | undefined, typeof mappedItems>();
-  for (const item of mappedItems) {
-    const key = item.printerName;
-    if (!groupedByPrinter.has(key)) groupedByPrinter.set(key, []);
-    groupedByPrinter.get(key)!.push(item);
-  }
-
-  const printGroups: Array<{ printerName: string; escposData: any[] }> = [];
   const kotOrderData: OrderData = {
     tableNumber: formattedTableNumber,
     orderId,
@@ -639,44 +654,8 @@ export async function updateOrderItems(
     sectionTag: sectionTag || undefined,
   };
 
-  for (const [printerName, groupItems] of groupedByPrinter) {
-    if (!printerName) {
-      const kitchenItems = groupItems.filter((i) => i.printerTarget !== "BAR_PRINTER" && i.menuType !== "LIQUOR");
-      const barItems = groupItems.filter((i) => i.printerTarget === "BAR_PRINTER" || i.menuType === "LIQUOR");
-
-      if (kitchenItems.length > 0) {
-        const kitchenPrintItems = kitchenItems.map((i) => ({
-          name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null, type: "food" as const,
-        }));
-        const escpos = buildFoodKOT({ ...kotOrderData, items: kitchenPrintItems });
-        if (escpos.length > 0) {
-          const fallbackPrinter = table.kot_printer_name || resolvePrinterName(null, "KOT_PRINTER", null, printerConfig);
-          if (fallbackPrinter) printGroups.push({ printerName: fallbackPrinter, escposData: escpos });
-        }
-      }
-      if (barItems.length > 0) {
-        const barPrintItems = barItems.map((i) => ({
-          name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null, type: "liquor" as const,
-        }));
-        const escpos = buildLiquorKOT({ ...kotOrderData, items: barPrintItems });
-        if (escpos.length > 0) {
-          const fallbackPrinter = resolvePrinterName(null, "BAR_PRINTER", null, printerConfig);
-          if (fallbackPrinter) printGroups.push({ printerName: fallbackPrinter, escposData: escpos });
-        }
-      }
-    } else {
-      const isAllLiquor = groupItems.every((i) => i.menuType === "LIQUOR");
-      const builder = isAllLiquor ? buildLiquorKOT : buildFoodKOT;
-      const printItems = groupItems.map((i) => ({
-        name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null,
-        type: (i.menuType === "LIQUOR" ? "liquor" : "food") as "food" | "liquor",
-      }));
-      const escpos = builder({ ...kotOrderData, items: printItems });
-      if (escpos.length > 0) {
-        printGroups.push({ printerName, escposData: escpos });
-      }
-    }
-  }
+  // Group items by printer and build print groups (shared logic)
+  const printGroups = buildKotPrintGroups(mappedItems, kotOrderData, table, printerConfig);
 
   // ── Print all groups ────────────────────────────────────────────────────────
   const printResults = await printGrouped(printGroups);

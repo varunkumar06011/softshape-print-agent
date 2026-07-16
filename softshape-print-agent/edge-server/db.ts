@@ -23,7 +23,7 @@ export function getKolkataDateString(date = new Date()): string {
   return date.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
 }
 
-const CURRENT_SCHEMA_VERSION = 1;
+const CURRENT_SCHEMA_VERSION = 2;
 
 let db: Database | null = null;
 let recoveryStatus: RecoveryResult = { recovered: false, corruptPath: null, message: "" };
@@ -41,8 +41,14 @@ export function getDb(): Database {
   const versionRow = db.query("PRAGMA user_version").get() as { user_version?: number } | undefined;
   const onDiskVersion = Number(versionRow?.user_version || 0);
 
-  if (onDiskVersion !== 0 && onDiskVersion !== CURRENT_SCHEMA_VERSION) {
-    console.warn(`[DB] Schema version mismatch: on-disk=${onDiskVersion}, expected=${CURRENT_SCHEMA_VERSION}. Rebuilding fresh DB.`);
+  // Detect pre-versioning DBs: user_version=0 but tables already exist (from
+  // an older app version that didn't stamp user_version). These have the old
+  // schema (e.g. organization_id NOT NULL) and must be rebuilt.
+  const hasPreVersioningTables = onDiskVersion === 0 &&
+    !!db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='outlet'").get();
+
+  if ((onDiskVersion !== 0 && onDiskVersion !== CURRENT_SCHEMA_VERSION) || hasPreVersioningTables) {
+    console.warn(`[DB] Schema version mismatch: on-disk=${onDiskVersion}, expected=${CURRENT_SCHEMA_VERSION}${hasPreVersioningTables ? ' (pre-versioning DB detected)' : ''}. Rebuilding fresh DB.`);
     const dbPath = getDbPath();
     db.close();
     db = null;
@@ -70,6 +76,7 @@ export function getDb(): Database {
   }
 
   initSchema(db);
+  runMigrations(db);
 
   if (onDiskVersion !== CURRENT_SCHEMA_VERSION) {
     db.exec(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
@@ -193,6 +200,7 @@ function initSchema(database: Database) {
       floor_id        TEXT,
       venue_id        TEXT,
       sort_order      INTEGER DEFAULT 0,
+      is_active       INTEGER DEFAULT 1,
       synced_at       INTEGER NOT NULL DEFAULT (unixepoch())
     );
     CREATE INDEX IF NOT EXISTS idx_section_restaurant ON section(restaurant_id);
@@ -449,6 +457,85 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_users_outlet ON users(outlet_id);
     CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active) WHERE is_active = 1;
   `);
+}
+
+// ── Lightweight column migrations for existing DBs ───────────────────────────
+// CREATE TABLE IF NOT EXISTS won't add new columns to existing tables.
+// This runs idempotent ALTER TABLE statements guarded by column-existence checks.
+function runMigrations(database: Database) {
+  const hasColumn = (table: string, col: string): boolean => {
+    const cols = database.query(`PRAGMA table_info(${table})`).all() as { name: string }[];
+    return cols.some(c => c.name === col);
+  };
+
+  // section.is_active — added for onboarding INSERT compatibility
+  if (!hasColumn("section", "is_active")) {
+    database.exec(`ALTER TABLE section ADD COLUMN is_active INTEGER DEFAULT 1`);
+  }
+
+  // outlet.organization_id NOT NULL → nullable
+  // Pre-v17.1.0 DBs created organization_id as TEXT NOT NULL. The schema-version
+  // check in getDb() should rebuild these, but on Windows the rebuild can fail
+  // silently (renameSync fails if WAL/SHM files are locked by another process).
+  // This migration recreates the outlet table with nullable organization_id as
+  // a safety net. SQLite has no ALTER COLUMN, so we recreate via temp table.
+  const outletCols = database.query("PRAGMA table_info(outlet)").all() as { name: string; notnull: number }[];
+  const orgCol = outletCols.find(c => c.name === "organization_id");
+  if (orgCol && orgCol.notnull === 1) {
+    console.warn("[DB] outlet.organization_id is NOT NULL — recreating table with nullable column");
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS outlet_migrate_tmp (
+        id                  TEXT PRIMARY KEY,
+        name                TEXT NOT NULL,
+        slug                TEXT NOT NULL,
+        restaurant_code     TEXT NOT NULL,
+        restaurant_type     TEXT,
+        address             TEXT,
+        phone               TEXT,
+        email               TEXT,
+        gstin               TEXT,
+        logo_url            TEXT,
+        receipt_header      TEXT,
+        receipt_sub_header  TEXT,
+        theme_primary       TEXT,
+        theme_secondary     TEXT,
+        printer_config      TEXT,
+        bar_unit_ml         INTEGER DEFAULT 30,
+        full_bottle_ml      INTEGER DEFAULT 750,
+        half_bottle_ml      INTEGER DEFAULT 375,
+        fssai               TEXT,
+        prices_include_gst  INTEGER DEFAULT 0,
+        gst_category        TEXT DEFAULT 'NON_AC',
+        gst_rate            REAL,
+        gst_registered      INTEGER DEFAULT 1,
+        service_charge_percent INTEGER DEFAULT 0,
+        enabled_modules     TEXT,
+        shared_kitchen_outlet_id TEXT,
+        organization_id     TEXT,
+        is_active           INTEGER DEFAULT 1,
+        synced_at           INTEGER NOT NULL DEFAULT (unixepoch())
+      );
+    `);
+    // Copy existing data using explicit column list. Use COALESCE for columns
+    // that might not exist in the old schema.
+    const oldColNames = new Set(outletCols.map(c => c.name));
+    const allCols = [
+      "id", "name", "slug", "restaurant_code", "restaurant_type", "address",
+      "phone", "email", "gstin", "logo_url", "receipt_header", "receipt_sub_header",
+      "theme_primary", "theme_secondary", "printer_config", "bar_unit_ml",
+      "full_bottle_ml", "half_bottle_ml", "fssai", "prices_include_gst",
+      "gst_category", "gst_rate", "gst_registered", "service_charge_percent",
+      "enabled_modules", "shared_kitchen_outlet_id", "organization_id",
+      "is_active", "synced_at"
+    ];
+    const selectCols = allCols.map(col =>
+      oldColNames.has(col) ? col : "NULL"
+    ).join(", ");
+    database.exec(`INSERT INTO outlet_migrate_tmp (${allCols.join(", ")}) SELECT ${selectCols} FROM outlet;`);
+    database.exec(`DROP TABLE outlet;`);
+    database.exec(`ALTER TABLE outlet_migrate_tmp RENAME TO outlet;`);
+    console.warn("[DB] outlet table recreated with nullable organization_id");
+  }
 }
 
 // ── Prepared statement helpers ───────────────────────────────────────────────
