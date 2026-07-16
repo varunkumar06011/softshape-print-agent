@@ -164,6 +164,7 @@ function loadRecordData(tableName: string, recordId: string): any | null {
         gstRegistered: !!o.gst_registered,
         serviceChargePercent: o.service_charge_percent || 0,
         enabledModules: o.enabled_modules,
+        organizationId: o.organization_id,
       };
     }
 
@@ -284,6 +285,18 @@ function loadRecordData(tableName: string, recordId: string): any | null {
       };
     }
 
+    case "transaction": {
+      // Payment confirmations are stored in edge_config with key `payment:${transactionId}`
+      // Settle records use `settle:${localTxnId}` — check both prefixes
+      const row = db.query("SELECT value FROM edge_config WHERE key IN (?, ?)").get(`payment:${recordId}`, `settle:${recordId}`) as any;
+      if (!row || !row.value) return null;
+      try {
+        return JSON.parse(row.value);
+      } catch {
+        return null;
+      }
+    }
+
     default:
       return null;
   }
@@ -358,6 +371,7 @@ async function ensureCloudSession(): Promise<boolean> {
         restaurantType: outlet.restaurant_type,
         restaurantCode: outlet.restaurant_code,
         slug: outlet.slug,
+        organizationId: outlet.organization_id || undefined,
         owner: owner ? { name: owner.name, pin: owner.pin } : undefined,
       }),
       signal: AbortSignal.timeout(10000),

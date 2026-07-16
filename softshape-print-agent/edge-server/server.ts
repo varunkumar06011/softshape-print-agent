@@ -37,7 +37,7 @@
 //   GET  /api/edge/sync/socket  — socket connection status
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, closeDb, getConfig, setConfig, getSyncState, enqueueSync, getRecoveryStatus } from "./db.ts";
+import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enqueueSync, getRecoveryStatus } from "./db.ts";
 import os from "os";
 import { runDailyMaintenance } from "./backup.ts";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
@@ -108,7 +108,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return jsonResponse({
         status: startupState === "error" ? "error" : "initializing",
         service: "softshape-edge-server",
-        version: "17.1.0",
+        version: "17.3.1",
         uptime: process.uptime(),
         error: startupError || null,
       });
@@ -132,7 +132,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse({
       status: "ok",
       service: "softshape-edge-server",
-      version: "17.1.0",
+      version: "17.3.1",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
@@ -168,6 +168,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse({
       registered: true,
       sessionValid: isSessionValid(),
+      configReady: isLocalReady(),
       restaurantId: session.restaurantId,
       restaurantName: session.restaurantName,
       restaurantCode: session.restaurantCode,
@@ -229,16 +230,34 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         saveEdgeApiKey(data.edgeApiKey);
       }
 
-      // Trigger initial config download
-      const configResult = await downloadFullConfig();
+      // Trigger initial config download in the background.
+      // Don't block the registration response — the 30s cloudFetch timeout
+      // would cause a "timeout 30sec" error if the backend is slow or the
+      // config payload is large. The frontend polls /health which reports
+      // config_sync_completed once the download finishes.
+      downloadFullConfig()
+        .then((result) => {
+          if (!result.success) {
+            console.error(`[EdgeServer] Initial config download failed: ${result.error}`);
+            // Clear the session so the broken first attempt doesn't become
+            // permanently invisible on next launch (isLocalReady would see
+            // the saved session + a partial outlet row and skip to "ready").
+            clearSession();
+          } else {
+            console.log(`[EdgeServer] Initial config downloaded: ${result.tablesLoaded} rows`);
+          }
+        })
+        .catch((err) => {
+          console.error(`[EdgeServer] Initial config download error:`, err);
+          clearSession();
+        });
 
       return jsonResponse({
         success: true,
         restaurantId: data.restaurantId,
         restaurantName: data.restaurantName,
-        configDownloaded: configResult.success,
-        tablesLoaded: configResult.tablesLoaded || 0,
-        configError: configResult.error,
+        configDownloaded: false,
+        message: "Registration successful — config downloading in background",
       });
     } catch (err: any) {
       return errorResponse(err.message || "Failed to connect to backend");
@@ -780,13 +799,14 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     try {
       const db = getDb();
       const restaurantId = crypto.randomUUID();
+      const orgId = crypto.randomUUID();
       const slug = restaurantName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
       const restaurantCode = slug.slice(0, 8).toUpperCase();
 
       // 1. Create outlet (restaurant settings)
-      db.query(`INSERT INTO outlet (id, name, slug, restaurant_code, restaurant_type, gst_category, gst_rate, gst_registered, prices_include_gst)
-                VALUES (?, ?, ?, ?, ?, 'NON_AC', 5.0, 1, 0)`)
-        .run(restaurantId, restaurantName, slug, restaurantCode, restaurantType || 'DINE_IN_VEG');
+      db.query(`INSERT INTO outlet (id, name, slug, restaurant_code, restaurant_type, gst_category, gst_rate, gst_registered, prices_include_gst, organization_id)
+                VALUES (?, ?, ?, ?, ?, 'NON_AC', 5.0, 1, 0, ?)`)
+        .run(restaurantId, restaurantName, slug, restaurantCode, restaurantType || 'DINE_IN_VEG', orgId);
       enqueueSync('outlet', restaurantId, 'create');
 
       // 2. Create default venue + floor + section
@@ -872,6 +892,9 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         backendUrl: getBackendUrl() || '',
         expiresAt: 0, // no expiry for local onboarding
       });
+
+      // 8. Mark local config as complete so isLocalReady() returns true
+      setSyncState("config_sync_completed", "true");
 
       console.log(`[Onboard] Created restaurant "${restaurantName}" (${restaurantId}) with ${numTables} tables, ${template.categories?.length || 0} categories, owner: ${owner.name}`);
 
