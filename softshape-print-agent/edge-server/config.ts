@@ -17,6 +17,7 @@ import { cloudFetch } from "./cloudFetch.ts";
 
 interface ConfigResponse {
   outlet: any;
+  organizationId?: string;
   taxProfiles: any[];
   priceProfiles: any[];
   priceProfileItems: any[];
@@ -78,26 +79,60 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
     let totalRows = 0;
 
     const applyConfig = db.transaction(() => {
-    // ── Purge stale data for this restaurant ─────────────────────────────────
+    // ── Purge stale data for this restaurant or organization ────────────────────
     // On re-link, old rows from a previous onboarding would otherwise remain
     // forever (ON CONFLICT only updates existing IDs; it never removes rows
     // that are no longer in the cloud config). Delete everything scoped to
-    // this restaurant before inserting the fresh snapshot.
+    // this restaurant (or organization if multi-outlet) before inserting the fresh snapshot.
     const rid = config.outlet.id;
-    db.query(`DELETE FROM venue_menu_item_availability WHERE restaurant_id = ?`).run(rid);
-    db.query(`DELETE FROM venue_price WHERE restaurant_id = ?`).run(rid);
-    db.query(`DELETE FROM menu_item_addon WHERE restaurant_id = ?`).run(rid);
-    db.query(`DELETE FROM menu_item_variant WHERE restaurant_id = ?`).run(rid);
-    db.query(`DELETE FROM menu_item WHERE restaurant_id = ?`).run(rid);
-    db.query(`DELETE FROM category WHERE restaurant_id = ?`).run(rid);
-    db.query(`DELETE FROM "table" WHERE restaurant_id = ?`).run(rid);
-    db.query(`DELETE FROM section WHERE restaurant_id = ?`).run(rid);
-    db.query(`DELETE FROM floor WHERE restaurant_id = ?`).run(rid);
-    db.query(`DELETE FROM venue WHERE restaurant_id = ?`).run(rid);
-    db.query(`DELETE FROM price_profile_item WHERE restaurant_id = ?`).run(rid);
-    db.query(`DELETE FROM price_profile WHERE restaurant_id = ?`).run(rid);
-    db.query(`DELETE FROM tax_profile WHERE restaurant_id = ?`).run(rid);
-    db.query(`DELETE FROM users WHERE outlet_id = ?`).run(rid);
+    
+    // If organizationId is present, we're fetching data for all outlets in the organization
+    // Purge all organization-scoped data, otherwise just purge for the current outlet
+    if (config.organizationId) {
+      // Get all restaurant IDs in the organization from the config data
+      const allRestaurantIds = new Set([
+        rid,
+        ...config.venues.map((v: any) => v.restaurantId),
+        ...config.tables.map((t: any) => t.restaurantId),
+        ...config.menuItems.map((m: any) => m.restaurantId),
+        ...config.categories.map((c: any) => c.restaurantId),
+        ...config.taxProfiles.map((tp: any) => tp.restaurantId),
+        ...config.priceProfiles.map((pp: any) => pp.restaurantId),
+      ]);
+      
+      for (const restaurantId of allRestaurantIds) {
+        db.query(`DELETE FROM venue_menu_item_availability WHERE restaurant_id = ?`).run(restaurantId);
+        db.query(`DELETE FROM venue_price WHERE restaurant_id = ?`).run(restaurantId);
+        db.query(`DELETE FROM menu_item_addon WHERE restaurant_id = ?`).run(restaurantId);
+        db.query(`DELETE FROM menu_item_variant WHERE restaurant_id = ?`).run(restaurantId);
+        db.query(`DELETE FROM menu_item WHERE restaurant_id = ?`).run(restaurantId);
+        db.query(`DELETE FROM category WHERE restaurant_id = ?`).run(restaurantId);
+        db.query(`DELETE FROM "table" WHERE restaurant_id = ?`).run(restaurantId);
+        db.query(`DELETE FROM section WHERE restaurant_id = ?`).run(restaurantId);
+        db.query(`DELETE FROM floor WHERE restaurant_id = ?`).run(restaurantId);
+        db.query(`DELETE FROM venue WHERE restaurant_id = ?`).run(restaurantId);
+        db.query(`DELETE FROM price_profile_item WHERE restaurant_id = ?`).run(restaurantId);
+        db.query(`DELETE FROM price_profile WHERE restaurant_id = ?`).run(restaurantId);
+        db.query(`DELETE FROM tax_profile WHERE restaurant_id = ?`).run(restaurantId);
+        db.query(`DELETE FROM users WHERE outlet_id = ?`).run(restaurantId);
+      }
+    } else {
+      // Single outlet mode - purge only for current restaurant
+      db.query(`DELETE FROM venue_menu_item_availability WHERE restaurant_id = ?`).run(rid);
+      db.query(`DELETE FROM venue_price WHERE restaurant_id = ?`).run(rid);
+      db.query(`DELETE FROM menu_item_addon WHERE restaurant_id = ?`).run(rid);
+      db.query(`DELETE FROM menu_item_variant WHERE restaurant_id = ?`).run(rid);
+      db.query(`DELETE FROM menu_item WHERE restaurant_id = ?`).run(rid);
+      db.query(`DELETE FROM category WHERE restaurant_id = ?`).run(rid);
+      db.query(`DELETE FROM "table" WHERE restaurant_id = ?`).run(rid);
+      db.query(`DELETE FROM section WHERE restaurant_id = ?`).run(rid);
+      db.query(`DELETE FROM floor WHERE restaurant_id = ?`).run(rid);
+      db.query(`DELETE FROM venue WHERE restaurant_id = ?`).run(rid);
+      db.query(`DELETE FROM price_profile_item WHERE restaurant_id = ?`).run(rid);
+      db.query(`DELETE FROM price_profile WHERE restaurant_id = ?`).run(rid);
+      db.query(`DELETE FROM tax_profile WHERE restaurant_id = ?`).run(rid);
+      db.query(`DELETE FROM users WHERE outlet_id = ?`).run(rid);
+    }
 
     // ── Outlet ──────────────────────────────────────────────────────────────
     db.query(`INSERT INTO outlet (
