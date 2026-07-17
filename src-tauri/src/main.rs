@@ -142,8 +142,8 @@ fn main() {
         .setup(|_app| {
             // Spawn the local HTTP print server on 0.0.0.0:PRINT_AGENT_PORT
             // so cashier (localhost) and captain tablets (LAN) can reach it.
-            // Default 3101 avoids colliding with Restroworks POS which uses 3100.
-            let port = std::env::var("PRINT_AGENT_PORT").unwrap_or_else(|_| "3101".to_string());
+            // Default 3102 avoids colliding with Edge Server which uses 3101.
+            let port = std::env::var("PRINT_AGENT_PORT").unwrap_or_else(|_| "3102".to_string());
             let addr = format!("0.0.0.0:{}", port);
             std::thread::spawn(move || {
                 http_server::start(&addr);

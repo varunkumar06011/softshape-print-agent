@@ -17,7 +17,7 @@
 import http from 'http';
 import { URL } from 'url';
 
-const PORT = process.env.PORT || 3101;
+const PORT = process.env.PORT || 3102;
 
 function getTauriInvoke() {
   const t = typeof window !== 'undefined' ? window.__TAURI__ : null;
