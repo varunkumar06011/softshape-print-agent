@@ -105,7 +105,30 @@ export function getTablesForRestaurant(): any[] {
       ORDER BY t.number ASC
     `).all(...ACTIVE_ORDER_STATUSES, section.id, restaurantId) as any[];
 
-    const mappedTables = tables.map((t) => mapTableRow(t));
+    const sectionInfo = {
+      id: section.id,
+      name: section.name,
+      restaurantId: section.restaurant_id,
+      venueId: section.venue_id,
+      venue: section.venue_id ? {
+        id: section.venue_id,
+        name: section.venue_name,
+        venueType: section.venue_type,
+        kotEnabled: !!section.kot_enabled,
+      } : undefined,
+    };
+
+    const mappedTables = tables.map((t) => {
+      const mapped = mapTableRow(t);
+      // Ensure section info is populated — the table query in getTablesForRestaurant
+      // doesn't join section_name, so mapTableRow leaves section undefined.
+      // VenueSectionView filters by table.section?.name, so without this, no tables match.
+      if (!mapped.section) {
+        mapped.section = sectionInfo;
+      }
+      mapped.sectionName = section.name;
+      return mapped;
+    });
 
     return {
       id: section.id,
@@ -147,7 +170,11 @@ export function getTablesFlat(): any[] {
     ORDER BY s.name ASC, t.number ASC
   `).all(restaurantId) as any[];
 
-  return tables.map((t) => mapTableRow(t));
+  return tables.map((t) => {
+    const mapped = mapTableRow(t);
+    if (t.section_name) mapped.sectionName = t.section_name;
+    return mapped;
+  });
 }
 
 // ─── Helper: Map a SQLite table row to the cloud response shape ───────────────
@@ -327,6 +354,19 @@ export function getSections(): any[] {
         guests: t.guests,
         currentBill: Number(t.current_bill),
         sectionTag: t.section_tag,
+        sectionName: s.name,
+        section: {
+          id: s.id,
+          name: s.name,
+          restaurantId: s.restaurant_id,
+          venueId: s.venue_id,
+          venue: s.venue_id ? {
+            id: s.venue_id,
+            name: s.venue_name,
+            venueType: s.venue_type,
+            kotEnabled: !!s.kot_enabled,
+          } : undefined,
+        },
       })),
     };
   });
@@ -454,6 +494,26 @@ export function getMenuItems(venueId?: string): any[] {
     }
   }
 
+  // Build all venue prices by item (for client-side venue price resolution)
+  const allVenuePrices = db.query(`
+    SELECT venue_id, menu_item_id, price FROM venue_price WHERE is_active = 1 AND restaurant_id = ?
+  `).all(restaurantId) as any[];
+  const allVenuePricesByItem: Record<string, Record<string, number>> = {};
+  for (const vp of allVenuePrices) {
+    if (!allVenuePricesByItem[vp.menu_item_id]) allVenuePricesByItem[vp.menu_item_id] = {};
+    allVenuePricesByItem[vp.menu_item_id][vp.venue_id] = Number(vp.price);
+  }
+
+  // Build venue availability by item
+  const venueAvailRecords = db.query(`
+    SELECT venue_id, menu_item_id, is_available FROM venue_menu_item_availability WHERE restaurant_id = ?
+  `).all(restaurantId) as any[];
+  const venueAvailByItem: Record<string, Record<string, boolean>> = {};
+  for (const rec of venueAvailRecords) {
+    if (!venueAvailByItem[rec.menu_item_id]) venueAvailByItem[rec.menu_item_id] = {};
+    venueAvailByItem[rec.menu_item_id][rec.venue_id] = !!rec.is_available;
+  }
+
   const items = db.query(`
     SELECT m.*, c.name as category_name, c.sort_order as category_sort_order
     FROM menu_item m
@@ -475,6 +535,10 @@ export function getMenuItems(venueId?: string): any[] {
       const defaultVariant = db.query("SELECT price FROM menu_item_variant WHERE menu_item_id = ? AND is_default = 1 LIMIT 1").get(m.id) as any;
       const basePrice = venuePriceMap.get(m.id) ?? Number(m.base_price);
       const variantPrice = defaultVariant ? Number(defaultVariant.price) : null;
+      const price = variantPrice ?? basePrice;
+
+      // Get all variants for this item (for POS portion size selection)
+      const variants = db.query("SELECT id, name, price, is_default, is_available FROM menu_item_variant WHERE menu_item_id = ? AND is_available = 1").all(m.id) as any[];
 
       return {
         id: m.id,
@@ -482,6 +546,7 @@ export function getMenuItems(venueId?: string): any[] {
         description: m.description,
         imageUrl: m.image_url,
         isVeg: !!m.is_veg,
+        isAvailable: !!m.is_available,
         gstEnabled: !!m.gst_enabled,
         menuType: m.menu_type,
         isSpecial: !!m.is_special,
@@ -489,8 +554,19 @@ export function getMenuItems(venueId?: string): any[] {
         specialActive: !!m.special_active,
         specialExpiresAt: m.special_expires_at ? new Date(m.special_expires_at).toISOString() : null,
         unit: m.unit,
-        category: { name: m.category_name },
-        effectivePrice: variantPrice ?? basePrice,
+        category: m.category_name,
+        price,
+        variants: variants.map((v) => ({
+          id: v.id,
+          name: v.name,
+          price: Number(v.price),
+          isDefault: !!v.is_default,
+          isAvailable: !!v.is_available,
+        })),
+        printerTarget: m.printer_target || null,
+        printerName: m.printer_name || null,
+        venuePrices: venueId ? (venuePriceMap.has(m.id) ? { [venueId]: venuePriceMap.get(m.id)! } : {}) : (allVenuePricesByItem[m.id] ?? {}),
+        venueAvailabilities: venueAvailByItem[m.id] ?? {},
       };
     });
 }
