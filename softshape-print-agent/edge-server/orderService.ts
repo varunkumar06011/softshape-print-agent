@@ -1551,3 +1551,133 @@ export async function saveTransactionEdge(
     },
   };
 }
+
+// ─── List Transactions (for edge-local Past Transactions) ───────────────────
+// Returns settled orders + walk-in transactions from local SQLite.
+// Mirrors the cloud /api/transactions response shape so the frontend
+// can use the same mapping logic.
+
+export async function listTransactionsEdge(
+  restaurantId: string,
+  opts: { date?: string | null; month?: string | null; limit?: number } = {},
+): Promise<any[]> {
+  const db = getDb();
+  const limit = opts.limit && opts.limit > 0 ? opts.limit : 2000;
+  const txns: any[] = [];
+
+  // 1. Settled orders with payment details from edge_config
+  let orderQuery = `SELECT o.*, t.number as table_number, t.section_tag, s.name as section_name
+    FROM order_record o
+    LEFT JOIN "table" t ON o.table_id = t.id
+    LEFT JOIN section s ON t.section_id = s.id
+    WHERE o.restaurant_id = ? AND o.status = 'SETTLED'`;
+  const orderParams: any[] = [restaurantId];
+
+  if (opts.date) {
+    // Filter by IST date: paid_at is epoch ms
+    const dayStart = new Date(opts.date + "T00:00:00+05:30").getTime();
+    const dayEnd = dayStart + 24 * 60 * 60 * 1000;
+    orderQuery += ` AND o.paid_at >= ? AND o.paid_at < ?`;
+    orderParams.push(dayStart, dayEnd);
+  } else if (opts.month) {
+    // Filter by IST month
+    const monthStart = new Date(opts.month + "-01T00:00:00+05:30").getTime();
+    const monthEnd = new Date(opts.month + "-31T23:59:59+05:30").getTime();
+    orderQuery += ` AND o.paid_at >= ? AND o.paid_at <= ?`;
+    orderParams.push(monthStart, monthEnd);
+  }
+
+  orderQuery += ` ORDER BY o.paid_at DESC LIMIT ?`;
+  orderParams.push(limit);
+
+  const settledOrders = db.query(orderQuery).all(...orderParams) as any[];
+
+  for (const order of settledOrders) {
+    // Look up payment details from edge_config
+    const paymentRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
+    let paymentData: any = {};
+    if (paymentRow?.value) {
+      try { paymentData = JSON.parse(paymentRow.value); } catch {}
+    }
+
+    // Get items for this order
+    const items = db.query("SELECT name, quantity, price, menu_type FROM order_item WHERE order_id = ?").all(order.id) as any[];
+
+    txns.push({
+      id: `edge-txn-${order.id}`,
+      orderId: order.id,
+      txnNumber: null,
+      billNumber: order.bill_number || null,
+      paidAt: order.paid_at ? new Date(order.paid_at).toISOString() : new Date(order.created_at).toISOString(),
+      amount: Number(order.total_amount ?? 0),
+      grandTotal: Number(order.total_amount ?? 0),
+      subtotal: Number(order.total_amount ?? 0),
+      discountPercent: Number(paymentData.discountPercent ?? 0),
+      discountAmount: 0,
+      cgst: 0,
+      sgst: 0,
+      roundOff: 0,
+      tipAmount: Number(paymentData.tipAmount ?? 0),
+      itemCount: items.length,
+      items: items.map(i => ({ name: i.name, quantity: i.quantity, price: i.price })),
+      captainId: order.captain_id || "CASHIER",
+      captainName: "Head Cashier",
+      method: paymentData.paymentMethod || "CASH",
+      tableNumber: order.table_number || null,
+      sectionTag: order.section_tag || null,
+      sectionId: null,
+      status: "COMPLETED",
+    });
+  }
+
+  // 2. Walk-in transactions from edge_config
+  let walkinQuery = `SELECT key, value FROM edge_config WHERE key LIKE 'walkin_txn:%'`;
+  const walkinRows = db.query(walkinQuery).all() as any[];
+
+  for (const row of walkinRows) {
+    try {
+      const txn = JSON.parse(row.value);
+      if (txn.restaurantId !== restaurantId) continue;
+
+      if (opts.date) {
+        const txnDate = new Date(txn.paidAt || txn.createdAt).toISOString().slice(0, 10);
+        if (txnDate !== opts.date) continue;
+      } else if (opts.month) {
+        const txnMonth = String(txn.paidAt || txn.createdAt || "").slice(0, 7);
+        if (txnMonth !== opts.month) continue;
+      }
+
+      txns.push({
+        id: txn.id || row.key,
+        orderId: txn.orderId || null,
+        txnNumber: txn.txnNumber || null,
+        billNumber: txn.billNumber || null,
+        paidAt: txn.paidAt ? new Date(txn.paidAt).toISOString() : new Date(txn.createdAt).toISOString(),
+        amount: Number(txn.grandTotal ?? txn.amount ?? 0),
+        grandTotal: Number(txn.grandTotal ?? txn.amount ?? 0),
+        subtotal: Number(txn.subtotal ?? 0),
+        discountPercent: Number(txn.discountPercent ?? 0),
+        discountAmount: Number(txn.discountAmount ?? 0),
+        cgst: Number(txn.cgst ?? 0),
+        sgst: Number(txn.sgst ?? 0),
+        roundOff: Number(txn.roundOff ?? 0),
+        tipAmount: Number(txn.tipAmount ?? 0),
+        itemCount: txn.itemCount || (Array.isArray(txn.items) ? txn.items.length : 0),
+        items: txn.items || [],
+        captainId: txn.captainId || "CASHIER",
+        captainName: "Head Cashier",
+        method: txn.method || "OTHER",
+        tableNumber: null,
+        sectionTag: txn.sectionTag || null,
+        sectionId: txn.sectionId || null,
+        status: "COMPLETED",
+      });
+    } catch {}
+  }
+
+  // Sort by paidAt descending
+  txns.sort((a, b) => new Date(b.paidAt).getTime() - new Date(a.paidAt).getTime());
+
+  // Apply limit
+  return txns.slice(0, limit);
+}

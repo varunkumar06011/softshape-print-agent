@@ -62,6 +62,7 @@ export function getDb(): Database {
 
     const fresh = new Database(dbPath, { create: true });
     fresh.exec("PRAGMA journal_mode = WAL;");
+    fresh.exec("PRAGMA auto_vacuum = INCREMENTAL;");
     fresh.exec("PRAGMA foreign_keys = ON;");
     fresh.exec("PRAGMA busy_timeout = 5000;");
     db = fresh;
@@ -77,6 +78,21 @@ export function getDb(): Database {
 
   initSchema(db);
   runMigrations(db);
+
+  // Enable incremental auto_vacuum so daily maintenance can reclaim free pages
+  // from deleted rows without a full VACUUM lock. For existing DBs where
+  // auto_vacuum is off (0), set it to INCREMENTAL (2) and run a one-time VACUUM.
+  try {
+    const av = db.query("PRAGMA auto_vacuum").get() as { auto_vacuum?: number } | undefined;
+    if (Number(av?.auto_vacuum || 0) !== 2) {
+      console.log("[DB] Enabling incremental auto_vacuum (one-time VACUUM)...");
+      db.exec("PRAGMA auto_vacuum = INCREMENTAL");
+      db.exec("VACUUM");
+      console.log("[DB] Incremental auto_vacuum enabled");
+    }
+  } catch (err) {
+    console.warn("[DB] Could not enable incremental auto_vacuum:", err);
+  }
 
   if (onDiskVersion !== CURRENT_SCHEMA_VERSION) {
     db.exec(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);

@@ -110,6 +110,7 @@ export function openDatabaseWithRecovery(): { db: Database; recovery: RecoveryRe
     // Create fresh DB
     const db = new Database(dbPath, { create: true });
     db.exec("PRAGMA journal_mode = WAL;");
+    db.exec("PRAGMA auto_vacuum = INCREMENTAL;");
     db.exec("PRAGMA foreign_keys = ON;");
     db.exec("PRAGMA busy_timeout = 5000;");
 

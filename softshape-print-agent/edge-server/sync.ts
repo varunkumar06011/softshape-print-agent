@@ -318,7 +318,9 @@ function markSynced(queueIds: number[]): void {
   if (queueIds.length === 0) return;
   const db = getDb();
   const placeholders = queueIds.map(() => "?").join(",");
-  db.query(`UPDATE sync_queue SET synced = 1 WHERE id IN (${placeholders})`).run(...queueIds);
+  // Delete instead of marking synced=1 — keeps the table small so
+  // collectBatch() stays fast and INSERTs don't slow down over a shift.
+  db.query(`DELETE FROM sync_queue WHERE id IN (${placeholders})`).run(...queueIds);
 }
 
 function incrementAttempts(queueIds: number[], error: string): void {
@@ -550,6 +552,15 @@ async function runSyncCycle(): Promise<void> {
   try {
     const result = await pushSyncBatch();
     deadLetterExhausted();
+
+    // Checkpoint WAL to keep the -wal file small and reads fast.
+    // Without this, the WAL grows throughout a shift and every query
+    // has to scan both the main DB and the WAL, causing progressive slowdown.
+    try {
+      getDb().query("PRAGMA wal_checkpoint(TRUNCATE)").run();
+    } catch {
+      // Non-fatal — checkpoint can fail if another connection is busy
+    }
 
     if (result.ok) {
       consecutiveFailures = 0;

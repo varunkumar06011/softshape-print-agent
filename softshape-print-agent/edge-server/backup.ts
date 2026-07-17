@@ -94,7 +94,17 @@ function pruneOldOrders(db: Database): void {
   db.query("DELETE FROM order_record WHERE created_at < ? AND cloud_synced = 1").run(cutoff);
 
   // Also prune synced sync_queue entries older than retention
+  // (synced rows are now deleted immediately in markSynced(), but this
+  // catches any stragglers from before that change was deployed)
   db.query("DELETE FROM sync_queue WHERE synced = 1 AND created_at < ?").run(cutoff);
+
+  // Reclaim free pages from deleted rows — keeps the DB file from growing
+  // unbounded. incremental_vacuum is non-blocking unlike full VACUUM.
+  try {
+    db.query("PRAGMA incremental_vacuum").run();
+  } catch {
+    // Non-fatal — can fail if auto_vacuum is not enabled
+  }
 
   console.log(`[Backup] Pruned ${before.count} orders older than ${ORDER_RETENTION_DAYS} days`);
 }

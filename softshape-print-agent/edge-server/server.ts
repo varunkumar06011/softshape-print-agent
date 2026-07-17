@@ -42,7 +42,7 @@ import os from "os";
 import { runDailyMaintenance } from "./backup.ts";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { downloadFullConfig, pullIncrementalChanges } from "./config.ts";
-import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge } from "./orderService.ts";
+import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge } from "./orderService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders } from "./reads.ts";
 import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
 import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode } from "./socketSync.ts";
@@ -622,6 +622,19 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     const result = await saveTransactionEdge(restaurantId, body);
     if (!result.success) return errorResponse(result.error || "Save transaction failed", 400);
     return jsonResponse(result);
+  }
+
+  // ── GET /api/edge/transactions — list settled orders + walk-in txns ────────
+  // Used by edge-local (PIN) auth to populate Past Transactions from local SQLite.
+  if (url.pathname === "/api/edge/transactions" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("No valid session", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const date = url.searchParams.get("date");
+    const month = url.searchParams.get("month");
+    const limit = parseInt(url.searchParams.get("limit") || "2000", 10);
+    const txns = await listTransactionsEdge(restaurantId, { date, month, limit });
+    return jsonResponse(txns, 200, { "Cache-Control": "no-store" });
   }
 
   // ── GET /api/edge/tables — sections with nested tables + active orders ────
