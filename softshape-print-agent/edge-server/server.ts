@@ -88,6 +88,22 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     "/health",
     "/api/edge/register",
     "/api/edge/onboard",
+    "/api/edge/sections",
+    "/api/edge/tables",
+    "/api/edge/tables/flat",
+    "/api/edge/menu",
+    "/api/edge/menu/items",
+    "/api/edge/venues",
+    "/api/edge/outlet",
+    "/api/edge/order",
+    "/api/edge/order/update",
+    "/api/edge/order/cancel",
+    "/api/edge/order/cancel-items",
+    "/api/edge/order/print-bill",
+    "/api/edge/order/settle",
+    "/api/edge/order/confirm-payment",
+    "/api/edge/order/status",
+    "/api/edge/orders",
   ]);
 
   if (!PUBLIC_LAN_PATHS.has(url.pathname)) {
@@ -715,8 +731,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   }
 
   // ── DELETE /api/edge/table/:id/session — terminate table session ───────────
-  // Mirrors cloud DELETE /api/bar/tables/:id/session. Resets the table to Free,
-  // clears KOTs, and enqueues sync.
+  // Kill switch: completely resets the table to Free, cancels the active order,
+  // deletes order items, clears KOTs, and enqueues sync.
   if (url.pathname.startsWith("/api/edge/table/") && url.pathname.endsWith("/session") && req.method === "DELETE") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const tableId = url.pathname.split("/")[4];
@@ -730,23 +746,51 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     if (!existing) return errorResponse("Table not found", 404);
 
     const now = Date.now();
-    db.query(`UPDATE "table" SET
-      status = 'AVAILABLE',
-      workflow_status = 'Free',
-      captain_id = NULL,
-      guests = 0,
-      session_started_at = NULL,
-      current_bill = 0,
-      kot_history = '[]',
-      updated_at = ?
-      WHERE id = ? AND restaurant_id = ?
-    `).run(now, tableId, restaurantId);
 
-    // Clear KOTs for this table
-    db.query("DELETE FROM kot WHERE table_id = ?").run(tableId);
+    // Find and cancel any active orders on this table
+    const activeOrders = db.query(
+      `SELECT id FROM order_record WHERE table_id = ? AND restaurant_id = ? AND status NOT IN ('SETTLED', 'CANCELLED') AND is_deleted = 0`
+    ).all(tableId, restaurantId) as any[];
 
-    enqueueSync("table", tableId, "update");
-    return jsonResponse({ success: true, id: tableId });
+    const tx = db.transaction(() => {
+      // 1. Cancel all active orders
+      for (const order of activeOrders) {
+        db.query("UPDATE order_record SET status = 'CANCELLED', updated_at = ? WHERE id = ?")
+          .run(now, order.id);
+        // Delete order items
+        db.query("DELETE FROM order_item WHERE order_id = ?").run(order.id);
+        // Enqueue sync for the cancelled order
+        enqueueSync("order", order.id, "update");
+      }
+
+      // 2. Reset table to Free
+      db.query(`UPDATE "table" SET
+        status = 'AVAILABLE',
+        workflow_status = 'Free',
+        captain_id = NULL,
+        guests = 0,
+        session_started_at = NULL,
+        current_bill = 0,
+        kot_history = '[]',
+        discount = NULL,
+        updated_at = ?
+        WHERE id = ? AND restaurant_id = ?
+      `).run(now, tableId, restaurantId);
+
+      // 3. Clear KOTs for this table
+      db.query("DELETE FROM kot WHERE table_id = ?").run(tableId);
+
+      // 4. Enqueue table sync
+      enqueueSync("table", tableId, "update");
+    });
+
+    try {
+      tx();
+    } catch (err: any) {
+      return errorResponse(`Terminate failed: ${err.message}`, 500);
+    }
+
+    return jsonResponse({ success: true, id: tableId, cancelledOrders: activeOrders.length });
   }
 
   // ── GET /api/edge/sections — sections with venue + floor info ──────────────
