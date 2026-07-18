@@ -33,12 +33,33 @@ function getTauriInvoke() {
 
 /**
  * Detect the local LAN IP address of this machine.
- * Uses WebRTC ICE candidate gathering (no STUN server needed for LAN IP).
- * Returns null if detection fails.
+ *
+ * Strategy:
+ *   1. Tauri `get_lan_ip` command — uses a connected UDP socket to read the
+ *      OS-chosen source IP for a routable destination. Reliable on Windows,
+ *      where WebView2 obfuscates WebRTC host candidates as mDNS hostnames
+ *      (e.g. `abc.local`) that don't match the IPv4 regex below.
+ *   2. WebRTC ICE candidate gathering (no STUN server needed for LAN IP) —
+ *      fallback for non-Tauri browsers.
+ * Returns null if both strategies fail.
  */
 let _cachedLanIp = null;
 async function getLanIp() {
   if (_cachedLanIp) return _cachedLanIp;
+  // 1. Preferred: Rust command (reliable on Windows/Tauri).
+  const invoke = getTauriInvoke();
+  if (invoke) {
+    try {
+      const ip = await invoke('get_lan_ip');
+      if (typeof ip === 'string' && /^\d{1,3}(\.\d{1,3}){3}$/.test(ip) && ip !== '127.0.0.1') {
+        _cachedLanIp = ip;
+        return ip;
+      }
+    } catch (err) {
+      console.warn('[Agent] get_lan_ip command failed, falling back to WebRTC:', err?.message || err);
+    }
+  }
+  // 2. Fallback: WebRTC ICE candidate gathering (non-Tauri browsers).
   try {
     // No ICE servers — only gather host candidates (LAN IPs), not public IPs via STUN
     const pc = new RTCPeerConnection({ iceServers: [] });

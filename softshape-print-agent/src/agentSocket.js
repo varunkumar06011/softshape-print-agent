@@ -33,6 +33,43 @@ class FetchError extends Error {
 }
 
 /**
+ * Resolve the Tauri invoke function regardless of API shape. Tauri v1 with
+ * withGlobalTauri exposes both window.__TAURI__.invoke and
+ * window.__TAURI__.tauri.invoke. Returns null outside the desktop webview.
+ */
+function getTauriInvoke() {
+  const t = typeof window !== "undefined" ? window.__TAURI__ : null;
+  if (!t) return null;
+  if (typeof t.invoke === "function") return t.invoke.bind(t);
+  if (t.tauri && typeof t.tauri.invoke === "function") return t.tauri.invoke.bind(t.tauri);
+  return null;
+}
+
+/**
+ * Detect the local LAN IP address of this machine.
+ * Uses the Tauri `get_lan_ip` Rust command (connected UDP socket trick) which
+ * is reliable on Windows where WebView2 obfuscates WebRTC host candidates
+ * as mDNS hostnames. Returns null if detection fails.
+ */
+let _cachedLanIp = null;
+async function getLanIp() {
+  if (_cachedLanIp) return _cachedLanIp;
+  const invoke = getTauriInvoke();
+  if (invoke) {
+    try {
+      const ip = await invoke('get_lan_ip');
+      if (typeof ip === 'string' && /^\d{1,3}(\.\d{1,3}){3}$/.test(ip) && ip !== '127.0.0.1') {
+        _cachedLanIp = ip;
+        return ip;
+      }
+    } catch (err) {
+      console.warn('[Agent] get_lan_ip command failed:', err?.message || err);
+    }
+  }
+  return null;
+}
+
+/**
  * Fetch with per-attempt timeout and exponential backoff.
  *
  * Retry policy:
@@ -167,6 +204,69 @@ let isOnline = false;
 
 const OFFLINE_QUEUE_KEY = "agent_offline_print_queue";
 
+// ── EventId dedup (Issue 1 + Issue 6) ──────────────────────────────────────
+// Prevents duplicate prints when the backend re-delivers buffered PENDING jobs
+// on reconnect, or when emitToRestaurant falls back from a printer-specific room
+// to the general room. Persisted to localStorage so it survives agent restarts.
+const SEEN_EVENT_IDS_KEY = "agent_seen_event_ids";
+const SEEN_EVENT_IDS_MAX = 500;
+const seenEventIds = new Set();
+let _seenEventIdsLoaded = false;
+
+function loadSeenEventIds() {
+  if (_seenEventIdsLoaded) return;
+  _seenEventIdsLoaded = true;
+  try {
+    const arr = JSON.parse(localStorage.getItem(SEEN_EVENT_IDS_KEY) || "[]");
+    for (const id of arr) {
+      if (typeof id === "string") seenEventIds.add(id);
+    }
+  } catch { /* ignore */ }
+}
+
+function saveSeenEventIds() {
+  try {
+    localStorage.setItem(SEEN_EVENT_IDS_KEY, JSON.stringify(Array.from(seenEventIds).slice(-SEEN_EVENT_IDS_MAX)));
+  } catch { /* ignore quota errors */ }
+}
+
+function isEventIdSeen(eventId) {
+  loadSeenEventIds();
+  return seenEventIds.has(eventId);
+}
+
+function markEventIdSeen(eventId) {
+  loadSeenEventIds();
+  seenEventIds.add(eventId);
+  if (seenEventIds.size > SEEN_EVENT_IDS_MAX) {
+    const arr = Array.from(seenEventIds);
+    seenEventIds.clear();
+    arr.slice(-SEEN_EVENT_IDS_MAX).forEach(id => seenEventIds.add(id));
+  }
+  saveSeenEventIds();
+}
+
+// ── Bounded concurrency for print jobs (Issue 2) ───────────────────────────
+// Processes up to MAX_CONCURRENT_PRINTS jobs simultaneously so a burst of KOTs
+// from multiple captains doesn't queue serially. The Rust-level Mutex (Issue 3)
+// ensures the actual Win32 printer calls don't interleave bytes.
+const MAX_CONCURRENT_PRINTS = 2;
+let activePrints = 0;
+const pendingPrintQueue = [];
+
+function processPrintQueue() {
+  while (pendingPrintQueue.length > 0 && activePrints < MAX_CONCURRENT_PRINTS) {
+    const envelope = pendingPrintQueue.shift();
+    activePrints++;
+    handlePrintJob(envelope).catch(err => {
+      console.error('[Agent] Concurrency queue print failed:', err);
+    }).finally(() => {
+      activePrints--;
+      processPrintQueue();
+    });
+  }
+}
+
 function getOfflineQueue() {
   try {
     return JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY) || "[]");
@@ -187,6 +287,13 @@ function saveOfflineQueue(queue) {
 
 function addToOfflineQueue(envelope) {
   const queue = getOfflineQueue();
+  // Dedup by eventId — if the same job is already queued (e.g. backend re-emitted
+  // during downtime), don't add a duplicate. handlePrintJob's dedup would catch it
+  // anyway, but this prevents unbounded localStorage growth.
+  if (envelope.eventId && queue.some(e => e.eventId === envelope.eventId)) {
+    console.log(`[Agent] Duplicate eventId already in offline queue: ${envelope.eventId}`);
+    return;
+  }
   queue.push({ ...envelope, queuedAt: Date.now() });
   saveOfflineQueue(queue);
   console.log(`[Agent] Queued offline print job: ${envelope.type} (queue: ${queue.length})`);
@@ -230,6 +337,8 @@ export async function registerAgent({
 }) {
   const body = { agentId, printerMapping: mapping || {} };
   if (restaurantCode) body.restaurantCode = restaurantCode;
+  const lanIp = await getLanIp();
+  if (lanIp) body.lanIp = lanIp;
 
   const res = await fetchWithRetry(
     `${BACKEND_URL}/api/print/agent-register`,
@@ -288,7 +397,11 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
 
   socket.on("connect", () => {
     isOnline = true;
-    socket.emit("agent:join", { restaurantId, sessionToken });
+    // Issue 5: Send stations (printer names) so the backend can route to
+    // printer-specific rooms (print:<rid>:<printerName>) instead of always
+    // falling back to the general room with an extra adapter.sockets() query.
+    const stations = Object.values(printerMapping).filter(Boolean);
+    socket.emit("agent:join", { restaurantId, sessionToken, stations });
     onStatusChangeCb?.("connected");
     // Flush any print jobs that were queued while offline
     flushOfflineQueue();
@@ -306,7 +419,19 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
       addToOfflineQueue(envelope);
       return;
     }
-    await handlePrintJob(envelope);
+    // Issue 2: Use bounded concurrency instead of serial await so a burst of
+    // KOTs from multiple captains doesn't block the socket event loop.
+    if (activePrints >= MAX_CONCURRENT_PRINTS) {
+      pendingPrintQueue.push(envelope);
+    } else {
+      activePrints++;
+      handlePrintJob(envelope).catch(err => {
+        console.error('[Agent] Print failed:', err);
+      }).finally(() => {
+        activePrints--;
+        processPrintQueue();
+      });
+    }
   });
 
   socket.on("disconnect", () => {
@@ -334,6 +459,22 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
  */
 export async function handlePrintJob(envelope) {
   const { type, data } = envelope;
+
+  // ── Dedup: skip if we've already printed this eventId (Issue 1) ──
+  // On reconnect the backend re-delivers buffered PENDING jobs and emitToRestaurant
+  // may fall back from a printer-specific room to the general room, causing double
+  // delivery. This guard ensures each job is printed exactly once.
+  if (envelope.eventId && isEventIdSeen(envelope.eventId)) {
+    console.log(`[Agent] Duplicate eventId skipped: ${envelope.eventId}`);
+    socket?.emit("print:ack", {
+      restaurantId,
+      eventId: envelope.eventId,
+      requestId: data?.requestId,
+      status: "success",
+    });
+    return;
+  }
+  if (envelope.eventId) markEventIdSeen(envelope.eventId);
 
   // Prefer local printerMapping over backend-sent printerName.
   // The local mapping is configured on this machine and knows the actual printer names.
@@ -440,13 +581,16 @@ export function startHeartbeat(getPrinterStatus) {
     if (!sessionToken) return;
     try {
       const printerStatus = getPrinterStatus ? await getPrinterStatus() : {};
+      const hbBody = { printerStatus };
+      const lanIp = await getLanIp();
+      if (lanIp) hbBody.lanIp = lanIp;
       await fetch(`${BACKEND_URL}/api/print/agent-heartbeat`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${sessionToken}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ printerStatus }),
+        body: JSON.stringify(hbBody),
       });
     } catch {
       /* ignore heartbeat failures */

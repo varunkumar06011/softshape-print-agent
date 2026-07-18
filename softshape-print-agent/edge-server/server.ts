@@ -211,6 +211,22 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return errorResponse("setupToken and backendUrl are required");
     }
 
+    // Detect LAN IP so the captain app can discover this edge server via the
+    // backend's /api/print/agent-endpoint response instead of a 15s LAN scan.
+    let lanIp: string | null = null;
+    try {
+      const nets = os.networkInterfaces();
+      for (const iface of Object.values(nets)) {
+        for (const addr of iface || []) {
+          if (addr.family === "IPv4" && !addr.internal) {
+            lanIp = addr.address;
+            break;
+          }
+        }
+        if (lanIp) break;
+      }
+    } catch { /* ignore */ }
+
     // Call cloud backend to register the agent
     try {
       const res = await cloudFetch(`${backendUrl}/api/print/agent-register`, {
@@ -223,6 +239,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
           agentId: getDeviceId(),
           printerMapping: {},
           ...(restaurantCode ? { restaurantCode } : {}),
+          ...(lanIp ? { lanIp } : {}),
         }),
       });
 

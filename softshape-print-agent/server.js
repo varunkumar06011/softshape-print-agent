@@ -19,6 +19,26 @@ import { URL } from 'url';
 
 const PORT = process.env.PORT || 3102;
 
+// ── EventId dedup (Issue 7) ─────────────────────────────────────────────────
+// server.js runs as a separate Node process from the Tauri webview (agentSocket.js),
+// so it can't share the seenEventIds Set. This prevents duplicate prints when the
+// captain retries printLocal() after a failure and the backend also emits via socket.
+const SEEN_EVENT_IDS_MAX = 500;
+const seenEventIds = new Set();
+
+function isEventIdSeen(eventId) {
+  return seenEventIds.has(eventId);
+}
+
+function markEventIdSeen(eventId) {
+  seenEventIds.add(eventId);
+  if (seenEventIds.size > SEEN_EVENT_IDS_MAX) {
+    const arr = Array.from(seenEventIds);
+    seenEventIds.clear();
+    arr.slice(-SEEN_EVENT_IDS_MAX).forEach(id => seenEventIds.add(id));
+  }
+}
+
 function getTauriInvoke() {
   const t = typeof window !== 'undefined' ? window.__TAURI__ : null;
   if (!t) return null;
@@ -28,8 +48,14 @@ function getTauriInvoke() {
 }
 
 async function handlePrintJob(body) {
-  const { jobType, type, printerName, text, bytes, escposData, data } = body || {};
+  const { jobType, type, printerName, text, bytes, escposData, data, eventId } = body || {};
   const effectiveType = type || jobType;
+
+  // ── Dedup: skip if already printed (Issue 7) ──
+  if (eventId && isEventIdSeen(eventId)) {
+    console.log(`[PrintAgent:HTTP] Duplicate eventId skipped: ${eventId}`);
+    return { ok: true, queued: false, message: 'Duplicate eventId skipped' };
+  }
 
   if (!effectiveType) {
     return { ok: false, error: 'Missing jobType or type' };
@@ -69,6 +95,7 @@ async function handlePrintJob(body) {
         });
       }
       console.log(`[PrintAgent:HTTP] Printed [${effectiveType}] → ${targetPrinter} (${rawBytes.length} bytes)`);
+      if (eventId) markEventIdSeen(eventId);
       return { ok: true, queued: false, message: 'Printed' };
     } catch (err) {
       console.error(`[PrintAgent:HTTP] Print failed [${effectiveType}] → ${targetPrinter}:`, err);

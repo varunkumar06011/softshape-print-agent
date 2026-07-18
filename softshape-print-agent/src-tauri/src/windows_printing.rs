@@ -87,8 +87,17 @@ pub fn enumerate_printers() -> Result<Vec<super::PrinterInfo>, String> {
     Ok(printers)
 }
 
+use std::sync::Mutex;
+
+/// Serializes Win32 printer calls so concurrent print_raw invocations don't
+/// interleave ESC/POS bytes into the same spool document. The JS layer allows
+/// up to 2 concurrent prints for throughput; this mutex ensures only one at a
+/// time actually touches the printer driver.
+static PRINT_MUTEX: Mutex<()> = Mutex::new(());
+
 /// Send raw bytes to a printer by name. No print dialog.
 pub fn raw_print(printer_name: &str, bytes: &[u8]) -> Result<(), String> {
+    let _lock = PRINT_MUTEX.lock().unwrap();
     let name_ansi = to_ansi(printer_name);
     let mut handle = HANDLE(0);
 

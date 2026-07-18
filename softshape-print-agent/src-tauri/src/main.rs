@@ -69,12 +69,37 @@ fn print_network(ip: String, port: u16, bytes: Vec<u8>) -> Result<(), String> {
     Ok(())
 }
 
+/// Detect this machine's primary LAN IPv4 address.
+/// Uses a connected UDP socket — `connect()` on a UDP socket only sets the
+/// default destination (no packets are sent), and `local_addr()` returns the
+/// interface IP the OS routing table would use to reach it. More reliable than
+/// WebRTC ICE candidate gathering, which WebView2 obfuscates to mDNS hostnames.
+#[tauri::command]
+fn get_lan_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    // 8.8.8.8 is only used to force the OS to pick a non-loopback route;
+    // no traffic is actually sent for a UDP connect.
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()? {
+        std::net::SocketAddr::V4(addr) => {
+            let ip = addr.ip();
+            if !ip.is_loopback() && !ip.is_unspecified() {
+                Some(ip.to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             list_printers,
             print_raw,
-            print_network
+            print_network,
+            get_lan_ip
         ])
         .run(tauri::generate_context!())
         .expect("error while running SoftShape Print Agent");
