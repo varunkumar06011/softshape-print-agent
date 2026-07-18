@@ -11,7 +11,10 @@
 
 import { Database } from "bun:sqlite";
 import { openDatabaseWithRecovery, getDbPath, type RecoveryResult } from "./recovery.ts";
-import { existsSync, renameSync } from "node:fs";
+import { existsSync, renameSync, mkdirSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid, getDeviceId } from "./auth.ts";
+import { cloudFetch, getServerTimeOffsetMs } from "./cloudFetch.ts";
 
 // ── IST date helper ──────────────────────────────────────────────────────────
 // The cloud backend uses Asia/Kolkata (IST, UTC+5:30) for daily counter dates.
@@ -19,14 +22,78 @@ import { existsSync, renameSync } from "node:fs";
 // numbers map to the same counter date on the cloud during sync. Using UTC
 // (toISOString().slice(0,10)) caused a 5.5-hour mismatch around midnight where
 // edge and cloud counters were on different dates.
+//
+// Clock skew correction: if the cloud server's Date header indicates the local
+// clock is wrong, we apply the offset so the date string matches server time.
+// This prevents KOT numbers from resetting at the wrong time.
 export function getKolkataDateString(date = new Date()): string {
-  return date.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+  const offset = getServerTimeOffsetMs();
+  const corrected = offset !== 0 ? new Date(date.getTime() + offset) : date;
+  return corrected.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
 }
 
 const CURRENT_SCHEMA_VERSION = 2;
 
 let db: Database | null = null;
 let recoveryStatus: RecoveryResult = { recovered: false, corruptPath: null, message: "" };
+
+// ── Sync-before-migrate ──────────────────────────────────────────────────────
+// Before a schema-version rebuild wipes the DB, attempt to push unsynced orders
+// to the cloud. Fire-and-forget — the old DB is preserved as a backup file.
+
+async function attemptSyncBeforeMigrate(database: Database): Promise<void> {
+  if (!isSessionValid()) return;
+
+  const backendUrl = getBackendUrl();
+  const restaurantId = getRestaurantId();
+  const token = getSessionToken();
+  if (!backendUrl || !restaurantId || !token) return;
+
+  let unsyncedOrders: any[] = [];
+  try {
+    unsyncedOrders = database.query("SELECT * FROM order_record WHERE cloud_synced = 0").all() as any[];
+  } catch {
+    return;
+  }
+
+  if (unsyncedOrders.length === 0) return;
+
+  console.log(`[DB] Salvage sync: attempting to push ${unsyncedOrders.length} unsynced orders before schema rebuild...`);
+
+  const payload: any[] = [];
+  for (const order of unsyncedOrders) {
+    try {
+      const items = database.query("SELECT * FROM order_item WHERE order_id = ?").all(order.id) as any[];
+      payload.push({
+        tableName: "order",
+        recordId: order.id,
+        operation: "create",
+        data: {
+          ...order,
+          cloud_synced: undefined,
+          items: items.map(i => ({ ...i, cloud_synced: undefined })),
+        },
+      });
+    } catch { /* skip unreadable */ }
+  }
+
+  if (payload.length === 0) return;
+
+  try {
+    const res = await cloudFetch(`${backendUrl}/api/edge/sync`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ restaurantId, deviceId: getDeviceId(), batch: payload }),
+      timeout: 15_000,
+    });
+    if (res.ok) {
+      const result = await res.json() as { accepted: number[] };
+      console.log(`[DB] Salvage sync: ${result.accepted.length} orders pushed to cloud`);
+    }
+  } catch (err) {
+    console.warn("[DB] Salvage sync failed (non-blocking):", err);
+  }
+}
 
 export function getDb(): Database {
   if (db) return db;
@@ -49,6 +116,23 @@ export function getDb(): Database {
 
   if ((onDiskVersion !== 0 && onDiskVersion !== CURRENT_SCHEMA_VERSION) || hasPreVersioningTables) {
     console.warn(`[DB] Schema version mismatch: on-disk=${onDiskVersion}, expected=${CURRENT_SCHEMA_VERSION}${hasPreVersioningTables ? ' (pre-versioning DB detected)' : ''}. Rebuilding fresh DB.`);
+
+    // ── Backup before rebuild (VACUUM INTO) ──────────────────────────────────
+    try {
+      const backupDir = join(dirname(getDbPath()), "backups");
+      mkdirSync(backupDir, { recursive: true });
+      const backupFile = join(backupDir, `edge-pre-migrate-${Date.now()}.db`);
+      db.query(`VACUUM INTO '${backupFile}'`).run();
+      console.log(`[DB] Pre-migration backup created: ${backupFile}`);
+    } catch (backupErr) {
+      console.warn("[DB] Pre-migration backup failed (non-fatal):", backupErr);
+    }
+
+    // ── Salvage sync: push unsynced orders to cloud before wiping ────────────
+    attemptSyncBeforeMigrate(db).catch(e => {
+      console.warn("[DB] Salvage sync error (non-blocking):", e);
+    });
+
     const dbPath = getDbPath();
     db.close();
     db = null;

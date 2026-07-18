@@ -39,7 +39,7 @@
 
 import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enqueueSync, getRecoveryStatus } from "./db.ts";
 import os from "os";
-import { runDailyMaintenance } from "./backup.ts";
+import { runDailyMaintenance, runPeriodicBackup } from "./backup.ts";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { downloadFullConfig, pullIncrementalChanges } from "./config.ts";
 import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge } from "./orderService.ts";
@@ -48,6 +48,7 @@ import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDe
 import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode } from "./socketSync.ts";
 import { acquireInstanceLock, startHeartbeatLoop, stopHeartbeatLoop, releaseInstanceLock, forceReleaseLock, getLockStatus } from "./instanceLock.ts";
 import { cloudFetch } from "./cloudFetch.ts";
+import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount } from "./lanBroadcast.ts";
 
 const PORT = parseInt(process.env.EDGE_PORT || "3101", 10);
 let startupState: "starting" | "ready" | "error" = "starting";
@@ -528,6 +529,12 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       cashTipAmount: body.cashTipAmount,
       cardTipAmount: body.cardTipAmount,
       discountPercent: body.discountPercent,
+      subtotal: body.subtotal,
+      discountAmount: body.discountAmount,
+      cgst: body.cgst,
+      sgst: body.sgst,
+      grandTotal: body.grandTotal,
+      roundOff: body.roundOff,
       localTxnId: body.localTxnId,
       requestId: body.requestId,
     });
@@ -1032,6 +1039,11 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   if (url.pathname === "/api/edge/sync/socket" && req.method === "GET") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     return jsonResponse(getSocketStatus());
+  }
+
+  // ── GET /api/edge/lan/status — LAN WebSocket client count (Bug 2) ─────────
+  if (url.pathname === "/api/edge/lan/status" && req.method === "GET") {
+    return jsonResponse({ connectedClients: getLanClientCount() });
   }
 
   // ── POST /api/edge/onboard — 4-step offline onboarding ─────────────────────
@@ -1569,13 +1581,60 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   return errorResponse("Not found", 404);
 }
 
+// ── Global crash guards ──────────────────────────────────────────────────────
+// Bun's default behavior is to exit on uncaught exceptions and unhandled promise
+// rejections. In a long-running edge server, a transient error in the sync worker,
+// socket reconnect, or maintenance interval must NOT kill the process — the cashier
+// depends on it being alive. These handlers log and swallow the error so the HTTP
+// server keeps serving requests. The Tauri-side watchdog (main.rs) handles the
+// case where the process truly dies (segfault, OOM, etc.).
+
+process.on("uncaughtException", (err: any) => {
+  console.error("[EdgeServer] UNCAUGHT EXCEPTION (survived):", err?.stack || err);
+});
+
+process.on("unhandledRejection", (reason: any) => {
+  console.error("[EdgeServer] UNHANDLED REJECTION (survived):", reason?.stack || reason);
+});
+
 // ── Start server ──────────────────────────────────────────────────────────────
 
 const server = Bun.serve({
   port: PORT,
   hostname: "0.0.0.0", // Listen on all interfaces for LAN access
-  async fetch(req) {
+  websocket: {
+    open(ws) {
+      registerClient(ws);
+    },
+    message(ws, message) {
+      // We don't expect client messages — but acknowledge ping for keepalive
+      try {
+        const data = JSON.parse(message.toString());
+        if (data.type === "ping") {
+          ws.send(JSON.stringify({ type: "pong", ts: Date.now() }));
+        }
+      } catch {
+        // Ignore non-JSON messages
+      }
+    },
+    close(ws) {
+      unregisterClient(ws);
+    },
+    drain(ws) {
+      // Backpressure relief — nothing to do for small event payloads
+    },
+  },
+  async fetch(req, server) {
     const url = new URL(req.url);
+
+    // ── WebSocket upgrade for LAN real-time events (Bug 2 fix) ────────────────
+    if (url.pathname === "/ws" && req.method === "GET") {
+      if (server.upgrade(req)) {
+        return; // upgrade succeeded — Bun will call websocket.open
+      }
+      return errorResponse("WebSocket upgrade failed", 400);
+    }
+
     try {
       return await handleRequest(req, url);
     } catch (err: any) {
@@ -1587,6 +1646,10 @@ const server = Bun.serve({
 
 console.log(`[EdgeServer] SoftShape Edge Server running on http://0.0.0.0:${server.port}`);
 console.log(`[EdgeServer] Health check: http://localhost:${server.port}/health`);
+console.log(`[EdgeServer] WebSocket: ws://0.0.0.0:${server.port}/ws`);
+
+// Initialize LAN broadcast layer
+initLanBroadcast();
 
 // ── Startup maintenance: backup + prune ──────────────────────────────────────
 setTimeout(() => {
@@ -1617,6 +1680,11 @@ setTimeout(() => {
 setInterval(() => {
   try { runDailyMaintenance(getDb()); } catch (err) { console.warn("[EdgeServer] Scheduled maintenance failed:", err); }
 }, 24 * 60 * 60 * 1000);
+
+// Run periodic backup every 30 minutes (reduces data loss window)
+setInterval(() => {
+  try { runPeriodicBackup(getDb()); } catch (err) { console.warn("[EdgeServer] Periodic backup failed:", err); }
+}, 30 * 60 * 1000);
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 

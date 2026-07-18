@@ -14,6 +14,7 @@
 import { getDb, getNextKotNumber, enqueueSync, getKolkataDateString } from "./db.ts";
 import { buildFoodKOT, buildLiquorKOT, buildCancelKOT, buildBill, type PrintItem, type OrderData } from "./escpos.ts";
 import { printToPrinter, printGrouped, resolvePrinterName } from "./printer.ts";
+import { lanBroadcast } from "./lanBroadcast.ts";
 
 // ─── Shared KOT print group builder ─────────────────────────────────────────
 // Consolidates the KOT grouping logic used by both createOrder and updateOrderItems.
@@ -91,6 +92,57 @@ function buildKotPrintGroups(
 // ─── Active order statuses ───────────────────────────────────────────────────
 
 const ACTIVE_ORDER_STATUSES = ["PENDING", "CONFIRMED", "PREPARING", "READY", "BILLING_REQUESTED"];
+
+// ─── Server-side price resolution (Bug 1 fix) ───────────────────────────────
+// Mirrors the cloud buildVenuePriceMap: resolves the venue's price profile
+// from local SQLite and returns a map of menuItemId → resolved price.
+// Falls back to menu_item.base_price, then default variant price.
+
+function buildEdgePriceMap(venueId: string | null | undefined, restaurantId: string): Map<string, number> {
+  const db = getDb();
+  const priceMap = new Map<string, number>();
+
+  if (!venueId) return priceMap;
+
+  // 1. Look up venue → priceProfileId
+  const venue = db.query("SELECT price_profile_id FROM venue WHERE id = ?").get(venueId) as any;
+  if (!venue?.price_profile_id) return priceMap;
+
+  // 2. Load all price profile items for this profile
+  const profileItems = db.query("SELECT menu_item_id, price FROM price_profile_item WHERE price_profile_id = ?").all(venue.price_profile_id) as any[];
+  for (const pi of profileItems) {
+    priceMap.set(pi.menu_item_id, Number(pi.price));
+  }
+
+  return priceMap;
+}
+
+// Resolve a single item's price: priceMap → base_price → default variant price → client fallback
+function resolveItemPrice(
+  menuItemId: string,
+  priceMap: Map<string, number>,
+  menuItemMap: Map<string, any>,
+  clientPrice: number,
+): number {
+  const resolved = priceMap.get(menuItemId);
+  if (resolved != null && resolved > 0) return resolved;
+
+  const mi = menuItemMap.get(menuItemId);
+  if (mi) {
+    const base = Number(mi.base_price ?? 0);
+    if (base > 0) return base;
+  }
+
+  // Try default variant
+  if (mi) {
+    const db = getDb();
+    const variant = db.query("SELECT price FROM menu_item_variant WHERE menu_item_id = ? AND is_default = 1 LIMIT 1").get(menuItemId) as any;
+    if (variant && Number(variant.price) > 0) return Number(variant.price);
+  }
+
+  // Last resort: client-sent price (already validated as >= 0)
+  return Number(clientPrice);
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -289,8 +341,17 @@ export async function createOrder(
   const menuItemIds = items.map((i) => i.menuItemId).filter(Boolean);
   const menuItemMap = getMenuItemsWithCategories(menuItemIds);
 
-  // ── Calculate total ────────────────────────────────────────────────────────
-  const totalAmount = items.reduce((sum, i) => sum + Number(i.price) * i.quantity, 0);
+  // ── Server-side price resolution (Bug 1 fix) ──────────────────────────────
+  // Never trust client-sent prices — resolve from local SQLite price profiles.
+  const venueId = table.venue_id ?? null;
+  const priceMap = buildEdgePriceMap(venueId, restaurantId);
+  const resolvedItems = items.map((i) => ({
+    ...i,
+    price: resolveItemPrice(i.menuItemId, priceMap, menuItemMap, Number(i.price)),
+  }));
+
+  // ── Calculate total using resolved prices ───────────────────────────────────
+  const totalAmount = resolvedItems.reduce((sum, i) => sum + Number(i.price) * i.quantity, 0);
 
   // ── Generate IDs ───────────────────────────────────────────────────────────
   const orderId = crypto.randomUUID();
@@ -306,8 +367,8 @@ export async function createOrder(
       VALUES (?, ?, ?, 'PREPARING', ?, ?, ?, ?, ?, ?, ?, 0)
     `).run(orderId, tableId, restaurantId, totalAmount, captainId || null, platform || "DINE_IN", createdByUserId || null, requestId || null, now, now);
 
-    // 2. Create order items
-    for (const item of items) {
+    // 2. Create order items (using resolved prices)
+    for (const item of resolvedItems) {
       const orderItemId = crypto.randomUUID();
       db.query(`INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, notes, menu_type, cloud_synced)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
@@ -341,7 +402,7 @@ export async function createOrder(
       currentHistory = [];
     }
     // Map by index to handle duplicate menuItemIds correctly
-    const kotEntry = buildKotHistoryEntry(kotNumber, items.map((i, idx) => ({ ...i, orderItemId: orderItems[idx]?.id })));
+    const kotEntry = buildKotHistoryEntry(kotNumber, resolvedItems.map((i, idx) => ({ ...i, orderItemId: orderItems[idx]?.id })));
     currentHistory.push(kotEntry);
     db.query(`UPDATE "table" SET kot_history = ? WHERE id = ?`).run(JSON.stringify(currentHistory), tableId);
 
@@ -367,9 +428,9 @@ export async function createOrder(
   const sectionName = table.section_name || "Main Hall";
   const sectionTag = table.section_tag;
 
-  // Resolve printer for each item
+  // Resolve printer for each item (using resolved prices)
   const printerConfig = outlet.printerConfig || {};
-  const mappedItems = items.map((i) => {
+  const mappedItems = resolvedItems.map((i) => {
     const cat = menuItemMap.get(i.menuItemId) || {};
     const resolvedPrinterName = resolvePrinterName(
       cat.printer_name || null,
@@ -407,6 +468,10 @@ export async function createOrder(
 
   // ── Print all groups (synchronous — before HTTP response returns) ──────────
   const printResults = await printGrouped(printGroups);
+
+  // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
+  lanBroadcast("order:created", { order: { id: orderId, tableId, kotNumber, totalAmount }, tableId, requestId });
+  lanBroadcast("table:updated", { table: { id: tableId, status: "OCCUPIED", workflowStatus: "Preparing" }, tableId, requestId });
 
   // ── Return result ──────────────────────────────────────────────────────────
   const updatedTable = db.query(`
@@ -540,8 +605,16 @@ export async function updateOrderItems(
   const menuItemIds = items.map((i) => i.menuItemId).filter(Boolean);
   const menuItemMap = getMenuItemsWithCategories(menuItemIds);
 
-  // ── Calculate additional total ──────────────────────────────────────────────
-  const additionalAmount = items.reduce((sum, i) => sum + Number(i.price) * i.quantity, 0);
+  // ── Server-side price resolution (Bug 1 fix) ──────────────────────────────
+  const venueId = table.venue_id ?? null;
+  const priceMap = buildEdgePriceMap(venueId, restaurantId);
+  const resolvedItems = items.map((i) => ({
+    ...i,
+    price: resolveItemPrice(i.menuItemId, priceMap, menuItemMap, Number(i.price)),
+  }));
+
+  // ── Calculate additional total using resolved prices ──────────────────────────
+  const additionalAmount = resolvedItems.reduce((sum, i) => sum + Number(i.price) * i.quantity, 0);
 
   // ── Generate new KOT for just the new items ─────────────────────────────────
   const kotId = crypto.randomUUID();
@@ -553,8 +626,8 @@ export async function updateOrderItems(
 
     const newOrderItemIds: string[] = [];
 
-    // 1. Insert new order items
-    for (const item of items) {
+    // 1. Insert new order items (using resolved prices)
+    for (const item of resolvedItems) {
       const orderItemId = crypto.randomUUID();
       newOrderItemIds.push(orderItemId);
       db.query(`INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, notes, menu_type, cloud_synced)
@@ -567,12 +640,12 @@ export async function updateOrderItems(
       VALUES (?, ?, ?, ?, ?, ?, 0)
     `).run(kotId, restaurantId, tableId, orderId, kotNumber, now);
 
-    // 3. Create KOT items for just the new items
-    for (let i = 0; i < items.length; i++) {
+    // 3. Create KOT items for just the new items (using resolved prices)
+    for (let i = 0; i < resolvedItems.length; i++) {
       const kotItemId = crypto.randomUUID();
       db.query(`INSERT INTO kot_item (id, kot_id, order_item_id, menu_item_id, name, quantity, price, notes, status, created_at, cloud_synced)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'SENT', ?, 0)
-      `).run(kotItemId, kotId, newOrderItemIds[i], items[i].menuItemId, items[i].name, items[i].quantity, Number(items[i].price), items[i].notes || null, now);
+      `).run(kotItemId, kotId, newOrderItemIds[i], resolvedItems[i].menuItemId, resolvedItems[i].name, resolvedItems[i].quantity, Number(resolvedItems[i].price), resolvedItems[i].notes || null, now);
     }
 
     // 4. Bump order total + update timestamp
@@ -592,7 +665,7 @@ export async function updateOrderItems(
     } catch {
       currentHistory = [];
     }
-    const kotEntry = buildKotHistoryEntry(kotNumber, items.map((i, idx) => ({ ...i, orderItemId: newOrderItemIds[idx] })));
+    const kotEntry = buildKotHistoryEntry(kotNumber, resolvedItems.map((i, idx) => ({ ...i, orderItemId: newOrderItemIds[idx] })));
     currentHistory.push(kotEntry);
     db.query(`UPDATE "table" SET kot_history = ? WHERE id = ?`).run(JSON.stringify(currentHistory), tableId);
 
@@ -621,7 +694,7 @@ export async function updateOrderItems(
   const sectionTag = table.section_tag;
   const printerConfig = outlet.printerConfig || {};
 
-  const mappedItems = items.map((i) => {
+  const mappedItems = resolvedItems.map((i) => {
     const cat = menuItemMap.get(i.menuItemId) || {};
     const resolvedPrinterName = resolvePrinterName(
       cat.printer_name || null,
@@ -659,6 +732,10 @@ export async function updateOrderItems(
 
   // ── Print all groups ────────────────────────────────────────────────────────
   const printResults = await printGrouped(printGroups);
+
+  // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
+  lanBroadcast("order:updated", { orderId, tableId, kotNumber, requestId });
+  lanBroadcast("table:updated", { table: { id: tableId }, tableId, requestId });
 
   // ── Return result ──────────────────────────────────────────────────────────
   const updatedTable = db.query(`
@@ -972,6 +1049,10 @@ export async function requestBillingEdge(
 
   tx();
 
+  // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
+  lanBroadcast("order:updated", { orderId, status: "BILLING_REQUESTED" });
+  lanBroadcast("table:updated", { table: { id: order.table_id, workflowStatus: "Waiting Bill" }, tableId: order.table_id });
+
   return { success: true, order: { id: orderId, status: "BILLING_REQUESTED" } };
 }
 
@@ -1087,6 +1168,12 @@ export interface SettleOrderInput {
   cashTipAmount?: number;
   cardTipAmount?: number;
   discountPercent?: number;
+  subtotal?: number;
+  discountAmount?: number;
+  cgst?: number;
+  sgst?: number;
+  grandTotal?: number;
+  roundOff?: number;
   localTxnId?: string;
   requestId?: string;
 }
@@ -1131,6 +1218,12 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
         cashTipAmount: input.cashTipAmount,
         cardTipAmount: input.cardTipAmount,
         discountPercent: input.discountPercent,
+        subtotal: input.subtotal,
+        discountAmount: input.discountAmount,
+        cgst: input.cgst,
+        sgst: input.sgst,
+        grandTotal: input.grandTotal,
+        roundOff: input.roundOff,
         localTxnId,
         requestId,
         settledAt: now,
@@ -1156,6 +1249,10 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
 
   const updatedOrder = db.query("SELECT * FROM order_record WHERE id = ?").get(orderId) as any;
   const updatedTable = db.query(`SELECT t.*, s.name as section_name FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?`).get(order.table_id) as any;
+
+  // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
+  lanBroadcast("order:settled", { orderId, tableId: order.table_id, requestId });
+  lanBroadcast("table:updated", { table: { id: order.table_id, status: "AVAILABLE", workflowStatus: "Free" }, tableId: order.table_id });
 
   return {
     success: true,
@@ -1209,6 +1306,10 @@ export async function swapTableEdge(
 
   const updatedSource = db.query(`SELECT t.*, s.name as section_name FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?`).get(sourceTableId) as any;
   const updatedTarget = db.query(`SELECT t.*, s.name as section_name FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?`).get(targetTableId) as any;
+
+  // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
+  lanBroadcast("table:updated", { table: { id: sourceTableId }, tableId: sourceTableId });
+  lanBroadcast("table:updated", { table: { id: targetTableId }, tableId: targetTableId });
 
   return {
     success: true,
@@ -1301,6 +1402,10 @@ export async function transferItemsEdge(
   const updatedSource = db.query(`SELECT t.*, s.name as section_name FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?`).get(sourceTableId) as any;
   const updatedTarget = db.query(`SELECT t.*, s.name as section_name FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?`).get(targetTableId) as any;
 
+  // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
+  lanBroadcast("table:updated", { table: { id: sourceTableId }, tableId: sourceTableId });
+  lanBroadcast("table:updated", { table: { id: targetTableId }, tableId: targetTableId });
+
   return {
     success: true,
     sourceTable: { ...updatedSource, kot_history: safeParseKotHistory(updatedSource.kot_history) },
@@ -1314,7 +1419,7 @@ export async function editBillEdge(
   restaurantId: string,
   orderId: string,
   edits: { removedItemIds?: string[]; editQuantities?: Record<string, number>; addedItems?: any[]; editedBy?: string },
-): Promise<{ success: boolean; error?: string; order?: any }> {
+): Promise<{ success: boolean; error?: string; order?: any; printResults?: any[] }> {
   const db = getDb();
   const { removedItemIds, editQuantities, addedItems, editedBy } = edits;
 
@@ -1322,6 +1427,30 @@ export async function editBillEdge(
   if (!order) {
     return { success: false, error: "Order not found" };
   }
+
+  // ── Bug 1: Resolve prices for added items server-side ──────────────────────
+  let resolvedAddedItems: any[] = [];
+  let addedMenuItemMap = new Map<string, any>();
+  if (addedItems && addedItems.length > 0) {
+    const table = getTableWithSection(order.table_id);
+    const addedMenuItemIds = addedItems.map((i) => i.menuItemId || i.id).filter(Boolean);
+    addedMenuItemMap = getMenuItemsWithCategories(addedMenuItemIds);
+    const venueId = table?.venue_id ?? null;
+    const priceMap = buildEdgePriceMap(venueId, restaurantId);
+    resolvedAddedItems = addedItems.map((i) => {
+      const miId = i.menuItemId || i.id;
+      return {
+        ...i,
+        menuItemId: miId,
+        price: resolveItemPrice(miId, priceMap, addedMenuItemMap, Number(i.price)),
+      };
+    });
+  }
+
+  // Track new order item IDs for post-tx KOT printing (Bug 3)
+  const addedOrderItemIds: string[] = [];
+  let addedKotId: string | null = null;
+  let addedKotNumber: number | null = null;
 
   const now = Date.now();
   const tx = db.transaction(() => {
@@ -1357,18 +1486,46 @@ export async function editBillEdge(
       }
     }
 
-    // Add new items
-    if (addedItems && addedItems.length > 0) {
-      for (const item of addedItems) {
+    // Add new items (Bug 1: using resolved prices; Bug 3: create KOT + KOT items)
+    if (resolvedAddedItems.length > 0) {
+      // Bug 3: Generate a new KOT for the cashier-added items
+      addedKotId = crypto.randomUUID();
+      addedKotNumber = getNextKotNumber(restaurantId);
+      db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, created_at, cloud_synced)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
+      `).run(addedKotId, restaurantId, order.table_id, orderId, addedKotNumber, now);
+
+      for (const item of resolvedAddedItems) {
         const newItemId = crypto.randomUUID();
+        addedOrderItemIds.push(newItemId);
         const itemTotal = Number(item.price) * (item.quantity || 1);
         billDelta += itemTotal;
         db.query("INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, notes, menu_type, added_by_cashier, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0)")
           .run(newItemId, orderId, item.menuItemId || item.id || null, item.name, Number(item.price), item.quantity || 1, item.notes || null, item.menuType || "FOOD");
+
+        // Bug 3: Create KOT item for this added item
+        const kotItemId = crypto.randomUUID();
+        db.query(`INSERT INTO kot_item (id, kot_id, order_item_id, menu_item_id, name, quantity, price, notes, status, created_at, cloud_synced)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'SENT', ?, 0)
+        `).run(kotItemId, addedKotId, newItemId, item.menuItemId || item.id || null, item.name, item.quantity || 1, Number(item.price), item.notes || null, now);
+
         db.query("UPDATE order_record SET total_amount = total_amount + ?, updated_at = ? WHERE id = ?")
           .run(itemTotal, now, orderId);
         enqueueSync("order_item", newItemId, "insert");
       }
+
+      // Bug 3: Update KOT history on table
+      const tableRow = db.query(`SELECT kot_history FROM "table" WHERE id = ?`).get(order.table_id) as any;
+      let currentHistory: any[] = [];
+      try {
+        currentHistory = JSON.parse(tableRow?.kot_history || "[]") as any[];
+        if (!Array.isArray(currentHistory)) currentHistory = [];
+      } catch { currentHistory = []; }
+      const kotEntry = buildKotHistoryEntry(addedKotNumber, resolvedAddedItems.map((i, idx) => ({ ...i, orderItemId: addedOrderItemIds[idx] })));
+      currentHistory.push(kotEntry);
+      db.query(`UPDATE "table" SET kot_history = ? WHERE id = ?`).run(JSON.stringify(currentHistory), order.table_id);
+
+      enqueueSync("kot", addedKotId, "insert");
     }
 
     // Sync table current_bill with the net bill delta
@@ -1384,8 +1541,62 @@ export async function editBillEdge(
 
   tx();
 
+  // ── Bug 3: Print KOT for cashier-added items ────────────────────────────────
+  let printResults: any[] = [];
+  if (resolvedAddedItems.length > 0 && addedKotId && addedKotNumber != null) {
+    const table = getTableWithSection(order.table_id);
+    const outlet = getOutlet(restaurantId);
+    if (table && outlet) {
+      const printerConfig = outlet.printerConfig || {};
+      const mappedAddedItems = resolvedAddedItems.map((i) => {
+        const cat = addedMenuItemMap.get(i.menuItemId || i.id) || {};
+        const resolvedPrinterName = resolvePrinterName(
+          cat.printer_name || null,
+          cat.printer_target || null,
+          cat.category_printer_target || null,
+          printerConfig
+        );
+        return {
+          name: i.name,
+          quantity: i.quantity || 1,
+          price: Number(i.price),
+          notes: i.notes ?? null,
+          menuType: i.menuType || "FOOD",
+          printerName: resolvedPrinterName,
+          printerTarget: cat.printer_target || cat.category_printer_target,
+        } as EdgeKotItem;
+      });
+
+      const formattedTableNumber = formatTableNumber(table);
+      const kotOrderData: OrderData = {
+        tableNumber: formattedTableNumber,
+        orderId,
+        items: mappedAddedItems.map((i) => ({
+          name: i.name,
+          quantity: i.quantity,
+          price: Number(i.price),
+          notes: i.notes ?? null,
+          type: (i.menuType === "LIQUOR" ? "liquor" : "food") as "food" | "liquor",
+        })),
+        restaurantName: outlet.receipt_header || outlet.name,
+        kotId: String(addedKotNumber),
+        sectionName: table.section_name || "Main Hall",
+        captainName: editedBy || "Cashier",
+        orderByRole: "CASHIER",
+        sectionTag: table.section_tag || undefined,
+      };
+
+      const printGroups = buildKotPrintGroups(mappedAddedItems, kotOrderData, table, printerConfig);
+      printResults = await printGrouped(printGroups);
+    }
+  }
+
+  // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
+  lanBroadcast("order:updated", { orderId, tableId: order.table_id, addedItems: resolvedAddedItems.length });
+  lanBroadcast("table:updated", { table: { id: order.table_id }, tableId: order.table_id });
+
   const updatedOrder = db.query("SELECT * FROM order_record WHERE id = ?").get(orderId) as any;
-  return { success: true, order: updatedOrder };
+  return { success: true, order: updatedOrder, printResults };
 }
 
 // ─── Confirm Payment (record payment for a settled order) ─────────────────────
@@ -1448,6 +1659,9 @@ export async function updateOrderStatusEdge(
   tx();
 
   const updatedOrder = db.query("SELECT * FROM order_record WHERE id = ?").get(orderId) as any;
+  // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
+  lanBroadcast("order:updated", { orderId, status: updatedOrder?.status });
+  lanBroadcast("table:updated", { table: { id: order.table_id }, tableId: order.table_id });
   return { success: true, order: updatedOrder };
 }
 
@@ -1609,14 +1823,14 @@ export async function listTransactionsEdge(
       txnNumber: null,
       billNumber: order.bill_number || null,
       paidAt: order.paid_at ? new Date(order.paid_at).toISOString() : new Date(order.created_at).toISOString(),
-      amount: Number(order.total_amount ?? 0),
-      grandTotal: Number(order.total_amount ?? 0),
-      subtotal: Number(order.total_amount ?? 0),
+      amount: Number(paymentData.grandTotal ?? order.total_amount ?? 0),
+      grandTotal: Number(paymentData.grandTotal ?? order.total_amount ?? 0),
+      subtotal: Number(paymentData.subtotal ?? order.total_amount ?? 0),
       discountPercent: Number(paymentData.discountPercent ?? 0),
-      discountAmount: 0,
-      cgst: 0,
-      sgst: 0,
-      roundOff: 0,
+      discountAmount: Number(paymentData.discountAmount ?? 0),
+      cgst: Number(paymentData.cgst ?? 0),
+      sgst: Number(paymentData.sgst ?? 0),
+      roundOff: Number(paymentData.roundOff ?? 0),
       tipAmount: Number(paymentData.tipAmount ?? 0),
       itemCount: items.length,
       items: items.map(i => ({ name: i.name, quantity: i.quantity, price: i.price })),

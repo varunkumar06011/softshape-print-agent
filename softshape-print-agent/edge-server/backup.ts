@@ -18,6 +18,43 @@ const ORDER_RETENTION_DAYS = 90;
 
 let lastBackupDate = "";
 
+// ── Periodic backup (every 30 minutes) ───────────────────────────────────────
+// Creates a VACUUM INTO backup without the full maintenance prune.
+// Reduces the data loss window from 24h to 30min in case of DB corruption.
+
+let lastPeriodicBackupAt = 0;
+const PERIODIC_BACKUP_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+const MAX_PERIODIC_BACKUPS = 48; // 48 × 30min = 24h of periodic backups
+
+export function runPeriodicBackup(db: Database): void {
+  const now = Date.now();
+  if (now - lastPeriodicBackupAt < PERIODIC_BACKUP_INTERVAL_MS) return;
+  lastPeriodicBackupAt = now;
+
+  try {
+    if (!existsSync(BACKUP_DIR)) {
+      mkdirSync(BACKUP_DIR, { recursive: true });
+    }
+    const backupPath = join(BACKUP_DIR, `edge-periodic-${now}.db`);
+    db.query(`VACUUM INTO '${backupPath}'`).run();
+    console.log(`[Backup] Periodic backup created: ${backupPath}`);
+
+    // Prune old periodic backups (keep only the most recent MAX_PERIODIC_BACKUPS)
+    const periodicFiles = readdirSync(BACKUP_DIR)
+      .filter(f => f.startsWith("edge-periodic-") && f.endsWith(".db"))
+      .map(f => ({ name: f, path: join(BACKUP_DIR, f), mtime: 0 }))
+      .sort((a, b) => b.name.localeCompare(a.name)); // newest first (timestamp in name)
+
+    for (let i = 0; i < periodicFiles.length; i++) {
+      if (i >= MAX_PERIODIC_BACKUPS) {
+        try { unlinkSync(periodicFiles[i].path); } catch { /* skip */ }
+      }
+    }
+  } catch (err) {
+    console.warn("[Backup] Periodic backup failed (non-fatal):", err);
+  }
+}
+
 export function runDailyMaintenance(db: Database): void {
   const today = new Date().toISOString().slice(0, 10);
   if (today === lastBackupDate) return;
