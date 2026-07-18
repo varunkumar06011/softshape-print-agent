@@ -197,10 +197,7 @@ export function resolvePrinterName(
   }
   if (legacyTarget === "BILL_PRINTER") {
     return normalized.find((p) => p.type === "BILL")?.name
-      || normalized.find((p) => p.nameLower.includes("bill"))?.name
-      || normalized.find((p) => p.type === "KITCHEN")?.name
-      || normalized.find((p) => p.nameLower.includes("kitchen"))?.name
-      || normalized.find((p) => p.type === "KOT")?.name;
+      || normalized.find((p) => p.nameLower.includes("bill"))?.name;
   }
 
   return undefined;

@@ -340,6 +340,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       platform: body.platform,
       requestId: body.requestId,
       orderByRole: body.orderByRole,
+      localPrinted: body.localPrinted || false,
+      kotEventIds: body.kotEventIds || null,
     });
 
     if (!result.success) {
@@ -375,6 +377,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       platform: body.platform,
       requestId: body.requestId,
       orderByRole: body.orderByRole,
+      localPrinted: body.localPrinted || false,
+      kotEventIds: body.kotEventIds || null,
     });
 
     if (!result.success) {
@@ -404,6 +408,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       cancelledBy: body.cancelledBy || "Staff",
       tableNumber: body.tableNumber,
       requestId: body.requestId,
+      localPrinted: body.localPrinted || false,
     });
 
     if (!result.success) {
@@ -433,6 +438,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         cancelledBy: body.cancelledBy || "Staff",
         tableNumber: body.tableNumber,
         requestId: body.requestId,
+        localPrinted: body.localPrinted || false,
       });
       results.push({ orderItemId: item.orderItemId, success: result.success, error: result.error });
     }
