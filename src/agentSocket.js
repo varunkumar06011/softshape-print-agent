@@ -40,7 +40,8 @@ let _cachedLanIp = null;
 async function getLanIp() {
   if (_cachedLanIp) return _cachedLanIp;
   try {
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    // No ICE servers — only gather host candidates (LAN IPs), not public IPs via STUN
+    const pc = new RTCPeerConnection({ iceServers: [] });
     pc.createDataChannel('');
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
