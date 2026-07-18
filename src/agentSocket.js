@@ -482,7 +482,7 @@ export async function handlePrintJob(envelope) {
   if (!targetPrinter) {
     if (type === "KOT") targetPrinter = printerMapping.kitchen;
     else if (type === "BAR_KOT") targetPrinter = printerMapping.bar;
-    else if (type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "BILL" || type === "VOUCHER" || type === "EXPENDITURE") targetPrinter = printerMapping.bill;
+    else if (type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "BILL" || type === "VOUCHER" || type === "EXPENDITURE") targetPrinter = printerMapping.bill || printerMapping.kitchen;
     else if (type === "CANCEL_KOT" || type === "CANCEL_ORDER") {
       // Route cancel slips to the correct printer based on the cancelled item's type
       const cancelItem = data?.item || data?.items?.[0];
