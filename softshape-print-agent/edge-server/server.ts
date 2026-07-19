@@ -179,10 +179,9 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return jsonResponse({ ok: false, error: "Missing jobType or type" }, 400);
     }
 
-    const targetPrinter = printerName || data?.printerName;
-    if (!targetPrinter) {
-      return jsonResponse({ ok: false, error: "Missing printerName" }, 400);
-    }
+    const targetPrinter = printerName || data?.printerName || null;
+    // Don't reject if printerName is missing — the Tauri frontend will resolve
+    // it from its local printer mapping (kitchen/bar/bill dropdowns).
 
     // Normalize ESC/POS data to the format the Tauri frontend expects
     let normalizedEscpos = escposData;
@@ -215,7 +214,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     });
 
     // Wait for print_ack from Tauri frontend (with 10s timeout)
-    const ack = await waitForPrintAck(printEventId, 10000);
+    const ack = await waitForPrintAck(printEventId, 20000);
     if (ack.ok) {
       console.log(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} ✓ (${clientCount} client(s))`);
       return jsonResponse({ ok: true, queued: false, clients: clientCount });

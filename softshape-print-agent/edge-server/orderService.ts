@@ -24,12 +24,12 @@ import { lanBroadcast, getLanClientCount, waitForPrintAck } from "./lanBroadcast
 // If no clients are connected, returns ok:false so the caller can fall back.
 
 interface PrintGroup {
-  printerName: string;
+  printerName: string | null;
   escposData: any[];
   type: string;
 }
 
-const PRINT_ACK_TIMEOUT_MS = 10000;
+const PRINT_ACK_TIMEOUT_MS = 20000;
 
 async function printWithLanFallback(
   groups: PrintGroup[],
@@ -41,13 +41,13 @@ async function printWithLanFallback(
 
   for (let i = 0; i < groups.length; i++) {
     const group = groups[i];
-    if (!group.printerName || group.escposData.length === 0) {
-      results.push({ ok: false, printerName: group.printerName || "unknown", bytes: 0, error: "No printer or data", method: "noop" });
+    if (group.escposData.length === 0) {
+      results.push({ ok: false, printerName: group.printerName || "unknown", bytes: 0, error: "No print data", method: "noop" });
       continue;
     }
     if (clientCount === 0) {
-      console.warn(`[Print] No LAN WebSocket clients — print_job for ${group.type} → ${group.printerName} will be lost`);
-      results.push({ ok: false, printerName: group.printerName, bytes: 0, error: "No LAN WebSocket clients connected", method: "lan_ws" });
+      console.warn(`[Print] No LAN WebSocket clients — print_job for ${group.type} → ${group.printerName || "(auto)"} will be lost`);
+      results.push({ ok: false, printerName: group.printerName || null, bytes: 0, error: "No LAN WebSocket clients connected", method: "lan_ws" });
       continue;
     }
 
@@ -55,7 +55,7 @@ async function printWithLanFallback(
     lanBroadcast("print_job", {
       type: group.type,
       data: {
-        printerName: group.printerName,
+        printerName: group.printerName || null,
         escposData: group.escposData,
         requestId: requestId || null,
       },
@@ -87,13 +87,13 @@ async function printWithLanFallback(
 }
 
 async function printSingleWithLanFallback(
-  printerName: string,
+  printerName: string | null,
   escposData: any[],
   type: string,
   requestId?: string,
 ): Promise<any> {
   if (getLanClientCount() === 0) {
-    console.warn(`[Print] No LAN WebSocket clients — print_job for ${type} → ${printerName} will be lost`);
+    console.warn(`[Print] No LAN WebSocket clients — print_job for ${type} → ${printerName || "(auto)"} will be lost`);
     return { ok: false, printerName, bytes: 0, error: "No LAN WebSocket clients connected", method: "lan_ws" };
   }
 
@@ -101,7 +101,7 @@ async function printSingleWithLanFallback(
   lanBroadcast("print_job", {
     type,
     data: {
-      printerName,
+      printerName: printerName || null,
       escposData,
       requestId: requestId || null,
     },
@@ -132,15 +132,15 @@ function buildKotPrintGroups(
   kotOrderData: OrderData,
   table: any,
   printerConfig: Record<string, any>,
-): Array<{ printerName: string; escposData: any[]; type: string }> {
-  const groupedByPrinter = new Map<string | undefined, EdgeKotItem[]>();
+): Array<{ printerName: string | null; escposData: any[]; type: string }> {
+  const groupedByPrinter = new Map<string | null | undefined, EdgeKotItem[]>();
   for (const item of mappedItems) {
     const key = item.printerName;
     if (!groupedByPrinter.has(key)) groupedByPrinter.set(key, []);
     groupedByPrinter.get(key)!.push(item);
   }
 
-  const printGroups: Array<{ printerName: string; escposData: any[]; type: string }> = [];
+  const printGroups: Array<{ printerName: string | null; escposData: any[]; type: string }> = [];
 
   for (const [printerName, groupItems] of groupedByPrinter) {
     if (!printerName) {
@@ -155,11 +155,8 @@ function buildKotPrintGroups(
         const escpos = buildFoodKOT({ ...kotOrderData, items: kitchenPrintItems });
         if (escpos.length > 0) {
           const fallbackPrinter = table.kot_printer_name || resolvePrinterName(null, "KOT_PRINTER", null, printerConfig);
-          if (fallbackPrinter) {
-            printGroups.push({ printerName: fallbackPrinter, escposData: escpos, type: "KOT" });
-          } else {
-            console.error(`[KOT] SILENT DROP: ${kitchenItems.length} kitchen items for table ${kotOrderData.tableNumber} — no KOT printer resolved (no item override, no category target, no KITCHEN-type printer in config)`);
-          }
+          // Don't drop if no fallback printer — Tauri frontend will resolve from its local mapping
+          printGroups.push({ printerName: fallbackPrinter || null, escposData: escpos, type: "KOT" });
         }
       }
       if (barItems.length > 0) {
@@ -169,11 +166,8 @@ function buildKotPrintGroups(
         const escpos = buildLiquorKOT({ ...kotOrderData, items: barPrintItems });
         if (escpos.length > 0) {
           const fallbackPrinter = resolvePrinterName(null, "BAR_PRINTER", null, printerConfig);
-          if (fallbackPrinter) {
-            printGroups.push({ printerName: fallbackPrinter, escposData: escpos, type: "BAR_KOT" });
-          } else {
-            console.error(`[KOT] SILENT DROP: ${barItems.length} bar items for table ${kotOrderData.tableNumber} — no BAR printer resolved (no item override, no category target, no BAR-type printer in config)`);
-          }
+          // Don't drop if no fallback printer — Tauri frontend will resolve from its local mapping
+          printGroups.push({ printerName: fallbackPrinter || null, escposData: escpos, type: "BAR_KOT" });
         }
       }
     } else {
@@ -1002,8 +996,8 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
   );
 
   let printResult: any = null;
-  if (printerName && !localPrinted) {
-    printResult = await printSingleWithLanFallback(printerName, escposData, "CANCEL_KOT");
+  if (!localPrinted) {
+    printResult = await printSingleWithLanFallback(printerName || null, escposData, "CANCEL_KOT");
   }
 
   return { success: true, printResult };
@@ -1069,7 +1063,7 @@ export async function reprintKot(input: ReprintKotInput): Promise<{ success: boo
   });
 
   // Group by printer and print (same logic as createOrder)
-  const groupedByPrinter = new Map<string | undefined, typeof printItems>();
+  const groupedByPrinter = new Map<string | null | undefined, typeof printItems>();
   for (const item of printItems) {
     const key = item.printerName;
     if (!groupedByPrinter.has(key)) groupedByPrinter.set(key, []);
@@ -1089,7 +1083,7 @@ export async function reprintKot(input: ReprintKotInput): Promise<{ success: boo
     sectionTag: sectionTag || undefined,
   };
 
-  const printGroups: Array<{ printerName: string; escposData: any[]; type: string }> = [];
+  const printGroups: Array<{ printerName: string | null; escposData: any[]; type: string }> = [];
 
   for (const [printerName, groupItems] of groupedByPrinter) {
     if (!printerName) {
@@ -1099,19 +1093,15 @@ export async function reprintKot(input: ReprintKotInput): Promise<{ success: boo
       if (kitchenItems.length > 0) {
         const escpos = buildFoodKOT({ ...kotOrderData, items: kitchenItems.map(i => ({ name: i.name, quantity: i.quantity, price: i.price, notes: i.notes ?? null, type: "food" as const })) });
         const fallback = table.kot_printer_name || resolvePrinterName(null, "KOT_PRINTER", null, printerConfig);
-        if (escpos.length > 0 && fallback) {
-          printGroups.push({ printerName: fallback, escposData: escpos, type: "KOT" });
-        } else if (escpos.length > 0 && !fallback) {
-          console.error(`[KOT reprint] SILENT DROP: ${kitchenItems.length} kitchen items for table ${kotOrderData.tableNumber} — no KOT printer resolved`);
+        if (escpos.length > 0) {
+          printGroups.push({ printerName: fallback || null, escposData: escpos, type: "KOT" });
         }
       }
       if (barItems.length > 0) {
         const escpos = buildLiquorKOT({ ...kotOrderData, items: barItems.map(i => ({ name: i.name, quantity: i.quantity, price: i.price, notes: i.notes ?? null, type: "liquor" as const })) });
         const fallback = resolvePrinterName(null, "BAR_PRINTER", null, printerConfig);
-        if (escpos.length > 0 && fallback) {
-          printGroups.push({ printerName: fallback, escposData: escpos, type: "BAR_KOT" });
-        } else if (escpos.length > 0 && !fallback) {
-          console.error(`[KOT reprint] SILENT DROP: ${barItems.length} bar items for table ${kotOrderData.tableNumber} — no BAR printer resolved`);
+        if (escpos.length > 0) {
+          printGroups.push({ printerName: fallback || null, escposData: escpos, type: "BAR_KOT" });
         }
       }
     } else {
@@ -1272,12 +1262,8 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
   const billPrinterName = table.bill_printer_name || resolvePrinterName(null, "BILL_PRINTER", null, printerConfig);
 
   let printResults: any[] = [];
-  if (billPrinterName) {
-    printResults = await printWithLanFallback([{ printerName: billPrinterName, escposData, type: "BILL" }]);
-  } else {
-    console.error(`[printBillEdge] SILENT DROP: Bill for order ${orderId} (table ${formattedTableNumber}) — no BILL printer resolved (no table.bill_printer_name, no BILL-type printer in config)`);
-    return { success: false, error: "No bill printer configured — cannot print bill", billNumber };
-  }
+  // Don't fail if no bill printer resolved — Tauri frontend will resolve from its local mapping
+  printResults = await printWithLanFallback([{ printerName: billPrinterName || null, escposData, type: "BILL" }]);
 
   return { success: true, billNumber, printResults };
 }

@@ -77,7 +77,7 @@ export function getLanClientCount(): number {
 
 const pendingPrintAcks = new Map<string, { resolve: (result: { ok: boolean; error?: string }) => void; timeout: any }>();
 
-export function waitForPrintAck(eventId: string, timeoutMs: number = 10000): Promise<{ ok: boolean; error?: string }> {
+export function waitForPrintAck(eventId: string, timeoutMs: number = 20000): Promise<{ ok: boolean; error?: string }> {
   return new Promise((resolve) => {
     const timeout = setTimeout(() => {
       if (pendingPrintAcks.delete(eventId)) {

@@ -20,15 +20,14 @@ import {
 } from "./agentSocket.js";
 
 // ── Edge server WebSocket for LAN print fallback ─────────────────────────────
-// The edge server (Bun, port 3101) and server.js (Node, port 3102) run as
-// separate processes without window.__TAURI__. When they can't print directly,
-// they broadcast print_job events via WebSocket. This Tauri frontend (which
-// HAS window.__TAURI__) connects to the edge server's /ws endpoint and prints
-// any received print_job events to the physical printer.
+// The edge server (Bun, port 3101) runs as a separate process without
+// window.__TAURI__. It broadcasts print_job events via WebSocket. This Tauri
+// frontend (which HAS window.__TAURI__) connects to the edge server's /ws
+// endpoint and prints any received print_job events to the physical printer.
 
 let edgeWs = null;
 let edgeWsReconnectTimer = null;
-const EDGE_WS_URL = `ws://${location.hostname || "localhost"}:3101/ws`;
+const EDGE_WS_URL = `ws://localhost:3101/ws`;
 
 const seenPrintEventIds = new Set();
 const SEEN_EVENT_IDS_MAX = 500;
@@ -160,16 +159,50 @@ async function doPrint(job) {
 }
 
 async function handleEdgePrintJob(envelope) {
-  const { type, data, eventId } = envelope;
+  // lanBroadcast wraps as: { type: "print_job", data: { type, data, eventId, ts }, ts }
+  // Unwrap the inner payload to get the actual print job fields.
+  const payload = envelope.data || envelope;
+  const { type, data, eventId } = payload;
+  if (!eventId) {
+    console.error(`[EdgeWS] print_job missing eventId — cannot track or ack`);
+    sendPrintAck(null, false, "Missing eventId in print_job");
+    return;
+  }
   if (!markEventSeen(eventId)) {
     console.log(`[EdgeWS] Duplicate print_job skipped: ${eventId}`);
     return;
   }
 
-  const targetPrinter = data?.printerName;
+  // Resolve printer: check local mapping first (this machine knows the physical printers),
+  // then fall back to the printerName sent by the Captain/edge server.
+  let targetPrinter = data?.printerName;
   if (!targetPrinter) {
-    console.error("[EdgeWS] No printerName in print_job:", type);
-    sendPrintAck(eventId, false, "No printerName in print_job");
+    try {
+      const stored = JSON.parse(localStorage.getItem("agent_printer_mapping") || "{}");
+      if (type === "KOT" || type === "CANCEL_KOT") targetPrinter = stored.kitchen;
+      else if (type === "BAR_KOT") targetPrinter = stored.bar;
+      else if (type === "BILL" || type === "FINAL_BILL") targetPrinter = stored.bill;
+      else if (type === "TABLE_SWAP") targetPrinter = stored.kitchen;
+      if (targetPrinter) {
+        console.log(`[EdgeWS] Resolved printer from local mapping: ${type} → ${targetPrinter}`);
+      }
+    } catch { /* ignore */ }
+  }
+
+  // Also check the DOM dropdowns as a fallback (they reflect the current UI selection)
+  if (!targetPrinter) {
+    if (type === "KOT" || type === "CANCEL_KOT") targetPrinter = kitchenSelect?.value || null;
+    else if (type === "BAR_KOT") targetPrinter = barSelect?.value || null;
+    else if (type === "BILL" || type === "FINAL_BILL") targetPrinter = billSelect?.value || null;
+    else if (type === "TABLE_SWAP") targetPrinter = kitchenSelect?.value || null;
+    if (targetPrinter) {
+      console.log(`[EdgeWS] Resolved printer from DOM dropdown: ${type} → ${targetPrinter}`);
+    }
+  }
+
+  if (!targetPrinter) {
+    console.error(`[EdgeWS] No printer resolved for ${type} — no local mapping and no printerName in print_job`);
+    sendPrintAck(eventId, false, `No printer resolved for ${type}`);
     return;
   }
 
