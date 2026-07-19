@@ -701,4 +701,4 @@ export function getOfflineQueueCount() {
   return getOfflineQueue().length;
 }
 
-export { handlePrintJob, FetchError };
+export { FetchError };

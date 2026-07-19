@@ -87,12 +87,15 @@ export async function printToPrinter(
     }
   }
 
-  // ── HTTP fallback: send to the cashier's internal print bridge ──────────────
+  // ── HTTP fallback: send to the edge server's /print endpoint (port 3101) ──
+  // The edge server relays via WebSocket to the Tauri frontend for physical printing.
+  // NOTE: printToPrinter/printGrouped are currently unused — orderService.ts uses
+  // printWithLanFallback() directly. This fallback is kept for future standalone use.
   const printAgentUrl = (
     process.env.PRINT_BRIDGE_URL ||
     getConfig("print_bridge_url") ||
     getConfig("print_agent_http_url") ||
-    "http://127.0.0.1:3102"
+    "http://127.0.0.1:3101"
   ).replace(/\/+$/, "");
   if (printAgentUrl) {
     try {

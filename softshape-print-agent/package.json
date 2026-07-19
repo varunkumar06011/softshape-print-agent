@@ -8,7 +8,8 @@
     "build": "vite build",
     "tauri": "tauri",
     "test": "vitest run",
-    "server": "node server.js"
+    "server": "node server.js",
+    "edge-server": "cd edge-server && bun run server.ts"
   },
   "dependencies": {
     "socket.io-client": "^4.7.5"

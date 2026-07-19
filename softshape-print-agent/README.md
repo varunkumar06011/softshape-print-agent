@@ -49,9 +49,13 @@ If registration fails, the error message now shows:
 - the backend URL that was tried
 - a **Retry** button
 
-## Local HTTP Print Server
+## Local HTTP Print Server (RETIRED)
 
-`server.js` is a standalone Node HTTP server that accepts print jobs on the same machine as the Cashier desktop app. It is not part of the Tauri frontend setup flow and is not affected by changes to `agentSocket.js`.
+`server.js` (port 3102) is **retired**. It was a standalone Node HTTP server that accepted print jobs, but it could never actually print — it ran outside the Tauri webview, so `window.__TAURI__` was always undefined and every print job failed with "No Tauri runtime available."
+
+The file is kept as a stub so old shortcuts/services that still launch `node server.js` don't crash. It returns **HTTP 410 Gone** for all routes (except `/health` which returns 200 with `deprecated: true`).
+
+**All print traffic must go through the Edge Server on port 3101**, which relays print jobs via WebSocket to the Tauri frontend (the only process with `window.__TAURI__` access) for physical printing.
 
 ## Printer Support
 
