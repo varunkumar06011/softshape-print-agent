@@ -69,3 +69,30 @@ export function lanBroadcast(type: string, data: any) {
 export function getLanClientCount(): number {
   return clients.size;
 }
+
+// ── Print ack registry ───────────────────────────────────────────────────────
+// When the edge server broadcasts a print_job via WebSocket, it waits for the
+// Tauri frontend to send back a print_ack confirming the print succeeded (or
+// failed). This provides end-to-end print confirmation instead of fire-and-forget.
+
+const pendingPrintAcks = new Map<string, { resolve: (result: { ok: boolean; error?: string }) => void; timeout: any }>();
+
+export function waitForPrintAck(eventId: string, timeoutMs: number = 10000): Promise<{ ok: boolean; error?: string }> {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      if (pendingPrintAcks.delete(eventId)) {
+        resolve({ ok: false, error: "Print ack timeout" });
+      }
+    }, timeoutMs);
+    pendingPrintAcks.set(eventId, { resolve, timeout });
+  });
+}
+
+export function resolvePrintAck(eventId: string, ok: boolean, error?: string) {
+  const pending = pendingPrintAcks.get(eventId);
+  if (pending) {
+    clearTimeout(pending.timeout);
+    pendingPrintAcks.delete(eventId);
+    pending.resolve({ ok, error });
+  }
+}

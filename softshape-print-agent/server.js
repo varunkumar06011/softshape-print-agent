@@ -103,8 +103,8 @@ async function handlePrintJob(body) {
     }
   }
 
-  console.log(`[PrintAgent:HTTP] No Tauri available, accepted [${effectiveType}] (${rawBytes.length} bytes)`);
-  return { ok: true, queued: true, message: 'Print job accepted (no Tauri)' };
+  console.error(`[PrintAgent:HTTP] No Tauri available — cannot print [${effectiveType}] → ${targetPrinter} (${rawBytes.length} bytes)`);
+  return { ok: false, error: 'No Tauri runtime available — print agent must run inside Tauri webview to print' };
 }
 
 const server = http.createServer(async (req, res) => {

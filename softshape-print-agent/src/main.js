@@ -19,6 +19,187 @@ import {
   checkBackendHealth,
 } from "./agentSocket.js";
 
+// ── Edge server WebSocket for LAN print fallback ─────────────────────────────
+// The edge server (Bun, port 3101) and server.js (Node, port 3102) run as
+// separate processes without window.__TAURI__. When they can't print directly,
+// they broadcast print_job events via WebSocket. This Tauri frontend (which
+// HAS window.__TAURI__) connects to the edge server's /ws endpoint and prints
+// any received print_job events to the physical printer.
+
+let edgeWs = null;
+let edgeWsReconnectTimer = null;
+const EDGE_WS_URL = `ws://${location.hostname || "localhost"}:3101/ws`;
+
+const seenPrintEventIds = new Set();
+const SEEN_EVENT_IDS_MAX = 500;
+
+function markEventSeen(eventId) {
+  if (!eventId) return false;
+  if (seenPrintEventIds.has(eventId)) return false;
+  seenPrintEventIds.add(eventId);
+  if (seenPrintEventIds.size > SEEN_EVENT_IDS_MAX) {
+    const arr = Array.from(seenPrintEventIds);
+    seenPrintEventIds.clear();
+    arr.slice(-SEEN_EVENT_IDS_MAX).forEach((id) => seenPrintEventIds.add(id));
+  }
+  return true;
+}
+
+function connectEdgeWebSocket() {
+  try {
+    edgeWs = new WebSocket(EDGE_WS_URL);
+  } catch {
+    scheduleEdgeReconnect();
+    return;
+  }
+
+  edgeWs.onopen = () => {
+    console.log("[EdgeWS] Connected to edge server WebSocket");
+    if (edgeWsReconnectTimer) {
+      clearTimeout(edgeWsReconnectTimer);
+      edgeWsReconnectTimer = null;
+    }
+    // Send initial ping to confirm connection
+    edgeWs.send(JSON.stringify({ type: "ping" }));
+  };
+
+  edgeWs.onmessage = async (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      if (msg.type === "print_job") {
+        await handleEdgePrintJob(msg);
+      } else if (msg.type === "pong") {
+        // Keepalive response — ignore
+      }
+    } catch (err) {
+      console.error("[EdgeWS] Failed to parse message:", err);
+    }
+  };
+
+  edgeWs.onerror = (err) => {
+    console.error("[EdgeWS] WebSocket error:", err);
+  };
+
+  edgeWs.onclose = () => {
+    console.log("[EdgeWS] Disconnected from edge server");
+    edgeWs = null;
+    scheduleEdgeReconnect();
+  };
+}
+
+function scheduleEdgeReconnect() {
+  if (edgeWsReconnectTimer) return;
+  edgeWsReconnectTimer = setTimeout(() => {
+    edgeWsReconnectTimer = null;
+    connectEdgeWebSocket();
+  }, 5000);
+}
+
+// ── Print retry queue ─────────────────────────────────────────────────────────
+// Failed print jobs are queued and retried up to 3 times with 2s delay.
+// After exhausting retries, the ack is sent as failed so the edge server
+// can trigger cloud fallback.
+
+const printRetryQueue = [];
+const MAX_PRINT_RETRIES = 3;
+const PRINT_RETRY_DELAY_MS = 2000;
+
+function sendPrintAck(eventId, ok, error) {
+  if (edgeWs && edgeWs.readyState === WebSocket.OPEN) {
+    edgeWs.send(JSON.stringify({ type: "print_ack", eventId, ok, error: error || null }));
+  }
+}
+
+function queuePrintRetry(job) {
+  printRetryQueue.push({ ...job, attempt: (job.attempt || 0) + 1 });
+  setTimeout(() => processRetryQueue(), PRINT_RETRY_DELAY_MS);
+}
+
+async function processRetryQueue() {
+  if (printRetryQueue.length === 0) return;
+  const job = printRetryQueue.shift();
+  console.log(`[EdgeWS] Retry #${job.attempt} for [${job.type}] → ${job.printerName}`);
+  await doPrint(job);
+}
+
+async function doPrint(job) {
+  const { type, printerName, bytes, eventId, attempt } = job;
+  if (window.__TAURI__) {
+    try {
+      const netMatch = printerName.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)$/);
+      if (netMatch) {
+        await window.__TAURI__.invoke("print_network", {
+          ip: netMatch[1],
+          port: parseInt(netMatch[2], 10),
+          bytes,
+        });
+      } else {
+        await window.__TAURI__.invoke("print_raw", {
+          printerName,
+          bytes,
+        });
+      }
+      console.log(`[EdgeWS] Printed [${type}] → ${printerName} (${bytes.length} bytes)${attempt ? ` (retry #${attempt})` : ""}`);
+      addJobToList({ type, data: { tableNumber: job.tableNumber } });
+      sendPrintAck(eventId, true);
+      return true;
+    } catch (err) {
+      console.error(`[EdgeWS] Print failed [${type}] → ${printerName}:`, err);
+      if (attempt < MAX_PRINT_RETRIES) {
+        queuePrintRetry(job);
+      } else {
+        sendPrintAck(eventId, false, `Print failed after ${MAX_PRINT_RETRIES} retries: ${err?.message || err}`);
+      }
+      return false;
+    }
+  } else {
+    console.warn(`[EdgeWS] No Tauri runtime — cannot print [${type}] → ${printerName}`);
+    sendPrintAck(eventId, false, "No Tauri runtime available");
+    return false;
+  }
+}
+
+async function handleEdgePrintJob(envelope) {
+  const { type, data, eventId } = envelope;
+  if (!markEventSeen(eventId)) {
+    console.log(`[EdgeWS] Duplicate print_job skipped: ${eventId}`);
+    return;
+  }
+
+  const targetPrinter = data?.printerName;
+  if (!targetPrinter) {
+    console.error("[EdgeWS] No printerName in print_job:", type);
+    sendPrintAck(eventId, false, "No printerName in print_job");
+    return;
+  }
+
+  const escposData = data?.escposData;
+  if (!escposData || (Array.isArray(escposData) && escposData.length === 0)) {
+    console.error(`[EdgeWS] No ESC/POS data in print_job: ${type}`);
+    sendPrintAck(eventId, false, "No ESC/POS data in print_job");
+    return;
+  }
+
+  // Convert ESC/POS data to bytes
+  const rawString = Array.isArray(escposData)
+    ? escposData.map((d) => d.data || "").join("")
+    : String(escposData);
+  const bytes = Array.from(new TextEncoder().encode(rawString));
+
+  await doPrint({ type, printerName: targetPrinter, bytes, eventId, tableNumber: data?.tableNumber, attempt: 0 });
+}
+
+// Start periodic ping to keep WebSocket alive
+let pingInterval = null;
+function startEdgePing() {
+  if (pingInterval) clearInterval(pingInterval);
+  pingInterval = setInterval(() => {
+    if (edgeWs && edgeWs.readyState === WebSocket.OPEN) {
+      edgeWs.send(JSON.stringify({ type: "ping" }));
+    }
+  }, 30000);
+}
+
 // DOM elements
 const setupSection = document.getElementById("setupSection");
 const connectedSection = document.getElementById("connectedSection");
@@ -347,3 +528,10 @@ if (stored) {
 } else {
   showSetup();
 }
+
+// ── Start edge server WebSocket for LAN print fallback ──────────────────────
+// This runs on every startup — the edge server is local (same machine) and
+// may broadcast print jobs that it couldn't print directly. The Tauri frontend
+// is the only process with window.__TAURI__ access to the physical printers.
+connectEdgeWebSocket();
+startEdgePing();

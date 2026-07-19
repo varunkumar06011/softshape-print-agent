@@ -48,7 +48,7 @@ import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDe
 import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode } from "./socketSync.ts";
 import { acquireInstanceLock, startHeartbeatLoop, stopHeartbeatLoop, releaseInstanceLock, forceReleaseLock, getLockStatus } from "./instanceLock.ts";
 import { cloudFetch } from "./cloudFetch.ts";
-import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount } from "./lanBroadcast.ts";
+import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount, lanBroadcast, resolvePrintAck, waitForPrintAck } from "./lanBroadcast.ts";
 
 const PORT = parseInt(process.env.EDGE_PORT || "3101", 10);
 let startupState: "starting" | "ready" | "error" = "starting";
@@ -87,6 +87,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   // enforcement via EDGE_REQUIRE_KEY=true.
   const PUBLIC_LAN_PATHS = new Set([
     "/health",
+    "/print",
     "/api/edge/register",
     "/api/edge/onboard",
     "/api/edge/sections",
@@ -161,6 +162,67 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       edgePort: PORT,
       maintenanceError: startupError || null,
     });
+  }
+
+  // ── POST /print — relay print job to Tauri frontend via LAN WebSocket ───────
+  // This is the fast LAN print path for Captain apps on the same network.
+  // The Captain POSTs ESC/POS data directly to the edge server, which broadcasts
+  // via WebSocket to the connected Tauri frontend (cashier) for physical printing.
+  // No auth required — this is a LAN-only endpoint (edge server binds to 0.0.0.0
+  // but is typically behind a firewall/router on the local network).
+  if (url.pathname === "/print" && req.method === "POST") {
+    const body = await req.json().catch(() => ({}));
+    const { type, jobType, printerName, escposData, bytes, text, data, eventId } = body || {};
+    const effectiveType = type || jobType;
+
+    if (!effectiveType) {
+      return jsonResponse({ ok: false, error: "Missing jobType or type" }, 400);
+    }
+
+    const targetPrinter = printerName || data?.printerName;
+    if (!targetPrinter) {
+      return jsonResponse({ ok: false, error: "Missing printerName" }, 400);
+    }
+
+    // Normalize ESC/POS data to the format the Tauri frontend expects
+    let normalizedEscpos = escposData;
+    if (!normalizedEscpos && bytes) {
+      // Legacy format: convert raw bytes to escposData structure
+      normalizedEscpos = [{ type: effectiveType, format: "escpos", data: String.fromCharCode(...bytes) }];
+    } else if (!normalizedEscpos && text) {
+      normalizedEscpos = [{ type: effectiveType, format: "text", data: text }];
+    }
+
+    if (!normalizedEscpos || (Array.isArray(normalizedEscpos) && normalizedEscpos.length === 0)) {
+      return jsonResponse({ ok: false, error: "Missing print payload (escposData, bytes, or text required)" }, 400);
+    }
+
+    const clientCount = getLanClientCount();
+    if (clientCount === 0) {
+      return jsonResponse({ ok: false, error: "No LAN WebSocket clients connected — Tauri frontend not available", queued: false }, 503);
+    }
+
+    const printEventId = eventId || `${effectiveType}-${Date.now()}`;
+    lanBroadcast("print_job", {
+      type: effectiveType,
+      data: {
+        printerName: targetPrinter,
+        escposData: normalizedEscpos,
+        requestId: data?.requestId || null,
+      },
+      eventId: printEventId,
+      ts: Date.now(),
+    });
+
+    // Wait for print_ack from Tauri frontend (with 10s timeout)
+    const ack = await waitForPrintAck(printEventId, 10000);
+    if (ack.ok) {
+      console.log(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} ✓ (${clientCount} client(s))`);
+      return jsonResponse({ ok: true, queued: false, clients: clientCount });
+    } else {
+      console.warn(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} FAILED: ${ack.error}`);
+      return jsonResponse({ ok: false, error: ack.error || "Print failed", queued: false }, 502);
+    }
   }
 
   // ── GET /api/edge/status ────────────────────────────────────────────────────
@@ -358,6 +420,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       requestId: body.requestId,
       orderByRole: body.orderByRole,
       localPrinted: body.localPrinted || false,
+      preReservedKotNumber: body.preReservedKotNumber ?? null,
       kotEventIds: body.kotEventIds || null,
     });
 
@@ -395,6 +458,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       requestId: body.requestId,
       orderByRole: body.orderByRole,
       localPrinted: body.localPrinted || false,
+      preReservedKotNumber: body.preReservedKotNumber ?? null,
       kotEventIds: body.kotEventIds || null,
     });
 
@@ -1630,11 +1694,13 @@ const server = Bun.serve({
       registerClient(ws);
     },
     message(ws, message) {
-      // We don't expect client messages — but acknowledge ping for keepalive
       try {
         const data = JSON.parse(message.toString());
         if (data.type === "ping") {
           ws.send(JSON.stringify({ type: "pong", ts: Date.now() }));
+        } else if (data.type === "print_ack") {
+          // Tauri frontend confirms print success/failure
+          resolvePrintAck(data.eventId, data.ok === true, data.error);
         }
       } catch {
         // Ignore non-JSON messages
