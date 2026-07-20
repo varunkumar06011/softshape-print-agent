@@ -442,7 +442,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── POST /api/edge/order/update — add items to existing order + print new KOT ──
   if (url.pathname === "/api/edge/order/update" && req.method === "POST") {
-    if (!isSessionValid()) {
+    if (!isLocalReady()) {
       return errorResponse("No valid session", 401);
     }
 
