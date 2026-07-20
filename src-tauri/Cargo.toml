@@ -14,10 +14,12 @@ custom-protocol = ["tauri/custom-protocol"]
 tauri-build = { version = "1.5", features = [] }
 
 [dependencies]
-tauri = { version = "1.6", features = ["updater"] }
+tauri = { version = "1.6", features = ["updater", "system-tray", "http-request"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tiny_http = "0.12"
+tauri-plugin-autostart = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "v1" }
+tauri-plugin-single-instance = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "v1" }
 
 # Windows printing
 [target.'cfg(windows)'.dependencies]

@@ -15,6 +15,7 @@ import { getDb, getNextKotNumber, enqueueSync, getKolkataDateString } from "./db
 import { buildFoodKOT, buildLiquorKOT, buildCancelKOT, buildBill, type PrintItem, type OrderData } from "./escpos.ts";
 import { resolvePrinterName } from "./printer.ts";
 import { lanBroadcast, getLanClientCount, waitForPrintAck } from "./lanBroadcast.ts";
+import { relayPrintViaCloud, isCloudSocketConnected } from "./socketSync.ts";
 
 // ─── LAN print dispatch ───────────────────────────────────────────────────────
 // The edge server (Bun process) does NOT have window.__TAURI__. Only the Tauri
@@ -46,8 +47,21 @@ async function printWithLanFallback(
       continue;
     }
     if (clientCount === 0) {
-      console.warn(`[Print] No LAN WebSocket clients — print_job for ${group.type} → ${group.printerName || "(auto)"} will be lost`);
-      results.push({ ok: false, printerName: group.printerName || null, bytes: 0, error: "No LAN WebSocket clients connected", method: "lan_ws" });
+      console.warn(`[Print] No LAN WebSocket clients — falling back to cloud relay for ${group.type} → ${group.printerName || "(auto)"}`);
+      const eventId = `${group.type}-${requestId || Date.now()}-${i}`;
+      const relayed = relayPrintViaCloud({
+        type: group.type,
+        data: { printerName: group.printerName || null, escposData: group.escposData, requestId: requestId || null },
+        eventId,
+      });
+      results.push({
+        ok: relayed,
+        printerName: group.printerName || null,
+        bytes: 0,
+        error: relayed ? null : "No LAN clients and cloud socket not connected",
+        method: relayed ? "cloud_relay" : "lan_ws",
+        eventId,
+      });
       continue;
     }
 
@@ -93,8 +107,14 @@ async function printSingleWithLanFallback(
   requestId?: string,
 ): Promise<any> {
   if (getLanClientCount() === 0) {
-    console.warn(`[Print] No LAN WebSocket clients — print_job for ${type} → ${printerName || "(auto)"} will be lost`);
-    return { ok: false, printerName, bytes: 0, error: "No LAN WebSocket clients connected", method: "lan_ws" };
+    console.warn(`[Print] No LAN WebSocket clients — falling back to cloud relay for ${type} → ${printerName || "(auto)"}`);
+    const eventId = `${type}-${requestId || Date.now()}`;
+    const relayed = relayPrintViaCloud({
+      type,
+      data: { printerName: printerName || null, escposData, requestId: requestId || null },
+      eventId,
+    });
+    return { ok: relayed, printerName, bytes: 0, error: relayed ? null : "No LAN clients and cloud socket not connected", method: relayed ? "cloud_relay" : "lan_ws", eventId };
   }
 
   const eventId = `${type}-${requestId || Date.now()}`;

@@ -230,12 +230,44 @@ function saveSeenEventIds() {
   } catch { /* ignore quota errors */ }
 }
 
+async function isEventIdSeenRust(eventId) {
+  const invoke = getTauriInvoke();
+  if (!invoke) return false;
+  try {
+    return await invoke("is_event_id_seen", { eventId });
+  } catch {
+    return false;
+  }
+}
+
+async function markEventIdSeenRust(eventId) {
+  const invoke = getTauriInvoke();
+  if (!invoke) return;
+  try {
+    await invoke("mark_event_id_seen", { eventId });
+  } catch {
+    // Ignore — dedup is best-effort
+  }
+}
+
+/// Atomic test-and-set: returns true if already seen (duplicate), false if
+/// newly marked (first occurrence). Eliminates the check-then-mark race.
+async function checkAndMarkEventIdRust(eventId) {
+  const invoke = getTauriInvoke();
+  if (!invoke) return false;
+  try {
+    return await invoke("check_and_mark_event_id", { eventId });
+  } catch {
+    return false;
+  }
+}
+
 function isEventIdSeen(eventId) {
   loadSeenEventIds();
   return seenEventIds.has(eventId);
 }
 
-function markEventIdSeen(eventId) {
+async function markEventIdSeen(eventId) {
   loadSeenEventIds();
   seenEventIds.add(eventId);
   if (seenEventIds.size > SEEN_EVENT_IDS_MAX) {
@@ -244,6 +276,7 @@ function markEventIdSeen(eventId) {
     arr.slice(-SEEN_EVENT_IDS_MAX).forEach(id => seenEventIds.add(id));
   }
   saveSeenEventIds();
+  await markEventIdSeenRust(eventId);
 }
 
 // ── Bounded concurrency for print jobs (Issue 2) ───────────────────────────
@@ -464,8 +497,12 @@ export async function handlePrintJob(envelope) {
   // On reconnect the backend re-delivers buffered PENDING jobs and emitToRestaurant
   // may fall back from a printer-specific room to the general room, causing double
   // delivery. This guard ensures each job is printed exactly once.
+  // Checks the local localStorage Set first (fast-path for same-path duplicates),
+  // then uses an atomic test-and-set in the shared Rust HashSet for cross-path
+  // dedup with the edge-WS path in main.js. The atomic operation eliminates the
+  // race where two async paths both pass the check before either marks.
   if (envelope.eventId && isEventIdSeen(envelope.eventId)) {
-    console.log(`[Agent] Duplicate eventId skipped: ${envelope.eventId}`);
+    console.log(`[Agent] Duplicate eventId skipped (local): ${envelope.eventId}`);
     socket?.emit("print:ack", {
       restaurantId,
       eventId: envelope.eventId,
@@ -474,7 +511,21 @@ export async function handlePrintJob(envelope) {
     });
     return;
   }
-  if (envelope.eventId) markEventIdSeen(envelope.eventId);
+  if (envelope.eventId) {
+    const alreadySeen = await checkAndMarkEventIdRust(envelope.eventId);
+    if (alreadySeen) {
+      console.log(`[Agent] Duplicate eventId skipped (cross-path Rust): ${envelope.eventId}`);
+      socket?.emit("print:ack", {
+        restaurantId,
+        eventId: envelope.eventId,
+        requestId: data?.requestId,
+        status: "success",
+      });
+      return;
+    }
+    // Also mark in the local localStorage Set for fast-path same-path dedup
+    await markEventIdSeen(envelope.eventId);
+  }
 
   // Prefer local printerMapping over backend-sent printerName.
   // The local mapping is configured on this machine and knows the actual printer names.

@@ -45,7 +45,7 @@ import { downloadFullConfig, pullIncrementalChanges } from "./config.ts";
 import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge } from "./orderService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders } from "./reads.ts";
 import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
-import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode } from "./socketSync.ts";
+import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode, relayPrintViaCloud } from "./socketSync.ts";
 import { acquireInstanceLock, startHeartbeatLoop, stopHeartbeatLoop, releaseInstanceLock, forceReleaseLock, getLockStatus } from "./instanceLock.ts";
 import { cloudFetch } from "./cloudFetch.ts";
 import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount, lanBroadcast, resolvePrintAck, waitForPrintAck } from "./lanBroadcast.ts";
@@ -198,7 +198,17 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     const clientCount = getLanClientCount();
     if (clientCount === 0) {
-      return jsonResponse({ ok: false, error: "No LAN WebSocket clients connected — Tauri frontend not available", queued: false }, 503);
+      const printEventId = eventId || `${effectiveType}-${Date.now()}`;
+      const relayed = relayPrintViaCloud({
+        type: effectiveType,
+        data: { printerName: targetPrinter, escposData: normalizedEscpos, requestId: data?.requestId || null },
+        eventId: printEventId,
+      });
+      if (relayed) {
+        console.log(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} via cloud fallback (no LAN clients)`);
+        return jsonResponse({ ok: true, queued: false, clients: 0, method: "cloud_relay", eventId: printEventId });
+      }
+      return jsonResponse({ ok: false, error: "No LAN WebSocket clients connected and cloud socket not available", queued: false }, 503);
     }
 
     const printEventId = eventId || `${effectiveType}-${Date.now()}`;

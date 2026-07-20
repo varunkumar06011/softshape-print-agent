@@ -32,6 +32,46 @@ const EDGE_WS_URL = `ws://localhost:3101/ws`;
 const seenPrintEventIds = new Set();
 const SEEN_EVENT_IDS_MAX = 500;
 
+function getTauriInvoke() {
+  const t = window.__TAURI__;
+  if (!t) return null;
+  if (typeof t.invoke === "function") return t.invoke.bind(t);
+  if (t.tauri && typeof t.tauri.invoke === "function") return t.tauri.invoke.bind(t.tauri);
+  return null;
+}
+
+async function isEventIdSeenRust(eventId) {
+  const invoke = getTauriInvoke();
+  if (!invoke) return false;
+  try {
+    return await invoke("is_event_id_seen", { eventId });
+  } catch {
+    return false;
+  }
+}
+
+async function markEventIdSeenRust(eventId) {
+  const invoke = getTauriInvoke();
+  if (!invoke) return;
+  try {
+    await invoke("mark_event_id_seen", { eventId });
+  } catch {
+    // Ignore — dedup is best-effort
+  }
+}
+
+/// Atomic test-and-set: returns true if already seen (duplicate), false if
+/// newly marked (first occurrence). Eliminates the check-then-mark race.
+async function checkAndMarkEventIdRust(eventId) {
+  const invoke = getTauriInvoke();
+  if (!invoke) return false; // no Tauri — allow print, local Set still guards
+  try {
+    return await invoke("check_and_mark_event_id", { eventId });
+  } catch {
+    return false; // on error, allow print — dedup is best-effort
+  }
+}
+
 function markEventSeen(eventId) {
   if (!eventId) return false;
   if (seenPrintEventIds.has(eventId)) return false;
@@ -169,7 +209,17 @@ async function handleEdgePrintJob(envelope) {
     return;
   }
   if (!markEventSeen(eventId)) {
-    console.log(`[EdgeWS] Duplicate print_job skipped: ${eventId}`);
+    console.log(`[EdgeWS] Duplicate print_job skipped (local cache): ${eventId}`);
+    return;
+  }
+  // Atomic cross-path dedup: test-and-set in a single Rust mutex lock.
+  // Returns true if already seen (another path printed it), false if newly
+  // marked (this path should print). Eliminates the race where two async
+  // paths both pass the check before either marks.
+  const alreadySeen = await checkAndMarkEventIdRust(eventId);
+  if (alreadySeen) {
+    console.log(`[EdgeWS] Duplicate print_job skipped (cross-path Rust dedup): ${eventId}`);
+    sendPrintAck(eventId, true);
     return;
   }
 

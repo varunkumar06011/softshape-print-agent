@@ -20,6 +20,10 @@
         "fullscreen": false
       }
     ],
+    "systemTray": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": false
+    },
     "allowlist": {
       "all": false,
       "http": {

@@ -18,7 +18,33 @@ import {
   setPrinterStatus,
   getBackendUrl,
   checkBackendHealth,
+  forceReconnect,
+  refetchPrinterMapping,
 } from "./agentSocket.js";
+
+// ── Edge server WebSocket for LAN print path ─────────────────────────────────
+// The edge server (Bun, port 3101) runs as a separate process without
+// window.__TAURI__. It broadcasts print_job events via WebSocket. This Tauri
+// frontend (which HAS window.__TAURI__) connects to the edge server's /ws
+// endpoint and prints any received print_job events to the physical printer.
+// This is the LAN fast path — print-agent is the SOLE canonical print receiver
+// for both cloud (Socket.IO) and LAN (edge-WS) paths.
+
+let edgeWs = null;
+let edgeWsReconnectTimer = null;
+let pingInterval = null;
+const EDGE_WS_URL = `ws://localhost:3101/ws`;
+
+const seenPrintEventIds = new Set();
+const SEEN_EVENT_IDS_MAX = 500;
+
+// ── Print retry queue ─────────────────────────────────────────────────────────
+// Failed print jobs are queued and retried up to 3 times with 2s delay.
+// After exhausting retries, the ack is sent as failed so the edge server
+// can trigger cloud fallback.
+const printRetryQueue = [];
+const MAX_PRINT_RETRIES = 3;
+const PRINT_RETRY_DELAY_MS = 2000;
 
 // DOM elements
 const setupSection = document.getElementById("setupSection");
@@ -60,9 +86,223 @@ function getOrCreateAgentId() {
   return id;
 }
 
+// ── Edge-WS dedup helpers ────────────────────────────────────────────────────
+// Atomic test-and-set: returns true if already seen (duplicate), false if
+// newly marked (first occurrence). Eliminates the check-then-mark race that
+// can occur when both the cloud socket path and the edge-WS path receive the
+// same print job concurrently.
+async function checkAndMarkEventIdRust(eventId) {
+  const invoke = getTauriInvoke();
+  if (!invoke) return false;
+  try {
+    return await invoke("check_and_mark_event_id", { eventId });
+  } catch {
+    return false;
+  }
+}
+
+function markEventSeen(eventId) {
+  if (!eventId) return false;
+  if (seenPrintEventIds.has(eventId)) return false;
+  seenPrintEventIds.add(eventId);
+  if (seenPrintEventIds.size > SEEN_EVENT_IDS_MAX) {
+    const arr = Array.from(seenPrintEventIds);
+    seenPrintEventIds.clear();
+    arr.slice(-SEEN_EVENT_IDS_MAX).forEach((id) => seenPrintEventIds.add(id));
+  }
+  return true;
+}
+
+function sendPrintAck(eventId, ok, error) {
+  if (edgeWs && edgeWs.readyState === WebSocket.OPEN) {
+    edgeWs.send(JSON.stringify({ type: "print_ack", eventId, ok, error: error || null }));
+  }
+}
+
+// ── Edge-WS connection management ────────────────────────────────────────────
+
+function connectEdgeWebSocket() {
+  try {
+    edgeWs = new WebSocket(EDGE_WS_URL);
+  } catch {
+    scheduleEdgeReconnect();
+    return;
+  }
+
+  edgeWs.onopen = () => {
+    console.log("[EdgeWS] Connected to edge server WebSocket");
+    if (edgeWsReconnectTimer) {
+      clearTimeout(edgeWsReconnectTimer);
+      edgeWsReconnectTimer = null;
+    }
+    edgeWs.send(JSON.stringify({ type: "ping" }));
+  };
+
+  edgeWs.onmessage = async (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      if (msg.type === "print_job") {
+        await handleEdgePrintJob(msg);
+      } else if (msg.type === "pong") {
+        // Keepalive response — ignore
+      }
+    } catch (err) {
+      console.error("[EdgeWS] Failed to parse message:", err);
+    }
+  };
+
+  edgeWs.onerror = (err) => {
+    console.error("[EdgeWS] WebSocket error:", err);
+  };
+
+  edgeWs.onclose = () => {
+    console.log("[EdgeWS] Disconnected from edge server");
+    edgeWs = null;
+    scheduleEdgeReconnect();
+  };
+}
+
+function scheduleEdgeReconnect() {
+  if (edgeWsReconnectTimer) return;
+  edgeWsReconnectTimer = setTimeout(() => {
+    edgeWsReconnectTimer = null;
+    connectEdgeWebSocket();
+  }, 5000);
+}
+
+function startEdgePing() {
+  if (pingInterval) clearInterval(pingInterval);
+  pingInterval = setInterval(() => {
+    if (edgeWs && edgeWs.readyState === WebSocket.OPEN) {
+      edgeWs.send(JSON.stringify({ type: "ping" }));
+    }
+  }, 30000);
+}
+
+// ── Edge-WS print execution ──────────────────────────────────────────────────
+
+function queuePrintRetry(job) {
+  printRetryQueue.push({ ...job, attempt: (job.attempt || 0) + 1 });
+  setTimeout(() => processRetryQueue(), PRINT_RETRY_DELAY_MS);
+}
+
+async function processRetryQueue() {
+  if (printRetryQueue.length === 0) return;
+  const job = printRetryQueue.shift();
+  console.log(`[EdgeWS] Retry #${job.attempt} for [${job.type}] → ${job.printerName}`);
+  await doPrint(job);
+}
+
+async function doPrint(job) {
+  const { type, printerName, bytes, eventId, attempt } = job;
+  const invoke = getTauriInvoke();
+  if (!invoke) {
+    console.warn(`[EdgeWS] No Tauri runtime — cannot print [${type}] → ${printerName}`);
+    sendPrintAck(eventId, false, "No Tauri runtime available");
+    return false;
+  }
+  try {
+    const netMatch = printerName.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)$/);
+    if (netMatch) {
+      await invoke("print_network", {
+        ip: netMatch[1],
+        port: parseInt(netMatch[2], 10),
+        bytes,
+      });
+    } else {
+      await invoke("print_raw", { printerName, bytes });
+    }
+    console.log(`[EdgeWS] Printed [${type}] → ${printerName} (${bytes.length} bytes)${attempt ? ` (retry #${attempt})` : ""}`);
+    addJobToList({ type, data: { tableNumber: job.tableNumber } });
+    sendPrintAck(eventId, true);
+    return true;
+  } catch (err) {
+    console.error(`[EdgeWS] Print failed [${type}] → ${printerName}:`, err);
+    if (attempt < MAX_PRINT_RETRIES) {
+      queuePrintRetry(job);
+    } else {
+      sendPrintAck(eventId, false, `Print failed after ${MAX_PRINT_RETRIES} retries: ${err?.message || err}`);
+    }
+    return false;
+  }
+}
+
+async function handleEdgePrintJob(envelope) {
+  // lanBroadcast wraps as: { type: "print_job", data: { type, data, eventId, ts }, ts }
+  const payload = envelope.data || envelope;
+  const { type, data, eventId } = payload;
+  if (!eventId) {
+    console.error(`[EdgeWS] print_job missing eventId — cannot track or ack`);
+    sendPrintAck(null, false, "Missing eventId in print_job");
+    return;
+  }
+  // Local fast-path dedup (in-process Set)
+  if (!markEventSeen(eventId)) {
+    console.log(`[EdgeWS] Duplicate print_job skipped (local cache): ${eventId}`);
+    return;
+  }
+  // Atomic cross-path dedup: test-and-set in a single Rust mutex lock.
+  // Returns true if the cloud socket path already printed this eventId.
+  const alreadySeen = await checkAndMarkEventIdRust(eventId);
+  if (alreadySeen) {
+    console.log(`[EdgeWS] Duplicate print_job skipped (cross-path Rust dedup): ${eventId}`);
+    sendPrintAck(eventId, true);
+    return;
+  }
+
+  // Resolve printer: check local mapping first, then DOM dropdowns, then
+  // fall back to the printerName sent by the Captain/edge server.
+  let targetPrinter = data?.printerName;
+  if (!targetPrinter) {
+    try {
+      const stored = JSON.parse(localStorage.getItem("agent_printer_mapping") || "{}");
+      if (type === "KOT" || type === "CANCEL_KOT") targetPrinter = stored.kitchen;
+      else if (type === "BAR_KOT") targetPrinter = stored.bar;
+      else if (type === "BILL" || type === "FINAL_BILL") targetPrinter = stored.bill;
+      else if (type === "TABLE_SWAP") targetPrinter = stored.kitchen;
+      if (targetPrinter) {
+        console.log(`[EdgeWS] Resolved printer from local mapping: ${type} → ${targetPrinter}`);
+      }
+    } catch { /* ignore */ }
+  }
+  if (!targetPrinter) {
+    if (type === "KOT" || type === "CANCEL_KOT") targetPrinter = kitchenSelect?.value || null;
+    else if (type === "BAR_KOT") targetPrinter = barSelect?.value || null;
+    else if (type === "BILL" || type === "FINAL_BILL") targetPrinter = billSelect?.value || null;
+    else if (type === "TABLE_SWAP") targetPrinter = kitchenSelect?.value || null;
+    if (targetPrinter) {
+      console.log(`[EdgeWS] Resolved printer from DOM dropdown: ${type} → ${targetPrinter}`);
+    }
+  }
+  if (!targetPrinter) {
+    console.error(`[EdgeWS] No printer resolved for ${type} — no local mapping and no printerName in print_job`);
+    sendPrintAck(eventId, false, `No printer resolved for ${type}`);
+    return;
+  }
+
+  const escposData = data?.escposData;
+  if (!escposData || (Array.isArray(escposData) && escposData.length === 0)) {
+    console.error(`[EdgeWS] No ESC/POS data in print_job: ${type}`);
+    sendPrintAck(eventId, false, "No ESC/POS data in print_job");
+    return;
+  }
+
+  const rawString = Array.isArray(escposData)
+    ? escposData.map((d) => d.data || "").join("")
+    : String(escposData);
+  const bytes = Array.from(new TextEncoder().encode(rawString));
+
+  await doPrint({ type, printerName: targetPrinter, bytes, eventId, tableNumber: data?.tableNumber, attempt: 0 });
+}
+
 function setStatus(text, connected) {
   connectionStatus.textContent = text;
   connectionStatus.className = "header-status" + (connected ? " connected" : "");
+  // Update tray tooltip so a cashier can see connection status without opening the window
+  if (window.__TAURI__) {
+    window.__TAURI__.invoke("update_connection_status", { status: text })
+      .catch(() => {});
+  }
 }
 
 function showSetup() {
@@ -422,3 +662,67 @@ if (stored) {
 } else {
   showSetup();
 }
+
+// ─── OS resume/wake reconnect ──────────────────────────────────────────────
+// After a Windows sleep/wake cycle, the socket may appear "connected" but
+// the underlying TCP connection is dead. Socket.IO's reconnection logic
+// will eventually detect this, but it can take 30+ seconds (reconnectionDelayMax).
+// These listeners force an immediate reconnect attempt on wake/resume.
+
+let lastVisibilityHidden = false;
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") {
+    lastVisibilityHidden = true;
+  } else if (document.visibilityState === "visible" && lastVisibilityHidden) {
+    lastVisibilityHidden = false;
+    // Window became visible again — likely a wake/resume
+    forceReconnect();
+  }
+});
+
+window.addEventListener("online", () => {
+  // Network adapter came back online (e.g. after sleep/wake or Wi-Fi reconnect)
+  forceReconnect();
+});
+
+// ─── Autostart toggle UI ───────────────────────────────────────────────────
+// Initialize the autostart checkbox state from the Tauri command and wire
+// the change handler. This lets a cashier or IT person disable autostart
+// if they replace the PC's role.
+
+async function initAutostartToggle() {
+  const checkbox = document.getElementById("autostartToggle");
+  if (!checkbox || !window.__TAURI__) return;
+  try {
+    const enabled = await window.__TAURI__.invoke("is_autostart_enabled");
+    checkbox.checked = enabled;
+  } catch {
+    checkbox.checked = true; // default to checked if command fails
+  }
+  checkbox.addEventListener("change", async () => {
+    try {
+      if (checkbox.checked) {
+        await window.__TAURI__.invoke("enable_autostart");
+      } else {
+        await window.__TAURI__.invoke("disable_autostart");
+      }
+    } catch (err) {
+      console.error("[Autostart] Toggle failed:", err);
+      // Revert checkbox state on error
+      try {
+        const enabled = await window.__TAURI__.invoke("is_autostart_enabled");
+        checkbox.checked = enabled;
+      } catch {}
+    }
+  });
+}
+
+initAutostartToggle();
+
+// ── Start edge server WebSocket for LAN print path ───────────────────────────
+// This runs on every startup — the edge server is local (same machine) and
+// broadcasts print jobs via WebSocket. Print-agent is the sole canonical print
+// receiver: it handles both the cloud Socket.IO path and this LAN edge-WS path.
+connectEdgeWebSocket();
+startEdgePing();

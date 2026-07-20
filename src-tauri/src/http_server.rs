@@ -45,6 +45,26 @@ pub fn is_event_id_seen(id: &str) -> bool {
     guard.as_ref().map_or(false, |set| set.contains(id))
 }
 
+/// Atomic test-and-set for deduplication.
+/// Returns true if the eventId was ALREADY seen (duplicate — caller should skip).
+/// Returns false if the eventId was NOT seen and has now been marked (first
+/// occurrence — caller should proceed). Eliminates the race window between
+/// separate check-then-mark calls.
+pub fn check_and_mark_event_id(id: &str) -> bool {
+    let mut guard = SEEN_EVENT_IDS.lock().unwrap();
+    let set = guard.get_or_insert_with(|| HashSet::with_capacity(SEEN_EVENT_IDS_MAX));
+    if set.contains(id) {
+        return true;
+    }
+    if set.len() >= SEEN_EVENT_IDS_MAX {
+        if let Some(first) = set.iter().next().cloned() {
+            set.remove(&first);
+        }
+    }
+    set.insert(id.to_string());
+    false
+}
+
 /// Extract raw ESC/POS bytes from the escposData field.
 ///
 /// The frontend sends escposData as an array of objects:
@@ -155,8 +175,8 @@ fn handle_print_request(body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
         }
     }
 
-    // Dedup check
-    if !event_id.is_empty() && is_event_id_seen(event_id) {
+    // Atomic dedup check-and-mark (eliminates race between check and mark)
+    if !event_id.is_empty() && check_and_mark_event_id(event_id) {
         let resp = serde_json::json!({
             "status": "success",
             "deduped": true
@@ -164,10 +184,6 @@ fn handle_print_request(body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
         return Response::from_string(resp.to_string())
             .with_status_code(200)
             .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
-    }
-
-    if !event_id.is_empty() {
-        mark_event_id_seen(event_id);
     }
 
     // Validate required fields

@@ -225,6 +225,7 @@ let heartbeatInterval = null;
 let onStatusChangeCb = null;
 let onPrintJobCb = null;
 let isOnline = false;
+const ackedEventIds = new Set();
 
 // ── Printer status tracking ──────────────────────────────────────────────────
 // Updated by the UI when dropdown selections change. Used by handlePrintJob
@@ -278,6 +279,18 @@ async function markEventIdSeen(id) {
     await invoke("mark_event_id_seen", { eventId: id });
   } catch {
     // Ignore failures - dedup is best-effort
+  }
+}
+
+/// Atomic test-and-set: returns true if already seen (duplicate), false if
+/// newly marked (first occurrence). Eliminates the check-then-mark race.
+async function checkAndMarkEventIdRust(id) {
+  const invoke = getTauriInvoke();
+  if (!invoke) return false;
+  try {
+    return await invoke("check_and_mark_event_id", { eventId: id });
+  } catch {
+    return false;
   }
 }
 
@@ -431,6 +444,17 @@ export function connectAgent({ token, rid, mapping, onStatusChange, onPrintJob, 
     onStatusChangeCb?.("connected");
     // Flush any print jobs that were queued while offline
     flushOfflineQueue();
+    // Re-fetch printer mapping from backend — config could have changed
+    // while the agent was disconnected (e.g. admin updated printer assignments)
+    refetchPrinterMapping().then((updated) => {
+      if (updated) {
+        const names = [];
+        if (printerMapping.kitchen) names.push(printerMapping.kitchen);
+        if (printerMapping.bar) names.push(printerMapping.bar);
+        if (printerMapping.bill) names.push(printerMapping.bill);
+        socket.emit("agent:join", { restaurantId, sessionToken, stations, printerNames: [...new Set(names)] });
+      }
+    }).catch(() => {});
   });
 
   socket.on("agent:joined", ({ bufferedCount }) => {
@@ -484,20 +508,24 @@ export async function handlePrintJob(envelope) {
   // On reconnect the backend re-delivers buffered PENDING jobs and the agent's
   // own offline queue may also contain the same job.  This guard ensures each
   // job is printed exactly once.
-  if (envelope.eventId && await isEventIdSeen(envelope.eventId)) {
-    console.log(`[Agent] Duplicate eventId skipped: ${envelope.eventId}`);
-    if (!ackedEventIds.has(envelope.eventId)) {
-      socket?.emit("print:ack", {
-        restaurantId,
-        eventId: envelope.eventId,
-        requestId: data?.requestId,
-        status: "success",
-      });
-      ackedEventIds.add(envelope.eventId);
+  // Uses an atomic test-and-set in the shared Rust HashSet to eliminate the
+  // race window between check and mark.
+  if (envelope.eventId) {
+    const alreadySeen = await checkAndMarkEventIdRust(envelope.eventId);
+    if (alreadySeen) {
+      console.log(`[Agent] Duplicate eventId skipped: ${envelope.eventId}`);
+      if (!ackedEventIds.has(envelope.eventId)) {
+        socket?.emit("print:ack", {
+          restaurantId,
+          eventId: envelope.eventId,
+          requestId: data?.requestId,
+          status: "success",
+        });
+        ackedEventIds.add(envelope.eventId);
+      }
+      return;
     }
-    return;
   }
-  if (envelope.eventId) await markEventIdSeen(envelope.eventId);
 
   // Prefer explicit printerName from backend, then fall back to mapping by job type
   let targetPrinter = data?.printerName || null;
@@ -745,6 +773,46 @@ export function getBackendUrl() {
  */
 export function isAgentOnline() {
   return isOnline;
+}
+
+/**
+ * Force an immediate socket reconnect. Called by the OS resume/wake listener
+ * in main.js — after a sleep/wake cycle, the socket may appear "connected"
+ * but the underlying TCP connection is dead. This disconnects and reconnects
+ * immediately rather than waiting for Socket.IO's reconnection timer.
+ */
+export function forceReconnect() {
+  if (!socket) return;
+  console.log("[Agent] Forcing immediate reconnect");
+  if (socket.connected) {
+    socket.disconnect();
+  }
+  socket.connect();
+}
+
+/**
+ * Re-fetch the current printer mapping from the backend and update local state.
+ * Called on every reconnect (not just app launch) to ensure printer config
+ * changes made while the agent was disconnected are picked up.
+ */
+export async function refetchPrinterMapping() {
+  if (!restaurantId || !sessionToken) return;
+  try {
+    const url = `${BACKEND_URL}/api/print/agent-config?restaurantId=${restaurantId}`;
+    const res = await fetchWithRetry(url, {
+      headers: { Authorization: `Bearer ${sessionToken}` },
+    }, { retries: 2, timeoutMs: 8000 });
+    const data = await res.json();
+    if (data.printerMapping) {
+      printerMapping = { ...printerMapping, ...data.printerMapping };
+      localStorage.setItem("agent_printer_mapping", JSON.stringify(printerMapping));
+      console.log("[Agent] Printer mapping refreshed from backend");
+      return data.printerMapping;
+    }
+  } catch (err) {
+    console.warn("[Agent] Failed to refetch printer mapping:", err.message);
+  }
+  return null;
 }
 
 /**

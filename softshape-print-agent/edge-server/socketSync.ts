@@ -189,6 +189,31 @@ export function sendHeartbeat(): void {
   });
 }
 
+// ─── Relay print job via cloud socket (fallback when no LAN clients) ──────────
+
+export function relayPrintViaCloud(printJob: {
+  type: string;
+  data: { printerName: string | null; escposData: any[]; requestId?: string | null };
+  eventId: string;
+}): boolean {
+  if (!socket?.connected) {
+    console.warn("[SocketSync] Cannot relay print — cloud socket not connected");
+    return false;
+  }
+  const restaurantId = getRestaurantId();
+  if (!restaurantId) {
+    console.warn("[SocketSync] Cannot relay print — no restaurantId in session");
+    return false;
+  }
+  socket.emit("edge:relay_print", { ...printJob, restaurantId });
+  console.log(`[SocketSync] Relayed print job ${printJob.eventId} via cloud (${printJob.type})`);
+  return true;
+}
+
+export function isCloudSocketConnected(): boolean {
+  return socket?.connected || false;
+}
+
 // ─── Stop socket sync ────────────────────────────────────────────────────────
 
 export function stopSocketSync(): void {

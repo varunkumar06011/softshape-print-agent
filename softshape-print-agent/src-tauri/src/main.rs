@@ -4,9 +4,14 @@
 )]
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::sync::Mutex;
 
 #[cfg(windows)]
 mod windows_printing;
+
+static SEEN_EVENT_IDS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+const SEEN_EVENT_IDS_MAX: usize = 500;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PrinterInfo {
@@ -93,13 +98,61 @@ fn get_lan_ip() -> Option<String> {
     }
 }
 
+/// Check if an eventId has already been seen (for cross-path deduplication).
+#[tauri::command]
+fn is_event_id_seen(event_id: String) -> bool {
+    let mut guard = SEEN_EVENT_IDS.lock().unwrap();
+    let set = guard.get_or_insert_with(HashSet::new);
+    set.contains(&event_id)
+}
+
+/// Mark an eventId as seen (for cross-path deduplication).
+/// Evicts an arbitrary entry when the cache exceeds SEEN_EVENT_IDS_MAX to
+/// keep memory bounded.
+#[tauri::command]
+fn mark_event_id_seen(event_id: String) {
+    let mut guard = SEEN_EVENT_IDS.lock().unwrap();
+    let set = guard.get_or_insert_with(HashSet::new);
+    if set.len() >= SEEN_EVENT_IDS_MAX {
+        if let Some(first) = set.iter().next().cloned() {
+            set.remove(&first);
+        }
+    }
+    set.insert(event_id);
+}
+
+/// Atomic test-and-set for cross-path deduplication.
+/// Returns true if the eventId was ALREADY seen (duplicate — caller should skip).
+/// Returns false if the eventId was NOT seen and has now been marked (first
+/// occurrence — caller should proceed to print).
+/// This eliminates the race window between separate check-then-mark calls
+/// where two async paths could both pass the check before either marks.
+#[tauri::command]
+fn check_and_mark_event_id(event_id: String) -> bool {
+    let mut guard = SEEN_EVENT_IDS.lock().unwrap();
+    let set = guard.get_or_insert_with(HashSet::new);
+    if set.contains(&event_id) {
+        return true; // already seen — duplicate
+    }
+    if set.len() >= SEEN_EVENT_IDS_MAX {
+        if let Some(first) = set.iter().next().cloned() {
+            set.remove(&first);
+        }
+    }
+    set.insert(event_id);
+    false // newly marked — first occurrence
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             list_printers,
             print_raw,
             print_network,
-            get_lan_ip
+            get_lan_ip,
+            is_event_id_seen,
+            mark_event_id_seen,
+            check_and_mark_event_id
         ])
         .run(tauri::generate_context!())
         .expect("error while running SoftShape Print Agent");
