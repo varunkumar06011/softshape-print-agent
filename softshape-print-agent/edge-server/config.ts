@@ -56,6 +56,7 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
   }
 
   try {
+    console.log(`[config] Fetching ${backendUrl}/api/edge/config with token (restaurantId=${restaurantId})`);
     const res = await cloudFetch(`${backendUrl}/api/edge/config`, {
       method: "GET",
       headers: {
@@ -65,8 +66,11 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
       timeout: 60_000,
     });
 
+    console.log(`[config] Cloud response: status=${res.status}, ok=${res.ok}`);
+
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
+      console.warn(`[config] Cloud returned error: ${JSON.stringify(body)}`);
       return { success: false, error: body.error || `HTTP ${res.status}` };
     }
 
@@ -353,8 +357,10 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
 
     totalRows = applyConfig();
 
+    console.log(`[config] Download complete: ${totalRows} rows loaded, config_sync_completed=true`);
     return { success: true, tablesLoaded: totalRows };
   } catch (err: any) {
+    console.error(`[config] Download failed: ${err.message}`, err);
     return { success: false, error: err.message || "Failed to download config" };
   }
 }
