@@ -11,7 +11,7 @@
 // Total: 15-40ms from button press to printer starting.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, getNextKotNumber, enqueueSync, getKolkataDateString, createPrintJob, updatePrintJobStatus, getPendingPrintJobs, claimPrintJob, reclaimStalePrintingJobs } from "./db.ts";
+import { getDb, getNextKotNumber, enqueueSync, getKolkataDateString, createPrintJob, updatePrintJobStatus, getPendingPrintJobs, claimPrintJob, reclaimStalePrintingJobs, getPrintJobByEventId } from "./db.ts";
 import { buildFoodKOT, buildLiquorKOT, buildCancelKOT, buildBill, type PrintItem, type OrderData } from "./escpos.ts";
 import { resolvePrinterName } from "./printer.ts";
 import { lanBroadcast, getPrintingClientCount, broadcastPrintJob, waitForPrintAck } from "./lanBroadcast.ts";
@@ -1441,7 +1441,7 @@ export interface PrintBillInput {
   billEventId?: string;
 }
 
-export async function printBillEdge(input: PrintBillInput): Promise<{ success: boolean; error?: string; billNumber?: string; printResults?: any[] }> {
+export async function printBillEdge(input: PrintBillInput): Promise<{ success: boolean; error?: string; billNumber?: string; printResults?: any[]; printPending?: boolean }> {
   const db = getDb();
   const { orderId, restaurantId, discountPercent, localPrinted } = input;
 
@@ -1546,18 +1546,40 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
       itemSummary: [],
       captainName: null,
     });
-    // Async dispatch — don't block the HTTP response
-    dispatchSinglePrintJob(eventId, billGroup, undefined);
-    printResults.push({ ok: null, printerName: billPrinterName, bytes: 0, method: "durable_queued", eventId });
+    // Await the dispatch so we get the real print ack result.
+    // dispatchSinglePrintJob waits for the Tauri frontend's print_ack (up to 20s)
+    // or falls back to cloud relay. This ensures the HTTP response reflects the
+    // actual print status, not a fire-and-forget "queued" placeholder.
+    await dispatchSinglePrintJob(eventId, billGroup, undefined);
+    const job = getPrintJobByEventId(eventId);
+    if (job?.status === "printed") {
+      printResults.push({ ok: true, printerName: billPrinterName, bytes: 0, method: job.acked_via || "lan_ws", eventId });
+    } else if (job?.status === "printing") {
+      // Cloud relay accepted — print is pending, not yet confirmed
+      printResults.push({ ok: null, printerName: billPrinterName, bytes: 0, method: "cloud_relay", eventId, pending: true });
+    } else {
+      // needs_retry, failed, dead_letter, etc.
+      printResults.push({ ok: false, printerName: billPrinterName || "unknown", bytes: 0, error: job?.last_error || "Print failed — will retry automatically", method: "durable_queued", eventId });
+    }
   }
 
-  // Check if all print results indicate hard failure
-  const allFailed = printResults.length > 0 && printResults.every(r => r.ok === false);
-  if (allFailed) {
-    return { success: false, error: "Bill print failed — no print data generated", billNumber, printResults };
-  }
+  // Return truthful status based on actual print results
+  const allPrinted = printResults.length > 0 && printResults.every(r => r.ok === true);
+  const anyFailed = printResults.some(r => r.ok === false);
+  const anyPending = printResults.some(r => r.ok === null);
 
-  return { success: true, billNumber, printResults };
+  if (allPrinted) {
+    return { success: true, billNumber, printResults };
+  } else if (anyFailed && !anyPending) {
+    // All failed, none pending — bill number was assigned but print failed
+    return { success: false, error: printResults.find(r => r.ok === false)?.error || "Bill print failed", billNumber, printResults };
+  } else if (anyPending && !anyFailed) {
+    // Print pending (cloud relay) — bill number assigned, print in progress
+    return { success: true, billNumber, printResults, printPending: true };
+  } else {
+    // Mixed: some failed, some pending — partial failure
+    return { success: true, billNumber, printResults, printPending: true };
+  }
 }
 
 // ─── Settle Order (mark as settled, free the table) ───────────────────────────
