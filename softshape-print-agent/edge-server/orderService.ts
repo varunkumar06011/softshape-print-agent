@@ -14,7 +14,7 @@
 import { getDb, getNextKotNumber, enqueueSync, getKolkataDateString, createPrintJob, updatePrintJobStatus, getPendingPrintJobs, claimPrintJob, reclaimStalePrintingJobs } from "./db.ts";
 import { buildFoodKOT, buildLiquorKOT, buildCancelKOT, buildBill, type PrintItem, type OrderData } from "./escpos.ts";
 import { resolvePrinterName } from "./printer.ts";
-import { lanBroadcast, getLanClientCount, waitForPrintAck } from "./lanBroadcast.ts";
+import { lanBroadcast, getPrintingClientCount, broadcastPrintJob, waitForPrintAck } from "./lanBroadcast.ts";
 import { relayPrintViaCloud, isCloudSocketConnected } from "./socketSync.ts";
 
 // ─── LAN print dispatch ───────────────────────────────────────────────────────
@@ -36,7 +36,7 @@ async function printWithLanFallback(
   groups: PrintGroup[],
   requestId?: string,
 ): Promise<any[]> {
-  const clientCount = getLanClientCount();
+  const clientCount = getPrintingClientCount();
   const results: any[] = [];
   const ackPromises: Promise<void>[] = [];
 
@@ -47,7 +47,7 @@ async function printWithLanFallback(
       continue;
     }
     if (clientCount === 0) {
-      console.warn(`[Print] No LAN WebSocket clients — falling back to cloud relay for ${group.type} → ${group.printerName || "(auto)"}`);
+      console.warn(`[Print] No printing-capable LAN clients — falling back to cloud relay for ${group.type} → ${group.printerName || "(auto)"}`);
       const eventId = `${group.type}-${requestId || Date.now()}-${i}`;
       const relayed = relayPrintViaCloud({
         type: group.type,
@@ -58,7 +58,7 @@ async function printWithLanFallback(
         ok: relayed,
         printerName: group.printerName || null,
         bytes: 0,
-        error: relayed ? null : "No LAN clients and cloud socket not connected",
+        error: relayed ? null : "No printing clients and cloud socket not connected",
         method: relayed ? "cloud_relay" : "lan_ws",
         eventId,
       });
@@ -66,7 +66,7 @@ async function printWithLanFallback(
     }
 
     const eventId = `${group.type}-${requestId || Date.now()}-${i}`;
-    lanBroadcast("print_job", {
+    broadcastPrintJob("print_job", {
       type: group.type,
       data: {
         printerName: group.printerName || null,
@@ -106,19 +106,19 @@ async function printSingleWithLanFallback(
   type: string,
   requestId?: string,
 ): Promise<any> {
-  if (getLanClientCount() === 0) {
-    console.warn(`[Print] No LAN WebSocket clients — falling back to cloud relay for ${type} → ${printerName || "(auto)"}`);
+  if (getPrintingClientCount() === 0) {
+    console.warn(`[Print] No printing-capable LAN clients — falling back to cloud relay for ${type} → ${printerName || "(auto)"}`);
     const eventId = `${type}-${requestId || Date.now()}`;
     const relayed = relayPrintViaCloud({
       type,
       data: { printerName: printerName || null, escposData, requestId: requestId || null },
       eventId,
     });
-    return { ok: relayed, printerName, bytes: 0, error: relayed ? null : "No LAN clients and cloud socket not connected", method: relayed ? "cloud_relay" : "lan_ws", eventId };
+    return { ok: relayed, printerName, bytes: 0, error: relayed ? null : "No printing clients and cloud socket not connected", method: relayed ? "cloud_relay" : "lan_ws", eventId };
   }
 
   const eventId = `${type}-${requestId || Date.now()}`;
-  lanBroadcast("print_job", {
+  broadcastPrintJob("print_job", {
     type,
     data: {
       printerName: printerName || null,
@@ -226,10 +226,10 @@ async function dispatchSinglePrintJob(
   }
 
   try {
-    const clientCount = getLanClientCount();
+    const clientCount = getPrintingClientCount();
 
     if (clientCount === 0) {
-      // No LAN clients — try cloud relay
+      // No printing-capable LAN clients — try cloud relay
       const relayed = relayPrintViaCloud({
         type: group.type,
         data: { printerName: group.printerName || null, escposData: group.escposData, requestId: requestId || null },
@@ -240,13 +240,13 @@ async function dispatchSinglePrintJob(
         // doesn't re-dispatch. The cloud ack path or lease expiry will resolve it.
         return;
       }
-      // No LAN clients and no cloud — mark for retry
-      updatePrintJobStatus(eventId, "needs_retry", "No LAN clients and cloud socket unavailable");
+      // No printing clients and no cloud — mark for retry
+      updatePrintJobStatus(eventId, "needs_retry", "No printing clients and cloud socket unavailable");
       return;
     }
 
-    // Broadcast to LAN WebSocket clients
-    lanBroadcast("print_job", {
+    // Broadcast to printing-capable LAN WebSocket clients only
+    broadcastPrintJob("print_job", {
       type: group.type,
       data: {
         printerName: group.printerName || null,
@@ -1479,9 +1479,40 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
   const printerConfig = outlet.printerConfig || {};
   const billPrinterName = table.bill_printer_name || resolvePrinterName(null, "BILL_PRINTER", null, printerConfig);
 
-  let printResults: any[] = [];
-  // Don't fail if no bill printer resolved — Tauri frontend will resolve from its local mapping
-  printResults = await printWithLanFallback([{ printerName: billPrinterName || null, escposData, type: "BILL" }]);
+  // Use the durable print queue (same as KOT path) so bill prints survive
+  // edge server crashes and are retried by the background dispatch loop.
+  // Use billEventId directly as the event_id for idempotent deduplication
+  // (ON CONFLICT DO NOTHING on the print_job table).
+  const billGroup: PrintGroup = { printerName: billPrinterName || null, escposData, type: "BILL" };
+  const eventId = input.billEventId || `BILL-${orderId}-${Date.now()}`;
+
+  const printResults: any[] = [];
+  if (escposData.length === 0) {
+    printResults.push({ ok: false, printerName: billPrinterName || "unknown", bytes: 0, error: "No print data", method: "noop" });
+  } else {
+    createPrintJob({
+      eventId,
+      restaurantId,
+      orderId,
+      kotId: null,
+      kotNumber: null,
+      tableId: order.table_id,
+      printerName: billPrinterName,
+      jobType: "BILL",
+      escposData,
+      itemSummary: [],
+      captainName: null,
+    });
+    // Async dispatch — don't block the HTTP response
+    dispatchSinglePrintJob(eventId, billGroup, undefined);
+    printResults.push({ ok: null, printerName: billPrinterName, bytes: 0, method: "durable_queued", eventId });
+  }
+
+  // Check if all print results indicate hard failure
+  const allFailed = printResults.length > 0 && printResults.every(r => r.ok === false);
+  if (allFailed) {
+    return { success: false, error: "Bill print failed — no print data generated", billNumber, printResults };
+  }
 
   return { success: true, billNumber, printResults };
 }
@@ -1509,15 +1540,39 @@ export interface SettleOrderInput {
   requestId?: string;
 }
 
-export async function settleOrderEdge(input: SettleOrderInput): Promise<{ success: boolean; error?: string; order?: any; table?: any; statusCode?: number }> {
+export async function settleOrderEdge(input: SettleOrderInput): Promise<{ success: boolean; error?: string; order?: any; table?: any; transaction?: any; statusCode?: number }> {
   const db = getDb();
-  const { orderId, restaurantId, paymentMethod, localTxnId, requestId } = input;
+  const { orderId, restaurantId, paymentMethod, requestId } = input;
+  // Always generate a localTxnId — this ensures a transaction sync record is
+  // always enqueued so the cloud receives the settlement payment.
+  const localTxnId = input.localTxnId || `edge-txn-${orderId}-${Date.now()}`;
 
   // Idempotency check — scoped to the target order to avoid matching other orders
   if (requestId) {
     const existing = db.query("SELECT * FROM order_record WHERE id = ? AND last_request_id = ?").get(orderId, requestId) as any;
     if (existing && existing.status === "SETTLED") {
-      return { success: true, order: existing, error: "Duplicate request — already settled" };
+      // Try to find the previously stored transaction data for this requestId
+      // so the replay returns the original transaction, not just the order.
+      let existingTxn: any = null;
+      try {
+        const rows = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%'").all() as any[];
+        for (const row of rows) {
+          const data = JSON.parse(row.value);
+          if (data.requestId === requestId) {
+            existingTxn = {
+              id: data.localTxnId,
+              orderId,
+              restaurantId,
+              paymentMethod: data.paymentMethod || "CASH",
+              billNumber: existing.bill_number || null,
+              paidAt: new Date(data.settledAt).toISOString(),
+              grandTotal: data.grandTotal ?? null,
+            };
+            break;
+          }
+        }
+      } catch { /* ignore parse errors */ }
+      return { success: true, order: existing, transaction: existingTxn, error: "Duplicate request — already settled" };
     }
   }
 
@@ -1536,38 +1591,38 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
     db.query(`UPDATE "table" SET status = 'AVAILABLE', workflow_status = 'Free', captain_id = NULL, guests = 0, session_started_at = NULL, current_bill = 0, kot_history = '[]', discount = NULL, updated_at = ? WHERE id = ?`)
       .run(now, order.table_id);
 
-    // Store payment details for sync worker to create cloud transaction
-    if (localTxnId || paymentMethod) {
-      const paymentKey = `settle:${localTxnId || orderId}`;
-      const paymentData = JSON.stringify({
-        orderId,
-        restaurantId,
-        paymentMethod: paymentMethod || "CASH",
-        cashAmount: input.cashAmount,
-        cardAmount: input.cardAmount,
-        tipAmount: input.tipAmount,
-        cashTipAmount: input.cashTipAmount,
-        cardTipAmount: input.cardTipAmount,
-        discountPercent: input.discountPercent,
-        subtotal: input.subtotal,
-        discountAmount: input.discountAmount,
-        cgst: input.cgst,
-        sgst: input.sgst,
-        serviceChargeAmount: input.serviceChargeAmount,
-        grandTotal: input.grandTotal,
-        roundOff: input.roundOff,
-        localTxnId,
-        requestId,
-        settledAt: now,
-      });
-      db.query("INSERT INTO edge_config (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?")
-        .run(paymentKey, paymentData, now, paymentData, now);
-    }
+    // Store payment details for sync worker to create cloud transaction.
+    // Always store — even if paymentMethod is missing, default to CASH.
+    const paymentKey = `settle:${localTxnId}`;
+    const paymentData = JSON.stringify({
+      orderId,
+      restaurantId,
+      paymentMethod: paymentMethod || "CASH",
+      cashAmount: input.cashAmount,
+      cardAmount: input.cardAmount,
+      tipAmount: input.tipAmount,
+      cashTipAmount: input.cashTipAmount,
+      cardTipAmount: input.cardTipAmount,
+      discountPercent: input.discountPercent,
+      subtotal: input.subtotal,
+      discountAmount: input.discountAmount,
+      cgst: input.cgst,
+      sgst: input.sgst,
+      serviceChargeAmount: input.serviceChargeAmount,
+      grandTotal: input.grandTotal,
+      roundOff: input.roundOff,
+      localTxnId,
+      requestId,
+      settledAt: now,
+    });
+    db.query("INSERT INTO edge_config (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?")
+      .run(paymentKey, paymentData, now, paymentData, now);
 
-    // Enqueue sync
+    // Enqueue sync — always enqueue a transaction record so the cloud
+    // receives the settlement payment and creates a cloud Transaction.
     enqueueSync("order", orderId, "update");
     enqueueSync("table", order.table_id, "update");
-    if (localTxnId) enqueueSync("transaction", localTxnId, "insert");
+    enqueueSync("transaction", localTxnId, "insert");
   });
 
   try {
@@ -1586,10 +1641,34 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
   lanBroadcast("order:settled", { orderId, tableId: order.table_id, requestId });
   lanBroadcast("table:updated", { table: { id: order.table_id, status: "AVAILABLE", workflowStatus: "Free" }, tableId: order.table_id });
 
+  // Build a local transaction object so the cashier UI can display it
+  // immediately without synthesizing its own.
+  const transaction = {
+    id: localTxnId,
+    orderId,
+    restaurantId,
+    paymentMethod: paymentMethod || "CASH",
+    cashAmount: input.cashAmount ?? null,
+    cardAmount: input.cardAmount ?? null,
+    tipAmount: input.tipAmount ?? 0,
+    discountPercent: input.discountPercent ?? 0,
+    subtotal: input.subtotal ?? null,
+    discountAmount: input.discountAmount ?? null,
+    cgst: input.cgst ?? null,
+    sgst: input.sgst ?? null,
+    serviceChargeAmount: input.serviceChargeAmount ?? null,
+    grandTotal: input.grandTotal ?? null,
+    roundOff: input.roundOff ?? null,
+    billNumber: updatedOrder.bill_number || null,
+    paidAt: new Date(now).toISOString(),
+    settledAt: now,
+  };
+
   return {
     success: true,
     order: updatedOrder,
     table: { ...updatedTable, kot_history: safeParseKotHistory(updatedTable.kot_history) },
+    transaction,
   };
 }
 

@@ -48,7 +48,7 @@ import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDe
 import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode, relayPrintViaCloud } from "./socketSync.ts";
 import { acquireInstanceLock, startHeartbeatLoop, stopHeartbeatLoop, releaseInstanceLock, forceReleaseLock, getLockStatus } from "./instanceLock.ts";
 import { cloudFetch } from "./cloudFetch.ts";
-import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount, lanBroadcast, resolvePrintAck, waitForPrintAck } from "./lanBroadcast.ts";
+import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount, getPrintingClientCount, setClientCapability, lanBroadcast, broadcastPrintJob, resolvePrintAck, waitForPrintAck } from "./lanBroadcast.ts";
 
 const PORT = parseInt(process.env.EDGE_PORT || "3101", 10);
 let startupState: "starting" | "ready" | "error" = "starting";
@@ -198,7 +198,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return jsonResponse({ ok: false, error: "Missing print payload (escposData, bytes, or text required)" }, 400);
     }
 
-    const clientCount = getLanClientCount();
+    const clientCount = getPrintingClientCount();
     if (clientCount === 0) {
       const printEventId = eventId || `${effectiveType}-${Date.now()}`;
       const relayed = relayPrintViaCloud({
@@ -207,14 +207,14 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         eventId: printEventId,
       });
       if (relayed) {
-        console.log(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} via cloud fallback (no LAN clients)`);
+        console.log(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} via cloud fallback (no printing clients)`);
         return jsonResponse({ ok: true, queued: false, clients: 0, method: "cloud_relay", eventId: printEventId });
       }
-      return jsonResponse({ ok: false, error: "No LAN WebSocket clients connected and cloud socket not available", queued: false }, 503);
+      return jsonResponse({ ok: false, error: "No printing-capable LAN WebSocket clients connected and cloud socket not available", queued: false }, 503);
     }
 
     const printEventId = eventId || `${effectiveType}-${Date.now()}`;
-    lanBroadcast("print_job", {
+    broadcastPrintJob("print_job", {
       type: effectiveType,
       data: {
         printerName: targetPrinter,
@@ -1153,7 +1153,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── GET /api/edge/lan/status — LAN WebSocket client count (Bug 2) ─────────
   if (url.pathname === "/api/edge/lan/status" && req.method === "GET") {
-    return jsonResponse({ connectedClients: getLanClientCount() });
+    return jsonResponse({ connectedClients: getLanClientCount(), printingClients: getPrintingClientCount() });
   }
 
   // ── GET /api/edge/print-jobs — print job queue status (diagnostics) ────────
@@ -1758,6 +1758,11 @@ const server = Bun.serve({
         const data = JSON.parse(message.toString());
         if (data.type === "ping") {
           ws.send(JSON.stringify({ type: "pong", ts: Date.now() }));
+        } else if (data.type === "register") {
+          // Client declares its capabilities on connect.
+          // Tauri desktops send { type: "register", canPrint: true }
+          // Captain web/APK sends { type: "register", canPrint: false }
+          setClientCapability(ws, data.canPrint === true);
         } else if (data.type === "print_ack") {
           // Tauri frontend confirms print success/failure
           const ok = data.ok === true;
