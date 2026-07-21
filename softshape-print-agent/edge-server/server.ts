@@ -398,15 +398,19 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       const configResult = await downloadFullConfig();
 
       if (!configResult.success) {
-        // Config download failed — clear the session so the broken first attempt
-        // doesn't become permanently invisible on next launch (isLocalReady would
-        // otherwise see the saved session + a partial outlet row and skip to "ready").
-        clearSession();
-        return errorResponse(
-          `Registration succeeded but config download failed: ${configResult.error || 'unknown error'}. ` +
-          'Please retry — your setup token may still be valid.',
-          500
-        );
+        // Keep the session — registration succeeded and the session token is
+        // valid for 30 days. The user should NOT need to re-link the restaurant
+        // just because the config download failed. The frontend will retry
+        // config sync via POST /api/edge/config/sync on the next launch.
+        console.warn(`[register] Config download failed after successful registration: ${configResult.error}. Session preserved for retry.`);
+        return jsonResponse({
+          success: true,
+          restaurantId: data.restaurantId,
+          restaurantName: data.restaurantName,
+          configDownloaded: false,
+          configError: configResult.error || 'unknown error',
+          tablesLoaded: 0,
+        });
       }
 
       return jsonResponse({
