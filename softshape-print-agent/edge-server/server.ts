@@ -380,8 +380,10 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
       const data = await res.json();
 
-      // Save session
+      // Save session immediately so the cloud key fallback and background
+      // config download both have a valid agent-session token.
       const expiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000; // 30 days
+      let edgeApiKey = data.edgeApiKey || null;
       saveSession({
         sessionToken: data.sessionToken,
         restaurantId: data.restaurantId,
@@ -389,39 +391,44 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         restaurantCode: restaurantCode || "",
         backendUrl,
         expiresAt,
-        edgeApiKey: data.edgeApiKey,
+        edgeApiKey: edgeApiKey || undefined,
       });
-      if (data.edgeApiKey) {
-        saveEdgeApiKey(data.edgeApiKey);
-      }
 
-      // Trigger initial config download
-      const configResult = await downloadFullConfig();
-
-      if (!configResult.success) {
-        // Keep the session — registration succeeded and the session token is
-        // valid for 30 days. The user should NOT need to re-link the restaurant
-        // just because the config download failed. The frontend will retry
-        // config sync via POST /api/edge/config/sync on the next launch.
-        console.warn(`[register] Config download failed after successful registration: ${configResult.error}. Session preserved for retry.`);
-        return jsonResponse({
-          success: true,
-          restaurantId: data.restaurantId,
-          restaurantName: data.restaurantName,
-          configDownloaded: false,
-          configError: configResult.error || 'unknown error',
-          tablesLoaded: 0,
-          edgeApiKey: data.edgeApiKey || null,
-        });
+      // Older backend builds do not include edgeApiKey in agent-register.
+      // Fetch it with the newly issued agent session token before returning.
+      if (!edgeApiKey && data.sessionToken) {
+        try {
+          const keyRes = await cloudFetch(`${backendUrl}/api/edge/key`, {
+            method: "GET",
+            headers: {
+              Authorization: `Bearer ${data.sessionToken}`,
+              "Content-Type": "application/json",
+            },
+            timeout: 15_000,
+          });
+          if (keyRes.ok) {
+            const keyBody = await keyRes.json();
+            edgeApiKey = keyBody.edgeApiKey || null;
+          }
+        } catch (keyErr: any) {
+          console.warn(`[register] Could not fetch edge API key fallback: ${keyErr.message}`);
+        }
       }
+      if (edgeApiKey) saveEdgeApiKey(edgeApiKey);
+
+      // Don't start a background config download — the frontend will call
+      // /api/edge/config/sync immediately after receiving this response.
+      // That call invokes downloadFullConfig() directly, so any errors are
+      // properly surfaced to the user instead of swallowed by a void promise.
 
       return jsonResponse({
         success: true,
         restaurantId: data.restaurantId,
         restaurantName: data.restaurantName,
-        configDownloaded: true,
-        tablesLoaded: configResult.tablesLoaded || 0,
-        edgeApiKey: data.edgeApiKey || null,
+        configDownloaded: false,
+        configPending: true,
+        tablesLoaded: 0,
+        edgeApiKey,
       });
     } catch (err: any) {
       return errorResponse(err.message || "Failed to connect to backend");
@@ -431,10 +438,13 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   // ── POST /api/edge/config/sync — trigger full config re-download ───────────
   if (url.pathname === "/api/edge/config/sync" && req.method === "POST") {
     if (!isSessionValid()) {
+      console.warn("[config/sync] Session invalid or expired");
       return errorResponse("No valid session — register first", 401);
     }
 
+    console.log("[config/sync] Starting downloadFullConfig()...");
     const result = await downloadFullConfig();
+    console.log(`[config/sync] downloadFullConfig() returned: success=${result.success}, tablesLoaded=${result.tablesLoaded || 0}, error=${result.error || 'none'}`);
     if (!result.success) {
       return errorResponse(result.error || "Config sync failed", 500);
     }
