@@ -370,6 +370,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
           ...(restaurantCode ? { restaurantCode } : {}),
           ...(lanIp ? { lanIp } : {}),
         }),
+        timeout: 30_000,
       });
 
       if (!res.ok) {
@@ -410,6 +411,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
           configDownloaded: false,
           configError: configResult.error || 'unknown error',
           tablesLoaded: 0,
+          edgeApiKey: data.edgeApiKey || null,
         });
       }
 
@@ -419,6 +421,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         restaurantName: data.restaurantName,
         configDownloaded: true,
         tablesLoaded: configResult.tablesLoaded || 0,
+        edgeApiKey: data.edgeApiKey || null,
       });
     } catch (err: any) {
       return errorResponse(err.message || "Failed to connect to backend");
@@ -433,7 +436,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     const result = await downloadFullConfig();
     if (!result.success) {
-      return errorResponse(result.error || "Config sync failed");
+      return errorResponse(result.error || "Config sync failed", 500);
     }
 
     return jsonResponse({

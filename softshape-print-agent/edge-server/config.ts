@@ -62,6 +62,7 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
       },
+      timeout: 60_000,
     });
 
     if (!res.ok) {
