@@ -107,7 +107,8 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
         db.query(`DELETE FROM menu_item_variant WHERE restaurant_id = ?`).run(restaurantId);
         db.query(`DELETE FROM menu_item WHERE restaurant_id = ?`).run(restaurantId);
         db.query(`DELETE FROM category WHERE restaurant_id = ?`).run(restaurantId);
-        db.query(`DELETE FROM "table" WHERE restaurant_id = ?`).run(restaurantId);
+        // Only delete tables that have no active orders
+        db.query(`DELETE FROM "table" WHERE restaurant_id = ? AND id NOT IN (SELECT table_id FROM order_record WHERE restaurant_id = ? AND status IN ('PREPARING','READY','BILLING_REQUESTED','SETTLED') AND is_deleted = 0)`).run(restaurantId, restaurantId);
         db.query(`DELETE FROM section WHERE restaurant_id = ?`).run(restaurantId);
         db.query(`DELETE FROM floor WHERE restaurant_id = ?`).run(restaurantId);
         db.query(`DELETE FROM venue WHERE restaurant_id = ?`).run(restaurantId);
@@ -118,13 +119,16 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
       }
     } else {
       // Single outlet mode - purge only for current restaurant
+      // Guard: preserve tables that have active orders to avoid orphaning
+      // in-service operational state during config refresh.
       db.query(`DELETE FROM venue_menu_item_availability WHERE restaurant_id = ?`).run(rid);
       db.query(`DELETE FROM venue_price WHERE restaurant_id = ?`).run(rid);
       db.query(`DELETE FROM menu_item_addon WHERE restaurant_id = ?`).run(rid);
       db.query(`DELETE FROM menu_item_variant WHERE restaurant_id = ?`).run(rid);
       db.query(`DELETE FROM menu_item WHERE restaurant_id = ?`).run(rid);
       db.query(`DELETE FROM category WHERE restaurant_id = ?`).run(rid);
-      db.query(`DELETE FROM "table" WHERE restaurant_id = ?`).run(rid);
+      // Only delete tables that have no active orders
+      db.query(`DELETE FROM "table" WHERE restaurant_id = ? AND id NOT IN (SELECT table_id FROM order_record WHERE restaurant_id = ? AND status IN ('PREPARING','READY','BILLING_REQUESTED','SETTLED') AND is_deleted = 0)`).run(rid, rid);
       db.query(`DELETE FROM section WHERE restaurant_id = ?`).run(rid);
       db.query(`DELETE FROM floor WHERE restaurant_id = ?`).run(rid);
       db.query(`DELETE FROM venue WHERE restaurant_id = ?`).run(rid);
@@ -386,13 +390,18 @@ export async function pullIncrementalChanges(): Promise<{ success: boolean; chan
     // The cloud endpoint returns changes grouped by table:
     // { timestamp, changes: [{ table, operation, row }, ...] }
     // We apply each change via upsert (for insert/update) or delete.
+    // All changes are applied atomically in a single transaction so a crash
+    // mid-pull doesn't leave a half-applied config.
     let applied = 0;
     if (data.changes && data.changes.length > 0) {
       const db = getDb();
-      for (const change of data.changes) {
-        const ok = applyChange(db, change);
-        if (ok) applied++;
-      }
+      const tx = db.transaction(() => {
+        for (const change of data.changes) {
+          const ok = applyChange(db, change);
+          if (ok) applied++;
+        }
+      });
+      tx();
     }
 
     setSyncState("last_incremental_sync", data.timestamp || new Date().toISOString());

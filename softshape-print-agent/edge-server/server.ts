@@ -37,7 +37,7 @@
 //   GET  /api/edge/sync/socket  — socket connection status
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enqueueSync, getRecoveryStatus, updatePrintJobStatus, getPendingPrintJobs, getOrderSyncStatus, getPrintJobByEventId } from "./db.ts";
+import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enqueueSync, getRecoveryStatus, updatePrintJobStatus, getPendingPrintJobs, getOrderSyncStatus, getPrintJobByEventId, cancelPrintJob, reprintPrintJob, getPrintJobsByOrder, insertSyncAudit, getSyncAuditRecords } from "./db.ts";
 import os from "os";
 import { runDailyMaintenance, runPeriodicBackup } from "./backup.ts";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
@@ -49,6 +49,7 @@ import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopH
 import { acquireInstanceLock, startHeartbeatLoop, stopHeartbeatLoop, releaseInstanceLock, forceReleaseLock, getLockStatus } from "./instanceLock.ts";
 import { cloudFetch } from "./cloudFetch.ts";
 import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount, getPrintingClientCount, setClientCapability, lanBroadcast, broadcastPrintJob, resolvePrintAck, waitForPrintAck } from "./lanBroadcast.ts";
+import { hashSync } from "bcryptjs";
 
 const PORT = parseInt(process.env.EDGE_PORT || "3101", 10);
 let startupState: "starting" | "ready" | "error" = "starting";
@@ -73,6 +74,25 @@ function errorResponse(error: string, status = 400): Response {
   return jsonResponse({ error }, status);
 }
 
+// ── One-time setup nonce for onboarding protection ───────────────────────────
+// Prevents unauthorized LAN devices from calling /api/edge/onboard during the
+// setup window. The nonce is generated on first boot, exposed via /health only
+// before onboarding completes, and invalidated after successful onboarding.
+
+function getSetupNonce(): string | null {
+  const existing = getConfig("setup_nonce");
+  if (existing) return existing;
+  // Generate a new nonce on first boot
+  const nonce = crypto.randomUUID();
+  setConfig("setup_nonce", nonce);
+  return nonce;
+}
+
+function invalidateSetupNonce(): void {
+  const db = getDb();
+  db.query("DELETE FROM edge_config WHERE key = ?").run("setup_nonce");
+}
+
 // ── Route handlers ────────────────────────────────────────────────────────────
 
 async function handleRequest(req: Request, url: URL): Promise<Response> {
@@ -82,44 +102,46 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   }
 
   // ── LAN API key auth (staged rollout) ────────────────────────────────────────
-  // Public routes that don't require the edge API key. Everything else must either
-  // present the correct X-Edge-Key header or wait until the restaurant has flipped
-  // enforcement via EDGE_REQUIRE_KEY=true.
+  // Routes that never require the edge API key. Only truly public routes
+  // (health check, cloud registration with setup token) belong here.
+  // All POS operation routes require the X-Edge-Key header when a key is
+  // configured on the edge server. This prevents unauthorized LAN devices
+  // from creating orders, settling bills, or triggering prints.
   const PUBLIC_LAN_PATHS = new Set([
     "/health",
-    "/print",
     "/api/edge/register",
-    "/api/edge/onboard",
-    "/api/edge/sections",
-    "/api/edge/tables",
-    "/api/edge/tables/flat",
-    "/api/edge/menu",
-    "/api/edge/menu/items",
-    "/api/edge/venues",
-    "/api/edge/outlet",
-    "/api/edge/order",
-    "/api/edge/order/update",
-    "/api/edge/order/cancel",
-    "/api/edge/order/cancel-items",
-    "/api/edge/order/print-bill",
-    "/api/edge/order/settle",
-    "/api/edge/order/confirm-payment",
-    "/api/edge/order/status",
-    "/api/edge/orders",
-    "/api/edge/print-jobs",
-    "/api/edge/print-jobs/retry",
   ]);
 
-  if (!PUBLIC_LAN_PATHS.has(url.pathname)) {
-    const configuredKey = getEdgeApiKey();
-    const requireKey = process.env.EDGE_REQUIRE_KEY === "true";
-    const provided = req.headers.get("X-Edge-Key");
+  // /api/edge/onboard is only accessible before initial setup is complete.
+  // After onboarding, it is blocked entirely to prevent re-initialization.
+  // /print is a legacy LAN relay path that requires the edge key when configured.
+  const isOnboarded = isLocalReady();
+  const configuredKey = getEdgeApiKey();
+  const provided = req.headers.get("X-Edge-Key");
 
-    if (configuredKey && provided && provided !== configuredKey) {
-      return errorResponse("Invalid edge API key", 401);
-    }
-    if (requireKey && (!provided || provided !== configuredKey)) {
-      return errorResponse("Missing or invalid edge API key", 401);
+  if (!PUBLIC_LAN_PATHS.has(url.pathname)) {
+    // Block onboarding after initial setup
+    if (url.pathname === "/api/edge/onboard") {
+      if (isOnboarded) {
+        return errorResponse("Onboarding already complete — device is registered", 403);
+      }
+      // Before onboarding completes, allow without key (initial setup flow)
+    } else if (url.pathname === "/print") {
+      // /print requires the edge key when one is configured
+      if (configuredKey && provided !== configuredKey) {
+        return errorResponse("Missing or invalid edge API key", 401);
+      }
+    } else {
+      // All other routes: require key when configured.
+      // EDGE_REQUIRE_KEY=true makes the key mandatory even if not yet configured.
+      const requireKey = process.env.EDGE_REQUIRE_KEY === "true";
+      if (configuredKey) {
+        if (!provided || provided !== configuredKey) {
+          return errorResponse("Missing or invalid edge API key", 401);
+        }
+      } else if (requireKey) {
+        return errorResponse("Edge API key required but not configured", 401);
+      }
     }
   }
 
@@ -150,19 +172,53 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         if (lanIp) break;
       }
     } catch (e) { console.warn('[health] network interface enumeration failed:', (e as Error).message); }
+
+    // Operational metrics for monitoring
+    let syncMetrics: any = null;
+    try {
+      syncMetrics = getSyncStatus();
+    } catch { /* ignore */ }
+
+    let printMetrics: any = null;
+    try {
+      const db = getDb();
+      const summary = db.query(`
+        SELECT
+          SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END) as accepted,
+          SUM(CASE WHEN status = 'printing' THEN 1 ELSE 0 END) as printing,
+          SUM(CASE WHEN status = 'printed' THEN 1 ELSE 0 END) as printed,
+          SUM(CASE WHEN status = 'needs_retry' THEN 1 ELSE 0 END) as needs_retry,
+          SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+          SUM(CASE WHEN status = 'dead_letter' THEN 1 ELSE 0 END) as dead_letter,
+          SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelled
+        FROM print_job
+      `).get() as any;
+      printMetrics = summary;
+    } catch { /* ignore */ }
+
     return jsonResponse({
       status: "ok",
       service: "softshape-edge-server",
-      version: "17.1.0",
+      version: "18.5.0",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
+      onboarded: isLocalReady(),
+      setupNonce: isLocalReady() ? null : getSetupNonce(),
       uptime: process.uptime(),
       databaseRecovered: recovery.recovered,
       recoveryMessage: recovery.message || null,
       lanIp,
       edgePort: PORT,
       maintenanceError: startupError || null,
+      sync: syncMetrics ? {
+        workerRunning: syncMetrics.workerRunning,
+        pendingCount: syncMetrics.pendingCount,
+        deadLetterCount: syncMetrics.deadLetterCount,
+        consecutiveFailures: syncMetrics.consecutiveFailures,
+        lastSyncAt: syncMetrics.lastSyncAt,
+      } : null,
+      printQueue: printMetrics,
     });
   }
 
@@ -934,6 +990,30 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse(data);
   }
 
+  // ── GET /api/edge/config/version — config version metadata for cache validation
+  if (url.pathname === "/api/edge/config/version" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const lastFullSync = getSyncState("last_full_config_sync") || null;
+    const lastIncrementalSync = getSyncState("last_incremental_sync") || null;
+    const db = getDb();
+    const rid = getRestaurantId();
+    const categoryCount = (db.query("SELECT COUNT(*) as c FROM category WHERE restaurant_id = ? AND is_active = 1").get(rid) as any)?.c || 0;
+    const menuItemCount = (db.query("SELECT COUNT(*) as c FROM menu_item WHERE is_deleted = 0 AND restaurant_id = ?").get(rid) as any)?.c || 0;
+    const tableCount = (db.query("SELECT COUNT(*) as c FROM \"table\" WHERE restaurant_id = ?").get(rid) as any)?.c || 0;
+    const venueCount = (db.query("SELECT COUNT(*) as c FROM venue WHERE restaurant_id = ? AND is_deleted = 0").get(rid) as any)?.c || 0;
+    return jsonResponse({
+      lastFullConfigSync: lastFullSync,
+      lastIncrementalSync: lastIncrementalSync,
+      restaurantId: rid,
+      stats: {
+        categories: categoryCount,
+        menuItems: menuItemCount,
+        tables: tableCount,
+        venues: venueCount,
+      },
+    });
+  }
+
   // ── GET /api/edge/venues — venues with floors and sections ─────────────────
   if (url.pathname === "/api/edge/venues" && req.method === "GET") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
@@ -1013,6 +1093,13 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   if (url.pathname === "/api/edge/sync/status" && req.method === "GET") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     return jsonResponse(getSyncStatus());
+  }
+
+  // ── GET /api/edge/sync/audit — permanent rejection/conflict audit log ──────
+  if (url.pathname === "/api/edge/sync/audit" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const limit = Math.min(parseInt(url.searchParams.get("limit") || "100", 10), 500);
+    return jsonResponse({ records: getSyncAuditRecords(limit) });
   }
 
   // ── POST /api/edge/sync/push — manually trigger a sync push ────────────────
@@ -1181,6 +1268,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       needs_retry: (db.query("SELECT COUNT(*) as c FROM print_job WHERE status = 'needs_retry'").get() as any)?.c || 0,
       printed: (db.query("SELECT COUNT(*) as c FROM print_job WHERE status = 'printed'").get() as any)?.c || 0,
       failed: (db.query("SELECT COUNT(*) as c FROM print_job WHERE status = 'failed'").get() as any)?.c || 0,
+      dead_letter: (db.query("SELECT COUNT(*) as c FROM print_job WHERE status = 'dead_letter'").get() as any)?.c || 0,
+      cancelled: (db.query("SELECT COUNT(*) as c FROM print_job WHERE status = 'cancelled'").get() as any)?.c || 0,
     };
 
     return jsonResponse({ jobs: rows, summary }, 200, { "Cache-Control": "no-store" });
@@ -1191,6 +1280,70 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const result = await dispatchPendingPrintJobs();
     return jsonResponse({ success: true, ...result });
+  }
+
+  // ── POST /api/edge/print-jobs/cancel — cancel a pending or retryable print job ──
+  if (url.pathname === "/api/edge/print-jobs/cancel" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const body = await req.json().catch(() => ({}));
+    const { eventId } = body;
+    if (!eventId) return errorResponse("eventId is required", 400);
+    const cancelled = cancelPrintJob(eventId);
+    if (!cancelled) return errorResponse("Job not found or not in a cancellable state", 404);
+    return jsonResponse({ success: true, eventId, status: "cancelled" });
+  }
+
+  // ── POST /api/edge/print-jobs/reprint — reprint a print job with a new event ID ──
+  if (url.pathname === "/api/edge/print-jobs/reprint" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const body = await req.json().catch(() => ({}));
+    const { eventId, newEventId } = body;
+    if (!eventId) return errorResponse("eventId is required", 400);
+    const result = reprintPrintJob(eventId, newEventId);
+    if (!result) return errorResponse("Original print job not found", 404);
+    // Dispatch the new reprint immediately
+    const { dispatchSinglePrintJob } = await import("./orderService.ts");
+    const job = getPrintJobByEventId(result.eventId);
+    if (job) {
+      try {
+        const escposData = JSON.parse(job.escpos_data);
+        dispatchSinglePrintJob(result.eventId, { printerName: job.printer_name, escposData, type: job.job_type });
+      } catch (e) {
+        console.warn("[Reprint] Failed to dispatch reprint job:", e);
+      }
+    }
+    return jsonResponse({ success: true, ...result });
+  }
+
+  // ── POST /api/edge/print-jobs/test — send a test print to a specific printer ──
+  if (url.pathname === "/api/edge/print-jobs/test" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const body = await req.json().catch(() => ({}));
+    const { printerName } = body;
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const eventId = `test-print-${Date.now()}`;
+    const testEscpos = [
+      { type: "text", format: "plain", data: "=== TEST PRINT ===" },
+      { type: "text", format: "plain", data: `Printer: ${printerName || "(auto)"}` },
+      { type: "text", format: "plain", data: `Time: ${new Date().toISOString()}` },
+      { type: "text", format: "plain", data: "=================" },
+      { type: "cut", format: "command", data: "partial" },
+    ];
+    const { createPrintJob } = await import("./db.ts");
+    createPrintJob({
+      eventId,
+      restaurantId,
+      orderId: "test-print",
+      printerName: printerName || null,
+      jobType: "TEST",
+      escposData: testEscpos,
+      itemSummary: [],
+      captainName: "system",
+    });
+    const { dispatchSinglePrintJob } = await import("./orderService.ts");
+    dispatchSinglePrintJob(eventId, { printerName: printerName || null, escposData: testEscpos, type: "TEST" });
+    return jsonResponse({ success: true, eventId, message: "Test print dispatched" });
   }
 
   // ── POST /api/edge/onboard — 4-step offline onboarding ─────────────────────
@@ -1204,9 +1357,15 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return errorResponse("Invalid JSON body", 400);
     }
 
-    const { restaurantName, restaurantType, owner, menuTemplate, tableCount, printerMapping } = body;
+    const { restaurantName, restaurantType, owner, menuTemplate, tableCount, printerMapping, setupNonce } = body;
     if (!restaurantName || !owner?.name || !owner?.pin) {
       return errorResponse("restaurantName, owner.name, and owner.pin are required", 400);
+    }
+
+    // Validate one-time setup nonce to prevent unauthorized onboarding from LAN
+    const expectedNonce = getSetupNonce();
+    if (expectedNonce && setupNonce !== expectedNonce) {
+      return errorResponse("Invalid or missing setup nonce — fetch from /health before onboarding", 403);
     }
 
     try {
@@ -1215,109 +1374,123 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       const slug = restaurantName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
       const restaurantCode = slug.slice(0, 8).toUpperCase();
 
-      // 1. Create outlet (restaurant settings)
-      const organizationId = crypto.randomUUID();
-      db.query(`INSERT INTO outlet (id, name, slug, restaurant_code, restaurant_type, gst_category, gst_rate, gst_registered, prices_include_gst, organization_id)
-                VALUES (?, ?, ?, ?, ?, 'NON_AC', 5.0, 1, 0, ?)`)
-        .run(restaurantId, restaurantName, slug, restaurantCode, restaurantType || 'DINE_IN_VEG', organizationId);
-      enqueueSync('outlet', restaurantId, 'create');
+      // ── Atomic onboarding transaction ────────────────────────────────────────
+      // All DB writes (outlet, venue, floor, section, tables, menu, user, session,
+      // sync_state, nonce invalidation) are wrapped in a single transaction.
+      // If any step fails, the entire onboarding is rolled back — no partial
+      // restaurant setup, and the nonce remains valid for retry.
+      const tx = db.transaction(() => {
+        // 1. Create outlet (restaurant settings)
+        const organizationId = crypto.randomUUID();
+        db.query(`INSERT INTO outlet (id, name, slug, restaurant_code, restaurant_type, gst_category, gst_rate, gst_registered, prices_include_gst, organization_id)
+                  VALUES (?, ?, ?, ?, ?, 'NON_AC', 5.0, 1, 0, ?)`)
+          .run(restaurantId, restaurantName, slug, restaurantCode, restaurantType || 'DINE_IN_VEG', organizationId);
+        enqueueSync('outlet', restaurantId, 'create');
 
-      // 2. Create default venue + floor + section
-      const venueId = crypto.randomUUID();
-      db.query(`INSERT INTO venue (id, restaurant_id, name, venue_type, is_active, sort_order)
-                VALUES (?, ?, 'Main Hall', 'RESTAURANT', 1, 0)`)
-        .run(venueId, restaurantId);
-      enqueueSync('venue', venueId, 'create');
+        // 2. Create default venue + floor + section
+        const venueId = crypto.randomUUID();
+        db.query(`INSERT INTO venue (id, restaurant_id, name, venue_type, is_active, sort_order)
+                  VALUES (?, ?, 'Main Hall', 'RESTAURANT', 1, 0)`)
+          .run(venueId, restaurantId);
+        enqueueSync('venue', venueId, 'create');
 
-      const floorId = crypto.randomUUID();
-      db.query(`INSERT INTO floor (id, venue_id, restaurant_id, name, sort_order)
-                VALUES (?, ?, ?, 'Ground Floor', 0)`)
-        .run(floorId, venueId, restaurantId);
-      enqueueSync('floor', floorId, 'create');
+        const floorId = crypto.randomUUID();
+        db.query(`INSERT INTO floor (id, venue_id, restaurant_id, name, sort_order)
+                  VALUES (?, ?, ?, 'Ground Floor', 0)`)
+          .run(floorId, venueId, restaurantId);
+        enqueueSync('floor', floorId, 'create');
 
-      const sectionId = crypto.randomUUID();
-      db.query(`INSERT INTO section (id, name, restaurant_id, floor_id, sort_order, is_active)
-                VALUES (?, 'Main Section', ?, ?, 0, 1)`)
-        .run(sectionId, restaurantId, floorId);
-      enqueueSync('section', sectionId, 'create');
+        const sectionId = crypto.randomUUID();
+        db.query(`INSERT INTO section (id, name, restaurant_id, floor_id, sort_order, is_active)
+                  VALUES (?, 'Main Section', ?, ?, 0, 1)`)
+          .run(sectionId, restaurantId, floorId);
+        enqueueSync('section', sectionId, 'create');
 
-      // 3. Create tables
-      const numTables = Math.max(1, Math.min(100, parseInt(tableCount) || 10));
-      for (let i = 1; i <= numTables; i++) {
-        const tableId = crypto.randomUUID();
-        db.query(`INSERT INTO "table" (id, number, capacity, section_id, restaurant_id, status, workflow_status)
-                  VALUES (?, ?, 4, ?, ?, 'AVAILABLE', 'Free')`)
-          .run(tableId, i, sectionId, restaurantId);
-        enqueueSync('table', tableId, 'create');
-      }
+        // 3. Create tables
+        const numTables = Math.max(1, Math.min(100, parseInt(tableCount) || 10));
+        for (let i = 1; i <= numTables; i++) {
+          const tableId = crypto.randomUUID();
+          db.query(`INSERT INTO "table" (id, number, capacity, section_id, restaurant_id, status, workflow_status)
+                    VALUES (?, ?, 4, ?, ?, 'AVAILABLE', 'Free')`)
+            .run(tableId, i, sectionId, restaurantId);
+          enqueueSync('table', tableId, 'create');
+        }
 
-      // 4. Create menu from template
-      const template = menuTemplate || { categories: [] };
-      for (const cat of template.categories || []) {
-        const categoryId = crypto.randomUUID();
-        db.query(`INSERT INTO category (id, name, restaurant_id, sort_order, is_active)
-                  VALUES (?, ?, ?, ?, 1)`)
-          .run(categoryId, cat.name, restaurantId, cat.sortOrder || 0);
-        enqueueSync('category', categoryId, 'create');
+        // 4. Create menu from template
+        const template = menuTemplate || { categories: [] };
+        for (const cat of template.categories || []) {
+          const categoryId = crypto.randomUUID();
+          db.query(`INSERT INTO category (id, name, restaurant_id, sort_order, is_active)
+                    VALUES (?, ?, ?, ?, 1)`)
+            .run(categoryId, cat.name, restaurantId, cat.sortOrder || 0);
+          enqueueSync('category', categoryId, 'create');
 
-        for (const item of cat.items || []) {
-          const itemId = crypto.randomUUID();
-          db.query(`INSERT INTO menu_item (id, name, description, is_veg, is_available, sort_order, category_id, restaurant_id,
-                    base_price, unit, menu_type, gst_enabled, is_deleted)
-                    VALUES (?, ?, NULL, ?, 1, 0, ?, ?, ?, ?, ?, 1, 0)`)
-            .run(itemId, item.name, item.isVeg ? 1 : 0, categoryId, restaurantId,
-                 item.basePrice || 0, item.unit || null, item.menuType || 'FOOD');
-          enqueueSync('menu_item', itemId, 'create');
+          for (const item of cat.items || []) {
+            const itemId = crypto.randomUUID();
+            db.query(`INSERT INTO menu_item (id, name, description, is_veg, is_available, sort_order, category_id, restaurant_id,
+                      base_price, unit, menu_type, gst_enabled, is_deleted)
+                      VALUES (?, ?, NULL, ?, 1, 0, ?, ?, ?, ?, ?, 1, 0)`)
+              .run(itemId, item.name, item.isVeg ? 1 : 0, categoryId, restaurantId,
+                   item.basePrice || 0, item.unit || null, item.menuType || 'FOOD');
+            enqueueSync('menu_item', itemId, 'create');
 
-          // Create variants if present
-          if (item.variants && Array.isArray(item.variants)) {
-            for (const variant of item.variants) {
-              const variantId = crypto.randomUUID();
-              db.query(`INSERT INTO menu_item_variant (id, name, price, is_default, menu_item_id, is_available, restaurant_id)
-                        VALUES (?, ?, ?, ?, ?, 1, ?)`)
-                .run(variantId, variant.name, variant.price, variant.isDefault ? 1 : 0, itemId, restaurantId);
-              enqueueSync('menu_item_variant', variantId, 'create');
+            // Create variants if present
+            if (item.variants && Array.isArray(item.variants)) {
+              for (const variant of item.variants) {
+                const variantId = crypto.randomUUID();
+                db.query(`INSERT INTO menu_item_variant (id, name, price, is_default, menu_item_id, is_available, restaurant_id)
+                          VALUES (?, ?, ?, ?, ?, 1, ?)`)
+                  .run(variantId, variant.name, variant.price, variant.isDefault ? 1 : 0, itemId, restaurantId);
+                enqueueSync('menu_item_variant', variantId, 'create');
+              }
             }
           }
         }
-      }
 
-      // 5. Create owner user with PIN
-      const { hashSync } = await import("bcryptjs");
-      const userId = crypto.randomUUID();
-      const pinHash = hashSync(String(owner.pin), 10);
-      db.query(`INSERT INTO users (id, name, pin, role, outlet_id, is_active, synced_at)
-                VALUES (?, ?, ?, 'OWNER', ?, 1, unixepoch())`)
-        .run(userId, owner.name, pinHash, restaurantId);
-      enqueueSync('users', userId, 'create');
+        // 5. Create owner user with PIN
+        const userId = crypto.randomUUID();
+        const pinHash = hashSync(String(owner.pin), 10);
+        db.query(`INSERT INTO users (id, name, pin, role, outlet_id, is_active, synced_at)
+                  VALUES (?, ?, ?, 'OWNER', ?, 1, unixepoch())`)
+          .run(userId, owner.name, pinHash, restaurantId);
+        enqueueSync('users', userId, 'create');
 
-      // 6. Save printer config
-      if (printerMapping) {
-        setConfig('printer_config', JSON.stringify(printerMapping));
-      }
+        // 6. Save printer config
+        if (printerMapping) {
+          setConfig('printer_config', JSON.stringify(printerMapping));
+        }
 
-      // 7. Save session so the edge server is "registered" locally
-      saveSession({
-        sessionToken: `local-onboard-${Date.now()}`,
-        restaurantId,
-        restaurantName,
-        restaurantCode,
-        backendUrl: getBackendUrl() || '',
-        expiresAt: 0, // no expiry for local onboarding
+        // 7. Save session so the edge server is "registered" locally
+        saveSession({
+          sessionToken: `local-onboard-${Date.now()}`,
+          restaurantId,
+          restaurantName,
+          restaurantCode,
+          backendUrl: getBackendUrl() || '',
+          expiresAt: 0, // no expiry for local onboarding
+        });
+
+        // 8. Mark local config as complete so isLocalReady() returns true
+        setSyncState("config_sync_completed", "true");
+
+        // 9. Invalidate the setup nonce inside the transaction so it can't
+        //    be reused. If the transaction rolls back, the nonce is restored.
+        invalidateSetupNonce();
+
+        return { userId, numTables, template };
       });
 
-      // 8. Mark local config as complete so isLocalReady() returns true
-      setSyncState("config_sync_completed", "true");
+      const result = tx();
 
-      console.log(`[Onboard] Created restaurant "${restaurantName}" (${restaurantId}) with ${numTables} tables, ${template.categories?.length || 0} categories, owner: ${owner.name}`);
+      console.log(`[Onboard] Created restaurant "${restaurantName}" (${restaurantId}) with ${result.numTables} tables, ${result.template.categories?.length || 0} categories, owner: ${owner.name}`);
 
       return jsonResponse({
         success: true,
         restaurantId,
         restaurantCode,
-        ownerUserId: userId,
-        tableCount: numTables,
-        menuCategories: template.categories?.length || 0,
+        ownerUserId: result.userId,
+        tableCount: result.numTables,
+        menuCategories: result.template.categories?.length || 0,
       });
     } catch (err: any) {
       console.error("[Onboard] Failed:", err);

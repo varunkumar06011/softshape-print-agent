@@ -182,7 +182,7 @@ export function resolvePrinterName(
   if (allKnownNames.has(target)) return target;
 
   // 3. Legacy fallback: old enum values
-  const normalized = printers.map((p: any) => ({
+  const normalized: Array<{ name: string; type: string; nameLower: string }> = printers.map((p: any) => ({
     name: p.name,
     type: String(p.type || "").toUpperCase(),
     nameLower: String(p.name || "").toLowerCase(),

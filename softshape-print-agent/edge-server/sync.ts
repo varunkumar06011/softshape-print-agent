@@ -19,7 +19,7 @@
 //   - Emit socket events for real-time dashboard updates
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb } from "./db.ts";
+import { getDb, insertSyncAudit } from "./db.ts";
 import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid, getDeviceId, saveSession, loadSession } from "./auth.ts";
 import { cloudFetch } from "./cloudFetch.ts";
 
@@ -28,6 +28,7 @@ const MAX_BATCH_SIZE = 50;
 const MAX_ATTEMPTS = 5;
 const BACKOFF_BASE_MS = 10_000;   // 10 seconds
 const BACKOFF_MAX_MS = 5 * 60_000; // 5 minutes cap
+const SYNC_SCHEMA_VERSION = 1;
 
 let syncRunning = false;
 let lastSyncAt = 0;
@@ -62,11 +63,23 @@ interface SyncPayloadItem {
 
 function collectBatch(): SyncQueueRow[] {
   const db = getDb();
-  // Get pending records, prioritizing oldest first, skipping exhausted ones
+  // Get pending records, prioritizing by entity dependency order first,
+  // then oldest first within each priority group.
   return db.query(`
     SELECT * FROM sync_queue
     WHERE synced = 0
-    ORDER BY created_at ASC, id ASC
+    ORDER BY
+      CASE table_name
+        WHEN 'order' THEN 0
+        WHEN 'order_item' THEN 1
+        WHEN 'kot' THEN 1
+        WHEN 'kot_item' THEN 2
+        WHEN 'table' THEN 3
+        WHEN 'transaction' THEN 4
+        WHEN 'walkin_transaction' THEN 4
+        ELSE 10
+      END,
+      created_at ASC, id ASC
     LIMIT ?
   `).all(MAX_BATCH_SIZE) as SyncQueueRow[];
 }
@@ -486,6 +499,8 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
       body: JSON.stringify({
         restaurantId,
         deviceId: getDeviceId(),
+        schemaVersion: SYNC_SCHEMA_VERSION,
+        pushedAt: new Date().toISOString(),
         batch: payload,
       }),
     });
@@ -503,16 +518,39 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
 
     const result = await res.json() as {
       accepted: number[];
-      rejected: Array<{ queueId: number; error: string }>;
+      rejected: Array<{ queueId: number; error: string; outcome?: string }>;
     };
 
-    // Mark accepted records as synced
+    // Mark accepted records as synced (dequeued)
     markSynced(result.accepted);
 
-    // Increment attempts for rejected records
+    // Build lookup from queueId → payload item for audit logging
+    const payloadMap = new Map(payload.map((p) => [p.queueId, p]));
+
+    // Handle rejected records based on their outcome:
+    // - "error": transient failure — increment attempts for retry
+    // - "rejected"/"conflict": permanent — write audit row, then dequeue
+    //   (the cloud has seen this record and decided not to apply it)
+    // - missing outcome: treat as error for backward compatibility
+    const retryIds: number[] = [];
+    const dequeueIds: number[] = [];
     if (result.rejected && result.rejected.length > 0) {
       for (const rej of result.rejected) {
-        incrementAttempts([rej.queueId], rej.error);
+        if (rej.outcome === "rejected" || rej.outcome === "conflict") {
+          dequeueIds.push(rej.queueId);
+          // Persist audit record before dequeuing
+          const item = payloadMap.get(rej.queueId);
+          if (item) {
+            insertSyncAudit(rej.queueId, item.tableName, item.recordId, item.operation, rej.outcome, rej.error);
+          }
+          console.warn(`[Sync] ${rej.outcome}: queueId=${rej.queueId} — ${rej.error}`);
+        } else {
+          retryIds.push(rej.queueId);
+          incrementAttempts([rej.queueId], rej.error);
+        }
+      }
+      if (dequeueIds.length > 0) {
+        markSynced(dequeueIds);
       }
     }
 
@@ -531,12 +569,12 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
     lastSyncResult = {
       ok: true,
       pushed: payload.length,
-      accepted: result.accepted.length,
-      rejected: (result.rejected || []).length,
+      accepted: result.accepted.length + dequeueIds.length,
+      rejected: retryIds.length + orphanIds.length,
     };
 
-    if (result.accepted.length > 0) {
-      console.log(`[Sync] Pushed ${payload.length} records — ${result.accepted.length} accepted, ${(result.rejected || []).length} rejected`);
+    if (result.accepted.length > 0 || dequeueIds.length > 0) {
+      console.log(`[Sync] Pushed ${payload.length} records — ${result.accepted.length} accepted, ${dequeueIds.length} dequeued (rejected/conflict), ${retryIds.length + orphanIds.length} retrying`);
     }
 
     return lastSyncResult;

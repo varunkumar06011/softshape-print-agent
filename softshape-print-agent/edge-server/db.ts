@@ -529,6 +529,22 @@ function initSchema(database: Database) {
     );
     CREATE INDEX IF NOT EXISTS idx_sync_queue_pending ON sync_queue(synced) WHERE synced = 0;
 
+    -- Sync Audit (permanent rejections and conflicts from cloud sync)
+    -- When the cloud permanently rejects or flags a conflict on a sync item,
+    -- the edge stores an audit row here before dequeuing it from sync_queue.
+    -- This ensures operators can review why items were not applied.
+    CREATE TABLE IF NOT EXISTS sync_audit (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      queue_id        INTEGER NOT NULL,       -- original sync_queue.id
+      table_name      TEXT NOT NULL,
+      record_id       TEXT NOT NULL,
+      operation       TEXT NOT NULL,
+      outcome         TEXT NOT NULL,          -- 'rejected' or 'conflict'
+      message         TEXT,                   -- cloud's error message
+      audited_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
+    );
+    CREATE INDEX IF NOT EXISTS idx_sync_audit_outcome ON sync_audit(outcome);
+
     -- Sync State (cloud to edge pull tracking)
     CREATE TABLE IF NOT EXISTS sync_state (
       key             TEXT PRIMARY KEY,
@@ -562,13 +578,17 @@ function initSchema(database: Database) {
       escpos_data     TEXT NOT NULL,           -- JSON array of {type,format,data}
       item_summary    TEXT,                    -- JSON: [{name,qty}] for audit UI
       captain_name    TEXT,
-      status          TEXT NOT NULL DEFAULT 'accepted',  -- accepted|printing|printed|failed|needs_retry
+      status          TEXT NOT NULL DEFAULT 'accepted',  -- accepted|printing|printed|failed|needs_retry|dead_letter|cancelled
       attempts        INTEGER DEFAULT 0,
       last_error      TEXT,
       created_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
       updated_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
       printed_at      INTEGER,
-      acked_via       TEXT                     -- 'lan_ws' | 'cloud_relay' | 'local'
+      acked_via       TEXT,                    -- 'lan_ws' | 'cloud_relay' | 'local'
+      next_attempt_at INTEGER,                 -- exponential backoff scheduling
+      lease_until     INTEGER,                 -- claim lease expiry for stale recovery
+      copy_number     INTEGER DEFAULT 0,       -- reprint copy counter
+      payload_version INTEGER DEFAULT 1        -- ESC/POS payload schema version
     );
     CREATE INDEX IF NOT EXISTS idx_print_job_status ON print_job(status) WHERE status IN ('accepted', 'needs_retry');
     CREATE INDEX IF NOT EXISTS idx_print_job_printer_status ON print_job(printer_name, status);
@@ -602,6 +622,20 @@ function runMigrations(database: Database) {
   // section.is_active — added for onboarding INSERT compatibility
   if (!hasColumn("section", "is_active")) {
     database.exec(`ALTER TABLE section ADD COLUMN is_active INTEGER DEFAULT 1`);
+  }
+
+  // print_job: add durable queue columns for existing DBs
+  if (!hasColumn("print_job", "next_attempt_at")) {
+    database.exec(`ALTER TABLE print_job ADD COLUMN next_attempt_at INTEGER`);
+  }
+  if (!hasColumn("print_job", "lease_until")) {
+    database.exec(`ALTER TABLE print_job ADD COLUMN lease_until INTEGER`);
+  }
+  if (!hasColumn("print_job", "copy_number")) {
+    database.exec(`ALTER TABLE print_job ADD COLUMN copy_number INTEGER DEFAULT 0`);
+  }
+  if (!hasColumn("print_job", "payload_version")) {
+    database.exec(`ALTER TABLE print_job ADD COLUMN payload_version INTEGER DEFAULT 1`);
   }
 
   // outlet.organization_id NOT NULL → nullable
@@ -703,6 +737,34 @@ export function enqueueSync(tableName: string, recordId: string, operation: stri
     .run(tableName, recordId, operation, Date.now());
 }
 
+// ── Sync audit: persist permanent rejections/conflicts before dequeuing ──────
+
+export function insertSyncAudit(
+  queueId: number,
+  tableName: string,
+  recordId: string,
+  operation: string,
+  outcome: string,
+  message: string,
+): void {
+  const db = getDb();
+  db.query(
+    `INSERT INTO sync_audit (queue_id, table_name, record_id, operation, outcome, message, audited_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(queueId, tableName, recordId, operation, outcome, message, Date.now());
+}
+
+export function getSyncAuditRecords(limit = 100): Array<{
+  id: number; queue_id: number; table_name: string; record_id: string;
+  operation: string; outcome: string; message: string | null; audited_at: number;
+}> {
+  const db = getDb();
+  return db.query(
+    `SELECT id, queue_id, table_name, record_id, operation, outcome, message, audited_at
+     FROM sync_audit ORDER BY audited_at DESC LIMIT ?`,
+  ).all(limit) as any[];
+}
+
 export function getOrderSyncStatus(orderId: string): { synced: boolean; pending: number; deadLettered: number } {
   const db = getDb();
   const rows = db.query(
@@ -791,41 +853,73 @@ export function createPrintJob(job: {
 
 export function updatePrintJobStatus(
   eventId: string,
-  status: "printing" | "printed" | "failed" | "needs_retry",
+  status: "printing" | "printed" | "failed" | "needs_retry" | "dead_letter" | "cancelled",
   error?: string | null,
   ackedVia?: string | null,
 ): void {
   const db = getDb();
   const now = Date.now();
   const printedAt = status === "printed" ? now : null;
-  db.query(`UPDATE print_job SET status = ?, last_error = ?, acked_via = COALESCE(?, acked_via), printed_at = COALESCE(?, printed_at), updated_at = ?, attempts = attempts + 1 WHERE event_id = ?`)
-    .run(status, error || null, ackedVia || null, printedAt, now, eventId);
+  // Compute next_attempt_at for retryable statuses using exponential backoff
+  let nextAttemptAt: number | null = null;
+  if (status === "needs_retry") {
+    // Get current attempt count to compute backoff
+    const row = db.query("SELECT attempts FROM print_job WHERE event_id = ?").get(eventId) as { attempts: number } | undefined;
+    const attempts = row?.attempts ?? 0;
+    const backoffMs = Math.min(1000 * Math.pow(2, attempts), 60_000); // cap at 60s
+    nextAttemptAt = now + backoffMs;
+  }
+  db.query(`UPDATE print_job SET status = ?, last_error = ?, acked_via = COALESCE(?, acked_via), printed_at = COALESCE(?, printed_at), updated_at = ?, attempts = attempts + 1, next_attempt_at = COALESCE(?, next_attempt_at), lease_until = NULL WHERE event_id = ?`)
+    .run(status, error || null, ackedVia || null, printedAt, now, nextAttemptAt, eventId);
 }
 
 const PRINT_JOB_LEASE_MS = 30_000;
+const PRINT_JOB_MAX_ATTEMPTS = 10;
 
 export function claimPrintJob(eventId: string): boolean {
   const db = getDb();
   const now = Date.now();
+  const leaseUntil = now + PRINT_JOB_LEASE_MS;
   const result = db.query(
-    `UPDATE print_job SET status = 'printing', updated_at = ? WHERE event_id = ? AND status IN ('accepted', 'needs_retry')`,
-  ).run(now, eventId);
+    `UPDATE print_job SET status = 'printing', updated_at = ?, lease_until = ? WHERE event_id = ? AND status IN ('accepted', 'needs_retry') AND (next_attempt_at IS NULL OR next_attempt_at <= ?)`,
+  ).run(now, leaseUntil, eventId, now);
   return result.changes > 0;
 }
 
 export function reclaimStalePrintingJobs(): number {
   const db = getDb();
-  const cutoff = Date.now() - PRINT_JOB_LEASE_MS;
+  const now = Date.now();
+  // Reclaim jobs whose lease has expired — either by lease_until or by the old
+  // updated_at heuristic (for jobs created before the lease_until column existed)
+  const cutoff = now - PRINT_JOB_LEASE_MS;
   const result = db.query(
-    `UPDATE print_job SET status = 'accepted', updated_at = ? WHERE status = 'printing' AND updated_at < ?`,
-  ).run(Date.now(), cutoff);
+    `UPDATE print_job SET status = 'accepted', updated_at = ?, lease_until = NULL
+     WHERE status = 'printing'
+     AND (lease_until IS NOT NULL AND lease_until < ? OR lease_until IS NULL AND updated_at < ?)`,
+  ).run(now, now, cutoff);
+
+  // Transition jobs that exceeded max attempts to dead_letter
+  const deadLetterResult = db.query(
+    `UPDATE print_job SET status = 'dead_letter', updated_at = ?
+     WHERE status = 'needs_retry' AND attempts >= ?`,
+  ).run(now, PRINT_JOB_MAX_ATTEMPTS);
+  if (deadLetterResult.changes > 0) {
+    console.warn(`[PrintQueue] ${deadLetterResult.changes} job(s) moved to dead_letter after ${PRINT_JOB_MAX_ATTEMPTS} attempts`);
+  }
+
   return result.changes;
 }
 
 export function getPendingPrintJobs(limit = 50): any[] {
   const db = getDb();
-  return db.query(`SELECT * FROM print_job WHERE status IN ('accepted', 'needs_retry') ORDER BY id ASC LIMIT ?`)
-    .all(limit) as any[];
+  const now = Date.now();
+  // Only pick jobs that are ready for dispatch (next_attempt_at is null or in the past)
+  return db.query(
+    `SELECT * FROM print_job
+     WHERE status IN ('accepted', 'needs_retry')
+     AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+     ORDER BY id ASC LIMIT ?`
+  ).all(now, limit) as any[];
 }
 
 export function getPrintJobByEventId(eventId: string): any | null {
@@ -837,6 +931,49 @@ export function getPrintJobByEventId(eventId: string): any | null {
 export function getPrintJobsByOrder(orderId: string): any[] {
   const db = getDb();
   return db.query("SELECT * FROM print_job WHERE order_id = ? ORDER BY id ASC").all(orderId) as any[];
+}
+
+// ── Cancel a print job (prevent further dispatch attempts) ───────────────────
+export function cancelPrintJob(eventId: string): boolean {
+  const db = getDb();
+  const now = Date.now();
+  const result = db.query(
+    `UPDATE print_job SET status = 'cancelled', updated_at = ?, lease_until = NULL WHERE event_id = ? AND status IN ('accepted', 'needs_retry', 'dead_letter')`,
+  ).run(now, eventId);
+  return result.changes > 0;
+}
+
+// ── Reprint: create a new print job with a new event_id, copying ESC/POS data ─
+export function reprintPrintJob(originalEventId: string, newEventId?: string): { eventId: string; id: number | null } | null {
+  const db = getDb();
+  const original = db.query("SELECT * FROM print_job WHERE event_id = ?").get(originalEventId) as any | undefined;
+  if (!original) return null;
+
+  // Count existing reprints for this original event to generate a copy number
+  const copyRow = db.query(
+    "SELECT COUNT(*) as c FROM print_job WHERE event_id LIKE ? OR event_id = ?"
+  ).get(`${originalEventId}-reprint-%`, originalEventId) as { c: number };
+  const copyNumber = (copyRow?.c ?? 0) + 1;
+
+  const eventId = newEventId || `${originalEventId}-reprint-${copyNumber}`;
+  const now = Date.now();
+
+  try {
+    db.query(`INSERT INTO print_job
+      (event_id, restaurant_id, order_id, kot_id, kot_number, table_id, printer_name, job_type, escpos_data, item_summary, captain_name, status, copy_number, payload_version, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?)`)
+      .run(
+        eventId, original.restaurant_id, original.order_id, original.kot_id, original.kot_number,
+        original.table_id, original.printer_name, original.job_type,
+        original.escpos_data, original.item_summary, original.captain_name,
+        copyNumber, original.payload_version || 1, now, now,
+      );
+    const row = db.query("SELECT id FROM print_job WHERE event_id = ?").get(eventId) as { id: number } | undefined;
+    return { eventId, id: row?.id ?? null };
+  } catch (err) {
+    console.warn("[DB] reprintPrintJob failed:", err);
+    return null;
+  }
 }
 
 // ── Close database (for graceful shutdown) ────────────────────────────────────

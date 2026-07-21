@@ -140,31 +140,25 @@ async function printSingleWithLanFallback(
 // loop can retry the pending jobs. After dispatch, the print_job status is updated
 // based on the ack result.
 
-function persistAndDispatchPrints(
+// ─── Print intent preparation (pure computation, no side effects) ───────────
+// Splits the old persistAndDispatchPrints into a prepare phase (pure) and a
+// dispatch phase (async). This allows print intents to be persisted inside
+// the same SQLite transaction as the order/KOT, guaranteeing atomicity.
+
+interface PrintIntent {
+  eventId: string;
+  group: PrintGroup;
+  skip: boolean;              // true if escposData is empty
+  alreadyPrintedLocally: boolean; // true if captain already printed this group
+}
+
+function preparePrintIntents(
   groups: PrintGroup[],
   requestId: string | undefined,
-  restaurantId: string,
-  orderId: string,
-  kotId: string,
-  kotNumber: number,
-  tableId: string,
-  captainName: string | undefined,
   kotEventIds: string[] | null | undefined,
-): any[] {
-  // Fire-and-forget the async dispatch; return synchronous placeholder results.
-  // The caller doesn't need to wait for print acks to return HTTP to the captain —
-  // the print_job table tracks status and the background loop handles retries.
-  const results: any[] = [];
-
+): PrintIntent[] {
   // Build a type→eventId lookup from captain-provided kotEventIds.
-  // The captain generates IDs as `${requestId}-food` and `${requestId}-liquor`,
-  // but groups from buildKotPrintGroups are ordered by Map iteration (printer
-  // grouping), not by food/liquor order. Positional matching by index causes
-  // mismatches — match by type suffix instead.
   const eventIdByType: Record<string, string> = {};
-  // Also build a set of all provided eventIds — when localPrinted is false but
-  // some items printed locally, the captain sends only succeeded event IDs.
-  // We skip those groups (already printed) and only print the failed ones.
   const locallyPrintedEventIds = new Set<string>();
   if (kotEventIds && kotEventIds.length > 0) {
     for (const id of kotEventIds) {
@@ -176,47 +170,62 @@ function persistAndDispatchPrints(
     }
   }
 
-  for (let i = 0; i < groups.length; i++) {
-    const group = groups[i];
+  return groups.map((group, i) => {
     if (group.escposData.length === 0) {
-      results.push({ ok: false, printerName: group.printerName || "unknown", bytes: 0, error: "No print data", method: "noop" });
-      continue;
+      return { eventId: "", group, skip: true, alreadyPrintedLocally: false };
     }
-
-    // Use captain-provided eventId matched by type, else generate deterministic ID
     const eventId = eventIdByType[group.type] || `${group.type}-${requestId || Date.now()}-${i}`;
+    const alreadyPrintedLocally = locallyPrintedEventIds.has(eventId);
+    return { eventId, group, skip: false, alreadyPrintedLocally };
+  });
+}
 
-    // Skip groups already printed locally by the captain (partial print case)
-    if (locallyPrintedEventIds.has(eventId)) {
-      results.push({ ok: true, printerName: group.printerName || "unknown", bytes: 0, method: "skipped_local_print", eventId });
-      continue;
-    }
-
-    // Persist the print job durably (idempotent — ON CONFLICT DO NOTHING)
+// Persist print intents inside a transaction (synchronous, no dispatch).
+function persistPrintIntentsInTx(
+  intents: PrintIntent[],
+  restaurantId: string,
+  orderId: string,
+  kotId: string,
+  kotNumber: number,
+  tableId: string,
+  captainName: string | undefined,
+): void {
+  for (const intent of intents) {
+    if (intent.skip || intent.alreadyPrintedLocally) continue;
     createPrintJob({
-      eventId,
+      eventId: intent.eventId,
       restaurantId,
       orderId,
       kotId,
       kotNumber,
       tableId,
-      printerName: group.printerName,
-      jobType: group.type,
-      escposData: group.escposData,
+      printerName: intent.group.printerName,
+      jobType: intent.group.type,
+      escposData: intent.group.escposData,
       itemSummary: [],
       captainName: captainName || null,
     });
-
-    // Async dispatch — don't block the HTTP response
-    dispatchSinglePrintJob(eventId, group, requestId);
-
-    results.push({ ok: null, printerName: group.printerName, bytes: 0, method: "durable_queued", eventId });
   }
-
-  return results;
 }
 
-async function dispatchSinglePrintJob(
+// Dispatch print intents after the transaction commits (async, fire-and-forget).
+function dispatchPrintIntents(
+  intents: PrintIntent[],
+  requestId?: string,
+): any[] {
+  return intents.map((intent) => {
+    if (intent.skip) {
+      return { ok: false, printerName: intent.group.printerName || "unknown", bytes: 0, error: "No print data", method: "noop" };
+    }
+    if (intent.alreadyPrintedLocally) {
+      return { ok: true, printerName: intent.group.printerName || "unknown", bytes: 0, method: "skipped_local_print", eventId: intent.eventId };
+    }
+    dispatchSinglePrintJob(intent.eventId, intent.group, requestId);
+    return { ok: null, printerName: intent.group.printerName, bytes: 0, method: "durable_queued", eventId: intent.eventId };
+  });
+}
+
+export async function dispatchSinglePrintJob(
   eventId: string,
   group: PrintGroup,
   requestId?: string,
@@ -610,6 +619,16 @@ export async function createOrder(
     return { success: false, error: "No items in order", statusCode: 400 };
   }
 
+  // ── Validate item data — reject negative prices or quantities ──────────────
+  for (const item of items) {
+    if (!item.menuItemId || !item.name) {
+      return { success: false, error: "Each item must have menuItemId and name", statusCode: 400 };
+    }
+    if (Number(item.price) < 0 || Number(item.quantity) <= 0) {
+      return { success: false, error: `Invalid price/quantity for item: ${item.name}`, statusCode: 400 };
+    }
+  }
+
   const db = getDb();
 
   // ── Idempotency check: if requestId already exists, return existing order ──
@@ -657,6 +676,20 @@ export async function createOrder(
   const menuItemIds = items.map((i) => i.menuItemId).filter(Boolean);
   const menuItemMap = getMenuItemsWithCategories(menuItemIds);
 
+  // ── Validate menu item availability — reject unavailable or deleted items ──
+  for (const item of items) {
+    const mi = menuItemMap.get(item.menuItemId);
+    if (!mi) {
+      return { success: false, error: `Menu item not found: ${item.name}`, statusCode: 400 };
+    }
+    if (mi.is_deleted) {
+      return { success: false, error: `Menu item deleted: ${item.name}`, statusCode: 400 };
+    }
+    if (!mi.is_available) {
+      return { success: false, error: `Menu item not available: ${item.name}`, statusCode: 400 };
+    }
+  }
+
   // ── Server-side price resolution (Bug 1 fix) ──────────────────────────────
   // Never trust client-sent prices — resolve from local SQLite price profiles.
   const venueId = table.venue_id ?? null;
@@ -674,7 +707,48 @@ export async function createOrder(
   const kotId = crypto.randomUUID();
   const kotNumber = preReservedKotNumber != null ? preReservedKotNumber : getNextKotNumber(restaurantId);
 
-  // ── Transaction: create order + items + KOT + update table ──────────────────
+  // ── Build print groups BEFORE transaction (pure computation) ───────────────
+  // Print intents are persisted inside the transaction to guarantee atomicity.
+  const formattedTableNumber = formatTableNumber(table);
+  const restaurantName = outlet.receipt_header || outlet.name;
+  const sectionName = table.section_name || "Main Hall";
+  const sectionTag = table.section_tag;
+  const printerConfig = outlet.printerConfig || {};
+  const mappedItems = resolvedItems.map((i) => {
+    const cat = menuItemMap.get(i.menuItemId) || {};
+    const resolvedPrinterName = resolvePrinterName(
+      cat.printer_name || null,
+      cat.printer_target || null,
+      cat.category_printer_target || null,
+      printerConfig
+    );
+    return {
+      ...i,
+      printerName: resolvedPrinterName,
+      printerTarget: cat.printer_target || cat.category_printer_target,
+    };
+  });
+  const kotOrderData: OrderData = {
+    tableNumber: formattedTableNumber,
+    orderId,
+    items: mappedItems.map((i) => ({
+      name: i.name,
+      quantity: i.quantity,
+      price: Number(i.price),
+      notes: i.notes ?? null,
+      type: (i.menuType === "LIQUOR" ? "liquor" : "food") as "food" | "liquor",
+    })),
+    restaurantName,
+    kotId: String(kotNumber),
+    sectionName,
+    captainName: captainName || "Captain",
+    orderByRole: orderByRole || "CAPTAIN",
+    sectionTag: sectionTag || undefined,
+  };
+  const printGroups = buildKotPrintGroups(mappedItems, kotOrderData, table, printerConfig);
+  const printIntents = localPrinted ? [] : preparePrintIntents(printGroups, requestId, input.kotEventIds);
+
+  // ── Transaction: create order + items + KOT + print intents + update table ──
   const tx = db.transaction(() => {
     const now = Date.now();
 
@@ -726,6 +800,9 @@ export async function createOrder(
     enqueueSync("order", orderId, "insert");
     enqueueSync("kot", kotId, "insert");
     enqueueSync("table", tableId, "update");
+
+    // 8. Persist print intents in the same transaction (atomicity guarantee)
+    persistPrintIntentsInTx(printIntents, restaurantId, orderId, kotId, kotNumber, tableId, captainName);
   });
 
   try {
@@ -738,55 +815,9 @@ export async function createOrder(
     throw err;
   }
 
-  // ── Build ESC/POS and print ────────────────────────────────────────────────
-  const formattedTableNumber = formatTableNumber(table);
-  const restaurantName = outlet.receipt_header || outlet.name;
-  const sectionName = table.section_name || "Main Hall";
-  const sectionTag = table.section_tag;
-
-  // Resolve printer for each item (using resolved prices)
-  const printerConfig = outlet.printerConfig || {};
-  const mappedItems = resolvedItems.map((i) => {
-    const cat = menuItemMap.get(i.menuItemId) || {};
-    const resolvedPrinterName = resolvePrinterName(
-      cat.printer_name || null,
-      cat.printer_target || null,
-      cat.category_printer_target || null,
-      printerConfig
-    );
-    return {
-      ...i,
-      printerName: resolvedPrinterName,
-      printerTarget: cat.printer_target || cat.category_printer_target,
-    };
-  });
-
-  const kotOrderData: OrderData = {
-    tableNumber: formattedTableNumber,
-    orderId,
-    items: mappedItems.map((i) => ({
-      name: i.name,
-      quantity: i.quantity,
-      price: Number(i.price),
-      notes: i.notes ?? null,
-      type: (i.menuType === "LIQUOR" ? "liquor" : "food") as "food" | "liquor",
-    })),
-    restaurantName,
-    kotId: String(kotNumber),
-    sectionName,
-    captainName: captainName || "Captain",
-    orderByRole: orderByRole || "CAPTAIN",
-    sectionTag: sectionTag || undefined,
-  };
-
-  // Group items by printer and build print groups (shared logic)
-  const printGroups = buildKotPrintGroups(mappedItems, kotOrderData, table, printerConfig);
-
-  // ── Print all groups (durable — persisted to print_job table before dispatch) ──
-  // Skip if the captain already printed locally (localPrinted flag from frontend)
-  const printResults = localPrinted ? [] : persistAndDispatchPrints(
-    printGroups, requestId, restaurantId, orderId, kotId, kotNumber, tableId, captainName, input.kotEventIds,
-  );
+  // ── Dispatch print intents (async, fire-and-forget) ───────────────────────
+  // Print jobs were already persisted inside the transaction above.
+  const printResults = localPrinted ? [] : dispatchPrintIntents(printIntents, requestId);
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
   lanBroadcast("order:created", { order: { id: orderId, tableId, kotNumber, totalAmount }, tableId, requestId });
@@ -927,6 +958,20 @@ export async function updateOrderItems(
   const menuItemIds = items.map((i) => i.menuItemId).filter(Boolean);
   const menuItemMap = getMenuItemsWithCategories(menuItemIds);
 
+  // ── Validate menu item availability — reject unavailable or deleted items ──
+  for (const item of items) {
+    const mi = menuItemMap.get(item.menuItemId);
+    if (!mi) {
+      return { success: false, error: `Menu item not found: ${item.name}`, statusCode: 400 };
+    }
+    if (mi.is_deleted) {
+      return { success: false, error: `Menu item deleted: ${item.name}`, statusCode: 400 };
+    }
+    if (!mi.is_available) {
+      return { success: false, error: `Menu item not available: ${item.name}`, statusCode: 400 };
+    }
+  }
+
   // ── Server-side price resolution (Bug 1 fix) ──────────────────────────────
   const venueId = table.venue_id ?? null;
   const priceMap = buildEdgePriceMap(venueId, restaurantId);
@@ -942,7 +987,47 @@ export async function updateOrderItems(
   const kotId = crypto.randomUUID();
   const kotNumber = preReservedKotNumber != null ? preReservedKotNumber : getNextKotNumber(restaurantId);
 
-  // ── Transaction: insert new items + new KOT + update order total ───────────
+  // ── Build print groups BEFORE transaction (pure computation) ───────────────
+  const formattedTableNumber = formatTableNumber(table);
+  const restaurantName = outlet.receipt_header || outlet.name;
+  const sectionName = table.section_name || "Main Hall";
+  const sectionTag = table.section_tag;
+  const printerConfig = outlet.printerConfig || {};
+  const mappedItems = resolvedItems.map((i) => {
+    const cat = menuItemMap.get(i.menuItemId) || {};
+    const resolvedPrinterName = resolvePrinterName(
+      cat.printer_name || null,
+      cat.printer_target || null,
+      cat.category_printer_target || null,
+      printerConfig
+    );
+    return {
+      ...i,
+      printerName: resolvedPrinterName,
+      printerTarget: cat.printer_target || cat.category_printer_target,
+    };
+  });
+  const kotOrderData: OrderData = {
+    tableNumber: formattedTableNumber,
+    orderId,
+    items: mappedItems.map((i) => ({
+      name: i.name,
+      quantity: i.quantity,
+      price: Number(i.price),
+      notes: i.notes ?? null,
+      type: (i.menuType === "LIQUOR" ? "liquor" : "food") as "food" | "liquor",
+    })),
+    restaurantName,
+    kotId: String(kotNumber),
+    sectionName,
+    captainName: captainName || "Captain",
+    orderByRole: orderByRole || "CASHIER",
+    sectionTag: sectionTag || undefined,
+  };
+  const printGroups = buildKotPrintGroups(mappedItems, kotOrderData, table, printerConfig);
+  const printIntents = localPrinted ? [] : preparePrintIntents(printGroups, requestId, input.kotEventIds);
+
+  // ── Transaction: insert new items + new KOT + print intents + update order ──
   const tx = db.transaction(() => {
     const now = Date.now();
 
@@ -998,6 +1083,9 @@ export async function updateOrderItems(
     for (const oiId of newOrderItemIds) {
       enqueueSync("order_item", oiId, "insert");
     }
+
+    // 8. Persist print intents in the same transaction (atomicity guarantee)
+    persistPrintIntentsInTx(printIntents, restaurantId, orderId, kotId, kotNumber, tableId, captainName);
   });
 
   try {
@@ -1009,54 +1097,9 @@ export async function updateOrderItems(
     throw err;
   }
 
-  // ── Build ESC/POS and print (same logic as createOrder) ────────────────────
-  const formattedTableNumber = formatTableNumber(table);
-  const restaurantName = outlet.receipt_header || outlet.name;
-  const sectionName = table.section_name || "Main Hall";
-  const sectionTag = table.section_tag;
-  const printerConfig = outlet.printerConfig || {};
-
-  const mappedItems = resolvedItems.map((i) => {
-    const cat = menuItemMap.get(i.menuItemId) || {};
-    const resolvedPrinterName = resolvePrinterName(
-      cat.printer_name || null,
-      cat.printer_target || null,
-      cat.category_printer_target || null,
-      printerConfig
-    );
-    return {
-      ...i,
-      printerName: resolvedPrinterName,
-      printerTarget: cat.printer_target || cat.category_printer_target,
-    };
-  });
-
-  const kotOrderData: OrderData = {
-    tableNumber: formattedTableNumber,
-    orderId,
-    items: mappedItems.map((i) => ({
-      name: i.name,
-      quantity: i.quantity,
-      price: Number(i.price),
-      notes: i.notes ?? null,
-      type: (i.menuType === "LIQUOR" ? "liquor" : "food") as "food" | "liquor",
-    })),
-    restaurantName,
-    kotId: String(kotNumber),
-    sectionName,
-    captainName: captainName || "Captain",
-    orderByRole: orderByRole || "CASHIER",
-    sectionTag: sectionTag || undefined,
-  };
-
-  // Group items by printer and build print groups (shared logic)
-  const printGroups = buildKotPrintGroups(mappedItems, kotOrderData, table, printerConfig);
-
-  // ── Print all groups (durable — persisted to print_job table before dispatch) ──
-  // Skip if the captain already printed locally (localPrinted flag from frontend)
-  const printResults = localPrinted ? [] : persistAndDispatchPrints(
-    printGroups, requestId, restaurantId, orderId, kotId, kotNumber, tableId, captainName, input.kotEventIds,
-  );
+  // ── Dispatch print intents (async, fire-and-forget) ───────────────────────
+  // Print jobs were already persisted inside the transaction above.
+  const printResults = localPrinted ? [] : dispatchPrintIntents(printIntents, requestId);
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
   lanBroadcast("order:updated", { orderId, tableId, kotNumber, requestId });
