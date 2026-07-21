@@ -141,9 +141,10 @@ function connectEdgeWebSocket() {
   edgeWs.onmessage = async (event) => {
     try {
       const msg = JSON.parse(event.data);
-      if (msg.type === "print_job") {
-        await handleEdgePrintJob(msg);
-      } else if (msg.type === "pong") {
+      // Print Agent does NOT handle print_job from edge WebSocket.
+      // The cashier app is the sole print authority on edge WS.
+      // Print Agent only handles print jobs via cloud Socket.IO fallback.
+      if (msg.type === "pong") {
         // Keepalive response — ignore
       }
     } catch (err) {

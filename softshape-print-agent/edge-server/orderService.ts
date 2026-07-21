@@ -11,7 +11,7 @@
 // Total: 15-40ms from button press to printer starting.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, getNextKotNumber, enqueueSync, getKolkataDateString } from "./db.ts";
+import { getDb, getNextKotNumber, enqueueSync, getKolkataDateString, createPrintJob, updatePrintJobStatus, getPendingPrintJobs, claimPrintJob, reclaimStalePrintingJobs } from "./db.ts";
 import { buildFoodKOT, buildLiquorKOT, buildCancelKOT, buildBill, type PrintItem, type OrderData } from "./escpos.ts";
 import { resolvePrinterName } from "./printer.ts";
 import { lanBroadcast, getLanClientCount, waitForPrintAck } from "./lanBroadcast.ts";
@@ -131,6 +131,200 @@ async function printSingleWithLanFallback(
 
   const ack = await waitForPrintAck(eventId, PRINT_ACK_TIMEOUT_MS);
   return { ok: ack.ok, printerName, bytes: 0, error: ack.error || null, method: "lan_ws", eventId };
+}
+
+// ─── Durable print queue integration ──────────────────────────────────────────
+// persistAndDispatchPrints stores each print group as a print_job row in SQLite
+// (idempotent via event_id) BEFORE attempting to print. This ensures that if the
+// edge server crashes between order creation and printing, the background dispatch
+// loop can retry the pending jobs. After dispatch, the print_job status is updated
+// based on the ack result.
+
+function persistAndDispatchPrints(
+  groups: PrintGroup[],
+  requestId: string | undefined,
+  restaurantId: string,
+  orderId: string,
+  kotId: string,
+  kotNumber: number,
+  tableId: string,
+  captainName: string | undefined,
+  kotEventIds: string[] | null | undefined,
+): any[] {
+  // Fire-and-forget the async dispatch; return synchronous placeholder results.
+  // The caller doesn't need to wait for print acks to return HTTP to the captain —
+  // the print_job table tracks status and the background loop handles retries.
+  const results: any[] = [];
+
+  // Build a type→eventId lookup from captain-provided kotEventIds.
+  // The captain generates IDs as `${requestId}-food` and `${requestId}-liquor`,
+  // but groups from buildKotPrintGroups are ordered by Map iteration (printer
+  // grouping), not by food/liquor order. Positional matching by index causes
+  // mismatches — match by type suffix instead.
+  const eventIdByType: Record<string, string> = {};
+  // Also build a set of all provided eventIds — when localPrinted is false but
+  // some items printed locally, the captain sends only succeeded event IDs.
+  // We skip those groups (already printed) and only print the failed ones.
+  const locallyPrintedEventIds = new Set<string>();
+  if (kotEventIds && kotEventIds.length > 0) {
+    for (const id of kotEventIds) {
+      locallyPrintedEventIds.add(id);
+      if (id.endsWith("-food")) eventIdByType["KOT"] = id;
+      else if (id.endsWith("-liquor")) eventIdByType["BAR_KOT"] = id;
+      else if (id.endsWith("-bill")) eventIdByType["BILL"] = id;
+      else if (id.endsWith("-cancel")) eventIdByType["CANCEL_KOT"] = id;
+    }
+  }
+
+  for (let i = 0; i < groups.length; i++) {
+    const group = groups[i];
+    if (group.escposData.length === 0) {
+      results.push({ ok: false, printerName: group.printerName || "unknown", bytes: 0, error: "No print data", method: "noop" });
+      continue;
+    }
+
+    // Use captain-provided eventId matched by type, else generate deterministic ID
+    const eventId = eventIdByType[group.type] || `${group.type}-${requestId || Date.now()}-${i}`;
+
+    // Skip groups already printed locally by the captain (partial print case)
+    if (locallyPrintedEventIds.has(eventId)) {
+      results.push({ ok: true, printerName: group.printerName || "unknown", bytes: 0, method: "skipped_local_print", eventId });
+      continue;
+    }
+
+    // Persist the print job durably (idempotent — ON CONFLICT DO NOTHING)
+    createPrintJob({
+      eventId,
+      restaurantId,
+      orderId,
+      kotId,
+      kotNumber,
+      tableId,
+      printerName: group.printerName,
+      jobType: group.type,
+      escposData: group.escposData,
+      itemSummary: [],
+      captainName: captainName || null,
+    });
+
+    // Async dispatch — don't block the HTTP response
+    dispatchSinglePrintJob(eventId, group, requestId);
+
+    results.push({ ok: null, printerName: group.printerName, bytes: 0, method: "durable_queued", eventId });
+  }
+
+  return results;
+}
+
+async function dispatchSinglePrintJob(
+  eventId: string,
+  group: PrintGroup,
+  requestId?: string,
+): Promise<void> {
+  if (!claimPrintJob(eventId)) {
+    return;
+  }
+
+  try {
+    const clientCount = getLanClientCount();
+
+    if (clientCount === 0) {
+      // No LAN clients — try cloud relay
+      const relayed = relayPrintViaCloud({
+        type: group.type,
+        data: { printerName: group.printerName || null, escposData: group.escposData, requestId: requestId || null },
+        eventId,
+      });
+      if (relayed) {
+        // Cloud relay accepted — leave as 'printing' so the background loop
+        // doesn't re-dispatch. The cloud ack path or lease expiry will resolve it.
+        return;
+      }
+      // No LAN clients and no cloud — mark for retry
+      updatePrintJobStatus(eventId, "needs_retry", "No LAN clients and cloud socket unavailable");
+      return;
+    }
+
+    // Broadcast to LAN WebSocket clients
+    lanBroadcast("print_job", {
+      type: group.type,
+      data: {
+        printerName: group.printerName || null,
+        escposData: group.escposData,
+        requestId: requestId || null,
+      },
+      eventId,
+      ts: Date.now(),
+    });
+
+    // Wait for print_ack from Tauri frontend
+    const ack = await waitForPrintAck(eventId, PRINT_ACK_TIMEOUT_MS);
+    if (ack.ok) {
+      updatePrintJobStatus(eventId, "printed", null, "lan_ws");
+      console.log(`[Print] Job ${eventId} → ${group.printerName || "(auto)"} ✓`);
+    } else {
+      updatePrintJobStatus(eventId, "needs_retry", ack.error || "Print ack failed");
+      console.warn(`[Print] Job ${eventId} → ${group.printerName || "(auto)"} ✗ ${ack.error}`);
+    }
+  } catch (err: any) {
+    updatePrintJobStatus(eventId, "needs_retry", err?.message || String(err));
+    console.error(`[Print] Job ${eventId} dispatch error:`, err);
+  }
+}
+
+// ─── Background dispatch loop for pending print jobs ──────────────────────────
+// Called periodically by server.ts. Picks up print_job rows in 'accepted' or
+// 'needs_retry' status and re-dispatches them. Enforces per-printer serialization
+// by processing jobs in id ASC order and only dispatching one job per printer
+// per cycle (the ack from the Tauri frontend will free the printer for the next).
+
+let _dispatchRunning = false;
+
+export async function dispatchPendingPrintJobs(): Promise<{ dispatched: number; remaining: number }> {
+  if (_dispatchRunning) return { dispatched: 0, remaining: 0 };
+  _dispatchRunning = true;
+
+  try {
+    const reclaimed = reclaimStalePrintingJobs();
+    if (reclaimed > 0) {
+      console.log(`[PrintDispatch] Reclaimed ${reclaimed} stale printing job(s)`);
+    }
+
+    const pending = getPendingPrintJobs(50);
+    if (pending.length === 0) return { dispatched: 0, remaining: 0 };
+
+    // Group by printer_name and dispatch one per printer per cycle
+    const dispatchedPrinters = new Set<string | null>();
+    let dispatched = 0;
+
+    for (const job of pending) {
+      const printerKey = job.printer_name || "__auto__";
+      if (dispatchedPrinters.has(printerKey)) continue;
+      dispatchedPrinters.add(printerKey);
+
+      let escposData: any[];
+      try {
+        escposData = JSON.parse(job.escpos_data);
+      } catch {
+        updatePrintJobStatus(job.event_id, "failed", "Corrupted escpos_data in print_job row");
+        continue;
+      }
+
+      const group: PrintGroup = {
+        printerName: job.printer_name,
+        escposData,
+        type: job.job_type,
+      };
+
+      // Dispatch without blocking — fire and forget per printer
+      dispatchSinglePrintJob(job.event_id, group, undefined);
+      dispatched++;
+    }
+
+    return { dispatched, remaining: pending.length - dispatched };
+  } finally {
+    _dispatchRunning = false;
+  }
 }
 
 // ─── Shared KOT print group builder ─────────────────────────────────────────
@@ -588,9 +782,11 @@ export async function createOrder(
   // Group items by printer and build print groups (shared logic)
   const printGroups = buildKotPrintGroups(mappedItems, kotOrderData, table, printerConfig);
 
-  // ── Print all groups (synchronous — before HTTP response returns) ──────────
+  // ── Print all groups (durable — persisted to print_job table before dispatch) ──
   // Skip if the captain already printed locally (localPrinted flag from frontend)
-  const printResults = localPrinted ? [] : await printWithLanFallback(printGroups, requestId);
+  const printResults = localPrinted ? [] : persistAndDispatchPrints(
+    printGroups, requestId, restaurantId, orderId, kotId, kotNumber, tableId, captainName, input.kotEventIds,
+  );
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
   lanBroadcast("order:created", { order: { id: orderId, tableId, kotNumber, totalAmount }, tableId, requestId });
@@ -856,9 +1052,11 @@ export async function updateOrderItems(
   // Group items by printer and build print groups (shared logic)
   const printGroups = buildKotPrintGroups(mappedItems, kotOrderData, table, printerConfig);
 
-  // ── Print all groups ────────────────────────────────────────────────────────
+  // ── Print all groups (durable — persisted to print_job table before dispatch) ──
   // Skip if the captain already printed locally (localPrinted flag from frontend)
-  const printResults = localPrinted ? [] : await printWithLanFallback(printGroups, requestId);
+  const printResults = localPrinted ? [] : persistAndDispatchPrints(
+    printGroups, requestId, restaurantId, orderId, kotId, kotNumber, tableId, captainName, input.kotEventIds,
+  );
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
   lanBroadcast("order:updated", { orderId, tableId, kotNumber, requestId });
@@ -1304,6 +1502,7 @@ export interface SettleOrderInput {
   discountAmount?: number;
   cgst?: number;
   sgst?: number;
+  serviceChargeAmount?: number;
   grandTotal?: number;
   roundOff?: number;
   localTxnId?: string;
@@ -1354,6 +1553,7 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
         discountAmount: input.discountAmount,
         cgst: input.cgst,
         sgst: input.sgst,
+        serviceChargeAmount: input.serviceChargeAmount,
         grandTotal: input.grandTotal,
         roundOff: input.roundOff,
         localTxnId,

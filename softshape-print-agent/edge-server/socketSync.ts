@@ -25,7 +25,7 @@
 import { io, type Socket } from "socket.io-client";
 import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid } from "./auth.ts";
 import { applyChangesBatch, downloadFullConfig } from "./config.ts";
-import { getDb, setSyncState } from "./db.ts";
+import { getDb, setSyncState, updatePrintJobStatus } from "./db.ts";
 
 let socket: Socket | null = null;
 let connectionAttempts = 0;
@@ -165,6 +165,25 @@ export function startSocketSync(): void {
       }
     } catch (err) {
       console.error("[SocketSync] Failed to apply table_update:", err);
+    }
+  });
+
+  // ── Cloud print ack relay ──────────────────────────────────────────────────
+  // When a print job relayed via cloud is acknowledged by the Print Agent,
+  // the cloud emits edge:print_ack back to us. Update the durable print_job
+  // table so the background dispatch loop doesn't re-dispatch.
+  socket.on("edge:print_ack", (data: any) => {
+    try {
+      if (!data?.eventId) return;
+      updatePrintJobStatus(
+        data.eventId,
+        data.ok ? "printed" : "needs_retry",
+        data.ok ? null : (data.error || "Cloud print failed"),
+        "cloud_relay",
+      );
+      console.log(`[SocketSync] Cloud print_ack for ${data.eventId}: ${data.ok ? "printed" : "needs_retry"}`);
+    } catch (err) {
+      console.error("[SocketSync] Failed to process edge:print_ack:", err);
     }
   });
 

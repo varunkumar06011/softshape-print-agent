@@ -37,12 +37,12 @@
 //   GET  /api/edge/sync/socket  — socket connection status
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enqueueSync, getRecoveryStatus } from "./db.ts";
+import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enqueueSync, getRecoveryStatus, updatePrintJobStatus, getPendingPrintJobs, getOrderSyncStatus, getPrintJobByEventId } from "./db.ts";
 import os from "os";
 import { runDailyMaintenance, runPeriodicBackup } from "./backup.ts";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { downloadFullConfig, pullIncrementalChanges } from "./config.ts";
-import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge } from "./orderService.ts";
+import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders } from "./reads.ts";
 import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
 import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode, relayPrintViaCloud } from "./socketSync.ts";
@@ -106,6 +106,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     "/api/edge/order/confirm-payment",
     "/api/edge/order/status",
     "/api/edge/orders",
+    "/api/edge/print-jobs",
+    "/api/edge/print-jobs/retry",
   ]);
 
   if (!PUBLIC_LAN_PATHS.has(url.pathname)) {
@@ -147,7 +149,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         }
         if (lanIp) break;
       }
-    } catch { /* ignore */ }
+    } catch (e) { console.warn('[health] network interface enumeration failed:', (e as Error).message); }
     return jsonResponse({
       status: "ok",
       service: "softshape-edge-server",
@@ -296,7 +298,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         }
         if (lanIp) break;
       }
-    } catch { /* ignore */ }
+    } catch (e) { console.warn('[register] network interface enumeration failed:', (e as Error).message); }
 
     // Call cloud backend to register the agent
     try {
@@ -1137,9 +1139,58 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse(getSocketStatus());
   }
 
+  // ── GET /api/edge/order/:id/sync-status — per-order cloud sync status ──────
+  // Returns whether the order's sync_queue entries have been pushed to cloud.
+  // The captain uses this to decide when it's safe to remove the action from
+  // its local pending queue — keeping it until cloud sync is confirmed.
+  if (url.pathname.startsWith("/api/edge/order/") && url.pathname.endsWith("/sync-status") && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const parts = url.pathname.split("/");
+    const orderId = parts[parts.length - 2];
+    if (!orderId) return errorResponse("Missing order ID", 400);
+    return jsonResponse(getOrderSyncStatus(orderId));
+  }
+
   // ── GET /api/edge/lan/status — LAN WebSocket client count (Bug 2) ─────────
   if (url.pathname === "/api/edge/lan/status" && req.method === "GET") {
     return jsonResponse({ connectedClients: getLanClientCount() });
+  }
+
+  // ── GET /api/edge/print-jobs — print job queue status (diagnostics) ────────
+  if (url.pathname === "/api/edge/print-jobs" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const db = getDb();
+    const status = url.searchParams.get("status");
+    const orderId = url.searchParams.get("orderId");
+    const limit = Math.min(parseInt(url.searchParams.get("limit") || "100", 10), 500);
+
+    let rows: any[];
+    if (orderId) {
+      rows = db.query("SELECT id, event_id, order_id, kot_number, printer_name, job_type, status, attempts, last_error, created_at, printed_at, acked_via FROM print_job WHERE order_id = ? ORDER BY id DESC LIMIT ?")
+        .all(orderId, limit) as any[];
+    } else if (status) {
+      rows = db.query("SELECT id, event_id, order_id, kot_number, printer_name, job_type, status, attempts, last_error, created_at, printed_at, acked_via FROM print_job WHERE status = ? ORDER BY id DESC LIMIT ?")
+        .all(status, limit) as any[];
+    } else {
+      rows = db.query("SELECT id, event_id, order_id, kot_number, printer_name, job_type, status, attempts, last_error, created_at, printed_at, acked_via FROM print_job ORDER BY id DESC LIMIT ?")
+        .all(limit) as any[];
+    }
+
+    const summary = {
+      accepted: (db.query("SELECT COUNT(*) as c FROM print_job WHERE status = 'accepted'").get() as any)?.c || 0,
+      needs_retry: (db.query("SELECT COUNT(*) as c FROM print_job WHERE status = 'needs_retry'").get() as any)?.c || 0,
+      printed: (db.query("SELECT COUNT(*) as c FROM print_job WHERE status = 'printed'").get() as any)?.c || 0,
+      failed: (db.query("SELECT COUNT(*) as c FROM print_job WHERE status = 'failed'").get() as any)?.c || 0,
+    };
+
+    return jsonResponse({ jobs: rows, summary }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── POST /api/edge/print-jobs/retry — manually trigger pending print dispatch ──
+  if (url.pathname === "/api/edge/print-jobs/retry" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const result = await dispatchPendingPrintJobs();
+    return jsonResponse({ success: true, ...result });
   }
 
   // ── POST /api/edge/onboard — 4-step offline onboarding ─────────────────────
@@ -1709,7 +1760,30 @@ const server = Bun.serve({
           ws.send(JSON.stringify({ type: "pong", ts: Date.now() }));
         } else if (data.type === "print_ack") {
           // Tauri frontend confirms print success/failure
-          resolvePrintAck(data.eventId, data.ok === true, data.error);
+          const ok = data.ok === true;
+          const eventId = data.eventId;
+          if (!eventId) {
+            console.warn("[EdgeWS] print_ack missing eventId — ignoring");
+          } else {
+            // Validate: check that the print_job exists and is in 'printing' state.
+            // This prevents rogue/unauthorized clients from marking arbitrary jobs.
+            const job = getPrintJobByEventId(eventId);
+            if (job && job.status !== "printing") {
+              console.warn(`[EdgeWS] print_ack for ${eventId} rejected — job status is '${job.status}', expected 'printing'`);
+            } else {
+              resolvePrintAck(eventId, ok, data.error);
+              // Also update the durable print_job table so the dispatch loop
+              // and diagnostics endpoint reflect the actual print status.
+              try {
+                updatePrintJobStatus(
+                  eventId,
+                  ok ? "printed" : "needs_retry",
+                  ok ? null : (data.error || "Print failed"),
+                  "lan_ws",
+                );
+              } catch { /* print_job row may not exist for legacy /print endpoint */ }
+            }
+          }
         }
       } catch {
         // Ignore non-JSON messages
@@ -1748,6 +1822,25 @@ console.log(`[EdgeServer] WebSocket: ws://0.0.0.0:${server.port}/ws`);
 
 // Initialize LAN broadcast layer
 initLanBroadcast();
+
+// ── Background print dispatch loop ────────────────────────────────────────────
+// Every 5 seconds, pick up print_job rows in 'accepted' or 'needs_retry' status
+// and re-dispatch them. This handles:
+//   - Jobs created while no Tauri frontend was connected (cashier was closed)
+//   - Jobs that failed print_ack (printer offline, paper jam) — retried when fixed
+//   - Jobs from crashed edge server sessions (recovered from SQLite on restart)
+// Per-printer serialization is enforced inside dispatchPendingPrintJobs.
+setInterval(async () => {
+  if (!isLocalReady()) return;
+  try {
+    const result = await dispatchPendingPrintJobs();
+    if (result.dispatched > 0) {
+      console.log(`[PrintDispatch] Dispatched ${result.dispatched} pending print job(s), ${result.remaining} remaining`);
+    }
+  } catch (err) {
+    console.warn("[PrintDispatch] Background dispatch failed:", err);
+  }
+}, 5_000);
 
 // ── Startup maintenance: backup + prune ──────────────────────────────────────
 setTimeout(() => {

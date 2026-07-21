@@ -318,6 +318,22 @@ function markSynced(queueIds: number[]): void {
   if (queueIds.length === 0) return;
   const db = getDb();
   const placeholders = queueIds.map(() => "?").join(",");
+
+  // Before deleting, set cloud_synced = 1 on the source records so
+  // getOrderSyncStatus can confirm sync even after queue rows are cleaned up.
+  const rows = db.query(`SELECT table_name, record_id FROM sync_queue WHERE id IN (${placeholders})`).all(...queueIds) as any[];
+  for (const row of rows) {
+    if (row.table_name === "order") {
+      db.query("UPDATE order_record SET cloud_synced = 1 WHERE id = ?").run(row.record_id);
+    } else if (row.table_name === "order_item") {
+      db.query("UPDATE order_item SET cloud_synced = 1 WHERE id = ?").run(row.record_id);
+    } else if (row.table_name === "kot") {
+      db.query("UPDATE kot SET cloud_synced = 1 WHERE id = ?").run(row.record_id);
+    } else if (row.table_name === "kot_item") {
+      db.query("UPDATE kot_item SET cloud_synced = 1 WHERE id = ?").run(row.record_id);
+    }
+  }
+
   // Delete instead of marking synced=1 — keeps the table small so
   // collectBatch() stays fast and INSERTs don't slow down over a shift.
   db.query(`DELETE FROM sync_queue WHERE id IN (${placeholders})`).run(...queueIds);

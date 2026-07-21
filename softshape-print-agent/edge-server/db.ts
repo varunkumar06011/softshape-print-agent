@@ -543,6 +543,37 @@ function initSchema(database: Database) {
       updated_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
     );
 
+    -- Print Jobs (durable, idempotent print queue for KOT/bill printing)
+    -- One row per physical print job. The edge server creates these inside
+    -- the same transaction as the order/KOT write so they survive crashes.
+    -- The cashier Tauri frontend (or cloud relay) acknowledges each job.
+    -- Per-printer serialization is enforced by the dispatch loop reading
+    -- ORDER BY id ASC within a single-printer batch.
+    CREATE TABLE IF NOT EXISTS print_job (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id        TEXT NOT NULL UNIQUE,   -- idempotency key shared with captain
+      restaurant_id   TEXT NOT NULL,
+      order_id        TEXT NOT NULL,
+      kot_id          TEXT,
+      kot_number      INTEGER,
+      table_id        TEXT,
+      printer_name    TEXT,                   -- resolved printer (null = auto)
+      job_type        TEXT NOT NULL,           -- 'KOT', 'BAR_KOT', 'CANCEL_KOT', 'BILL', etc.
+      escpos_data     TEXT NOT NULL,           -- JSON array of {type,format,data}
+      item_summary    TEXT,                    -- JSON: [{name,qty}] for audit UI
+      captain_name    TEXT,
+      status          TEXT NOT NULL DEFAULT 'accepted',  -- accepted|printing|printed|failed|needs_retry
+      attempts        INTEGER DEFAULT 0,
+      last_error      TEXT,
+      created_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+      updated_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+      printed_at      INTEGER,
+      acked_via       TEXT                     -- 'lan_ws' | 'cloud_relay' | 'local'
+    );
+    CREATE INDEX IF NOT EXISTS idx_print_job_status ON print_job(status) WHERE status IN ('accepted', 'needs_retry');
+    CREATE INDEX IF NOT EXISTS idx_print_job_printer_status ON print_job(printer_name, status);
+    CREATE INDEX IF NOT EXISTS idx_print_job_order ON print_job(order_id);
+
     -- Users (staff accounts for offline PIN verification)
     CREATE TABLE IF NOT EXISTS users (
       id              TEXT PRIMARY KEY,
@@ -672,6 +703,39 @@ export function enqueueSync(tableName: string, recordId: string, operation: stri
     .run(tableName, recordId, operation, Date.now());
 }
 
+export function getOrderSyncStatus(orderId: string): { synced: boolean; pending: number; deadLettered: number } {
+  const db = getDb();
+  const rows = db.query(
+    `SELECT synced, attempts FROM sync_queue WHERE table_name IN ('order', 'order_item', 'kot', 'kot_item') AND record_id = ?`,
+  ).all(orderId) as any[];
+
+  if (rows.length === 0) {
+    // No sync_queue rows — check if the order exists at all.
+    // If it doesn't exist, the order was never created (wrong ID or not yet processed).
+    // If it exists with no pending sync entries, it was either already synced and
+    // cleaned up, or sync hasn't been queued yet. Check cloud_synced to distinguish.
+    const order = db.query("SELECT cloud_synced FROM order_record WHERE id = ?").get(orderId) as any;
+    if (!order) {
+      return { synced: false, pending: 0, deadLettered: 0 };
+    }
+    // Order exists — if cloud_synced is 1, it was confirmed synced.
+    // Otherwise, it may not have been queued yet (race condition) — treat as pending.
+    if (order.cloud_synced === 1) {
+      return { synced: true, pending: 0, deadLettered: 0 };
+    }
+    return { synced: false, pending: 1, deadLettered: 0 };
+  }
+
+  let pending = 0;
+  let deadLettered = 0;
+  for (const row of rows) {
+    if (row.synced === 1) continue;
+    if (row.attempts >= 5) deadLettered++;
+    else pending++;
+  }
+  return { synced: pending === 0 && deadLettered === 0, pending, deadLettered };
+}
+
 // ── Get next KOT number (local counter, atomic) ──────────────────────────────
 
 export function getNextKotNumber(restaurantId: string): number {
@@ -687,6 +751,92 @@ export function getNextKotNumber(restaurantId: string): number {
     .get(restaurantId, today) as { kot_count: number };
 
   return row.kot_count;
+}
+
+// ── Print job helpers (durable, idempotent print queue) ──────────────────────
+
+export function createPrintJob(job: {
+  eventId: string;
+  restaurantId: string;
+  orderId: string;
+  kotId?: string | null;
+  kotNumber?: number | null;
+  tableId?: string | null;
+  printerName: string | null;
+  jobType: string;
+  escposData: any[];
+  itemSummary?: any[];
+  captainName?: string | null;
+}): number | null {
+  const db = getDb();
+  const now = Date.now();
+  try {
+    db.query(`INSERT INTO print_job
+      (event_id, restaurant_id, order_id, kot_id, kot_number, table_id, printer_name, job_type, escpos_data, item_summary, captain_name, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?)
+      ON CONFLICT(event_id) DO NOTHING`)
+      .run(
+        job.eventId, job.restaurantId, job.orderId, job.kotId || null, job.kotNumber || null,
+        job.tableId || null, job.printerName, job.jobType,
+        JSON.stringify(job.escposData), JSON.stringify(job.itemSummary || []),
+        job.captainName || null, now, now,
+      );
+    const row = db.query("SELECT id FROM print_job WHERE event_id = ?").get(job.eventId) as { id: number } | undefined;
+    return row?.id ?? null;
+  } catch (err) {
+    console.warn("[DB] createPrintJob failed:", err);
+    return null;
+  }
+}
+
+export function updatePrintJobStatus(
+  eventId: string,
+  status: "printing" | "printed" | "failed" | "needs_retry",
+  error?: string | null,
+  ackedVia?: string | null,
+): void {
+  const db = getDb();
+  const now = Date.now();
+  const printedAt = status === "printed" ? now : null;
+  db.query(`UPDATE print_job SET status = ?, last_error = ?, acked_via = COALESCE(?, acked_via), printed_at = COALESCE(?, printed_at), updated_at = ?, attempts = attempts + 1 WHERE event_id = ?`)
+    .run(status, error || null, ackedVia || null, printedAt, now, eventId);
+}
+
+const PRINT_JOB_LEASE_MS = 30_000;
+
+export function claimPrintJob(eventId: string): boolean {
+  const db = getDb();
+  const now = Date.now();
+  const result = db.query(
+    `UPDATE print_job SET status = 'printing', updated_at = ? WHERE event_id = ? AND status IN ('accepted', 'needs_retry')`,
+  ).run(now, eventId);
+  return result.changes > 0;
+}
+
+export function reclaimStalePrintingJobs(): number {
+  const db = getDb();
+  const cutoff = Date.now() - PRINT_JOB_LEASE_MS;
+  const result = db.query(
+    `UPDATE print_job SET status = 'accepted', updated_at = ? WHERE status = 'printing' AND updated_at < ?`,
+  ).run(Date.now(), cutoff);
+  return result.changes;
+}
+
+export function getPendingPrintJobs(limit = 50): any[] {
+  const db = getDb();
+  return db.query(`SELECT * FROM print_job WHERE status IN ('accepted', 'needs_retry') ORDER BY id ASC LIMIT ?`)
+    .all(limit) as any[];
+}
+
+export function getPrintJobByEventId(eventId: string): any | null {
+  const db = getDb();
+  const row = db.query("SELECT * FROM print_job WHERE event_id = ?").get(eventId) as any | undefined;
+  return row ?? null;
+}
+
+export function getPrintJobsByOrder(orderId: string): any[] {
+  const db = getDb();
+  return db.query("SELECT * FROM print_job WHERE order_id = ? ORDER BY id ASC").all(orderId) as any[];
 }
 
 // ── Close database (for graceful shutdown) ────────────────────────────────────
