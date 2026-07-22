@@ -78,8 +78,16 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
     const db = getDb();
 
     if (!config.outlet) {
+      console.warn("[config] Cloud config response missing outlet — aborting");
       return { success: false, error: "Outlet not found in cloud config" };
     }
+
+    console.log(`[config] Config received: outlet=${config.outlet.id}, ` +
+      `taxProfiles=${config.taxProfiles?.length || 0}, ` +
+      `menuItems=${config.menuItems?.length || 0}, ` +
+      `tables=${config.tables?.length || 0}, ` +
+      `users=${config.users?.length || 0}, ` +
+      `organizationId=${config.organizationId || 'none'}`);
 
     let totalRows = 0;
 
@@ -142,6 +150,8 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
       db.query(`DELETE FROM tax_profile WHERE restaurant_id = ?`).run(rid);
       db.query(`DELETE FROM users WHERE outlet_id = ?`).run(rid);
     }
+
+    console.log("[config] Purge complete — starting upserts");
 
     // ── Outlet ──────────────────────────────────────────────────────────────
     db.query(`INSERT INTO outlet (

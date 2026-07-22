@@ -1179,7 +1179,13 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
       .run(newCancelledQty, orderItem.id);
 
     // 2. Mark the KOT item as CANCELLED so KDS stops showing it as active
+    //    Capture affected kot_item IDs and kot_ids first so we can sync them.
+    let cancelledKotItemIds: string[] = [];
+    let cancelledKotIds: string[] = [];
     if (isFullCancel) {
+      const kotItems = db.query("SELECT id, kot_id FROM kot_item WHERE order_item_id = ?").all(orderItem.id) as any[];
+      cancelledKotItemIds = kotItems.map((ki) => ki.id);
+      cancelledKotIds = [...new Set(kotItems.map((ki) => ki.kot_id))];
       db.query("UPDATE kot_item SET status = 'CANCELLED' WHERE order_item_id = ?")
         .run(orderItem.id);
     }
@@ -1208,6 +1214,12 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
     enqueueSync("order_item", orderItemId, "update");
     enqueueSync("order", orderId, "update");
     enqueueSync("table", order.table_id, "update");
+    for (const kotItemId of cancelledKotItemIds) {
+      enqueueSync("kot_item", kotItemId, "update");
+    }
+    for (const kotId of cancelledKotIds) {
+      enqueueSync("kot", kotId, "update");
+    }
   });
 
   tx();

@@ -151,7 +151,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return jsonResponse({
         status: startupState === "error" ? "error" : "initializing",
         service: "softshape-edge-server",
-        version: "18.5.0",
+        version: "22.1.0",
         uptime: process.uptime(),
         error: startupError || null,
       });
@@ -199,7 +199,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse({
       status: "ok",
       service: "softshape-edge-server",
-      version: "18.5.0",
+      version: "22.1.0",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
@@ -415,6 +415,26 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         }
       }
       if (edgeApiKey) saveEdgeApiKey(edgeApiKey);
+
+      // Start background sync services now that we have a valid session.
+      // On first boot (no prior session), these don't start at process init.
+      // Without this, the edge server has no heartbeat to cloud and no
+      // incremental sync until the process restarts.
+      try {
+        const lockResult = acquireInstanceLock();
+        if (lockResult.acquired) {
+          startHeartbeatLoop();
+          startSyncWorker();
+          startSocketSync();
+          startHeartbeat();
+          startIncrementalPolling();
+          console.log("[register] Background sync services started");
+        } else {
+          console.warn(`[register] Could not start sync services — instance lock held by ${lockResult.holder?.instanceId}`);
+        }
+      } catch (syncStartErr: any) {
+        console.warn("[register] Failed to start background sync services:", syncStartErr.message);
+      }
 
       // Don't start a background config download — the frontend will call
       // /api/edge/config/sync immediately after receiving this response.
@@ -2098,6 +2118,48 @@ process.on("SIGTERM", () => {
 
 // ── Auto-start incremental sync loop (every 60 seconds) ───────────────────────
 
+let _pollIntervalId: ReturnType<typeof setInterval> | null = null;
+let _pollStarted = false;
+
+function startIncrementalPolling(): void {
+  if (_pollStarted) return;
+  _pollStarted = true;
+
+  function schedulePoll() {
+    if (_pollIntervalId) clearInterval(_pollIntervalId);
+    const intervalMs = isInFallbackMode() ? 15_000 : 60_000;
+    _pollIntervalId = setInterval(async () => {
+      if (!isSessionValid()) return;
+      try {
+        const result = await pullIncrementalChanges();
+        if (result.success && result.changesApplied && result.changesApplied > 0) {
+          console.log(`[EdgeServer] Incremental sync: ${result.changesApplied} changes applied`);
+        }
+      } catch (err) {
+        console.warn('[EdgeServer] Incremental sync failed:', err);
+      }
+      // Re-evaluate interval after each poll in case fallback mode changed
+      const currentMs = isInFallbackMode() ? 15_000 : 60_000;
+      if (currentMs !== intervalMs) {
+        schedulePoll();
+      }
+    }, intervalMs);
+  }
+  schedulePoll();
+
+  // Initial incremental pull on startup
+  setTimeout(async () => {
+    try {
+      const result = await pullIncrementalChanges();
+      if (result.success) {
+        console.log(`[EdgeServer] Initial sync: ${result.changesApplied || 0} changes applied`);
+      }
+    } catch {
+      // Will retry in the interval
+    }
+  }, 3_000);
+}
+
 if (isSessionValid()) {
   console.log("[EdgeServer] Session valid — starting background sync loop");
 
@@ -2117,43 +2179,8 @@ if (isSessionValid()) {
     startHeartbeat();
   }
 
-  // Dynamic poll interval: 15s when socket is in fallback mode, 60s otherwise
-  let pollIntervalId: ReturnType<typeof setInterval> | null = null;
-  function schedulePoll() {
-    if (pollIntervalId) clearInterval(pollIntervalId);
-    const intervalMs = isInFallbackMode() ? 15_000 : 60_000;
-    pollIntervalId = setInterval(async () => {
-      if (!isSessionValid()) return;
-      if (!lockResult.acquired) return; // Don't poll if we don't have the lock
-      try {
-        const result = await pullIncrementalChanges();
-        if (result.success && result.changesApplied && result.changesApplied > 0) {
-          console.log(`[EdgeServer] Incremental sync: ${result.changesApplied} changes applied`);
-        }
-      } catch (err) {
-        console.warn('[EdgeServer] Incremental sync failed:', err);
-      }
-      // Re-evaluate interval after each poll in case fallback mode changed
-      const currentMs = isInFallbackMode() ? 15_000 : 60_000;
-      if (currentMs !== intervalMs) {
-        schedulePoll();
-      }
-    }, intervalMs);
-  }
   if (lockResult.acquired) {
-    schedulePoll();
-
-    // Initial incremental pull on startup
-    setTimeout(async () => {
-      try {
-        const result = await pullIncrementalChanges();
-        if (result.success) {
-          console.log(`[EdgeServer] Initial sync: ${result.changesApplied || 0} changes applied`);
-        }
-      } catch {
-        // Will retry in the interval
-      }
-    }, 3_000);
+    startIncrementalPolling();
   }
 } else {
   console.log("[EdgeServer] No valid session — waiting for registration via POST /api/edge/register");

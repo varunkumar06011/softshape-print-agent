@@ -63,23 +63,36 @@ function captureServerTime(res: Response): void {
 export async function cloudFetch(url: string, options: CloudFetchOptions = {}): Promise<Response> {
   const timeoutMs = options.timeout || DEFAULT_TIMEOUT_MS;
 
-  // If caller already provided a signal, use it; otherwise create a timeout signal
-  let signal: AbortSignal;
-  if (options.signal) {
-    signal = options.signal;
-  } else {
-    signal = AbortSignal.timeout(timeoutMs);
+  const { timeout: _removed, signal: callerSignal, ...fetchOptions } = options;
+
+  // Use AbortController+setTimeout instead of AbortSignal.timeout().
+  // AbortSignal.timeout() can fail to fire in compiled Bun binaries,
+  // causing fetch to hang indefinitely (root cause of config download timeouts).
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  // If caller provided a signal, abort when either fires
+  if (callerSignal) {
+    if (callerSignal.aborted) controller.abort();
+    else callerSignal.addEventListener("abort", () => controller.abort(), { once: true });
   }
 
-  const { timeout: _removed, ...fetchOptions } = options;
+  try {
+    const res = await fetch(url, {
+      ...fetchOptions,
+      signal: controller.signal,
+    });
 
-  const res = await fetch(url, {
-    ...fetchOptions,
-    signal,
-  });
+    // Capture server time for clock skew detection
+    captureServerTime(res);
 
-  // Capture server time for clock skew detection
-  captureServerTime(res);
-
-  return res;
+    return res;
+  } catch (err: any) {
+    if (controller.signal.aborted && (!callerSignal || !callerSignal.aborted)) {
+      throw new Error(`Request to ${url} timed out after ${timeoutMs / 1000}s`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
