@@ -518,7 +518,7 @@ export function getMenuItems(venueId?: string): any[] {
     SELECT m.*, c.name as category_name, c.sort_order as category_sort_order
     FROM menu_item m
     LEFT JOIN category c ON m.category_id = c.id
-    WHERE m.restaurant_id = ? AND m.is_available = 1 AND m.is_deleted = 0 AND c.is_active = 1
+    WHERE m.restaurant_id = ? AND m.is_available = 1 AND m.is_deleted = 0 AND (c.id IS NULL OR c.is_active = 1)
     ORDER BY c.sort_order ASC, m.sort_order ASC
   `).all(restaurantId) as any[];
 
