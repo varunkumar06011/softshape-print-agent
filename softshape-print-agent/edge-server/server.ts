@@ -151,7 +151,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return jsonResponse({
         status: startupState === "error" ? "error" : "initializing",
         service: "softshape-edge-server",
-        version: "22.6.0",
+        version: "22.7.0",
         uptime: process.uptime(),
         error: startupError || null,
       });
@@ -199,7 +199,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse({
       status: "ok",
       service: "softshape-edge-server",
-      version: "22.6.0",
+      version: "22.7.0",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
@@ -1025,6 +1025,29 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     const venueId = url.searchParams.get("venueId") || undefined;
     const data = getMenuItems(venueId);
     return jsonResponse(data);
+  }
+
+  // ── GET /api/edge/menu/debug — diagnostic: raw SQLite menu state ───────────
+  if (url.pathname === "/api/edge/menu/debug" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const db = getDb();
+    const rid = getRestaurantId();
+    const totalItems = (db.query("SELECT COUNT(*) as c FROM menu_item WHERE restaurant_id = ?").get(rid) as any)?.c || 0;
+    const availableItems = (db.query("SELECT COUNT(*) as c FROM menu_item WHERE restaurant_id = ? AND is_available = 1 AND is_deleted = 0").get(rid) as any)?.c || 0;
+    const deletedItems = (db.query("SELECT COUNT(*) as c FROM menu_item WHERE restaurant_id = ? AND is_deleted = 1").get(rid) as any)?.c || 0;
+    const unavailableItems = (db.query("SELECT COUNT(*) as c FROM menu_item WHERE restaurant_id = ? AND is_available = 0 AND is_deleted = 0").get(rid) as any)?.c || 0;
+    const totalCategories = (db.query("SELECT COUNT(*) as c FROM category WHERE restaurant_id = ?").get(rid) as any)?.c || 0;
+    const activeCategories = (db.query("SELECT COUNT(*) as c FROM category WHERE restaurant_id = ? AND is_active = 1").get(rid) as any)?.c || 0;
+    const itemsWithoutCategory = (db.query("SELECT COUNT(*) as c FROM menu_item m LEFT JOIN category c ON m.category_id = c.id WHERE m.restaurant_id = ? AND c.id IS NULL AND m.is_deleted = 0").get(rid) as any)?.c || 0;
+    const sampleItems = db.query("SELECT id, name, is_available, is_deleted, category_id FROM menu_item WHERE restaurant_id = ? LIMIT 5").all(rid);
+    const sampleCategories = db.query("SELECT id, name, is_active FROM category WHERE restaurant_id = ? LIMIT 5").all(rid);
+    return jsonResponse({
+      restaurantId: rid,
+      menuItems: { total: totalItems, available: availableItems, deleted: deletedItems, unavailable: unavailableItems, withoutCategory: itemsWithoutCategory },
+      categories: { total: totalCategories, active: activeCategories },
+      sampleItems,
+      sampleCategories,
+    });
   }
 
   // ── GET /api/edge/config/version — config version metadata for cache validation
