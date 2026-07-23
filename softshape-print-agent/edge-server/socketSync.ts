@@ -70,9 +70,8 @@ export function startSocketSync(): void {
     connectionAttempts = 0;
     fallbackToPolling = false;
 
-    // Register as edge server with print capability (Phase 4)
-    // The cloud can now route print_job events directly to this edge server
-    // instead of relaying through the standalone Print Agent.
+    // Register as edge server with print capability.
+    // The cloud routes print_job events directly to this edge server.
     socket!.emit("edge:register", {
       restaurantId,
       sessionToken: token,
@@ -186,11 +185,11 @@ export function startSocketSync(): void {
   // R5: edge:print_ack listener removed — cloud no longer relays print jobs.
   // The runtime SQLite queue is the sole retry owner (ADR-001).
 
-  // ── Direct cloud print_job handler (Phase 4: Fold Print Agent) ─────────────
-  // The cloud can now send print_job events directly to this edge server.
-  // Previously, the standalone Print Agent received these and printed via
-  // Tauri. Now the Runtime prints them via the isolated print service on
-  // :3103 and sends print:ack back to the cloud.
+  // ── Direct cloud print_job handler ────────────────────────────────────────
+  // The cloud sends print_job events directly to this edge server for
+  // cloud-originated prints (e.g. admin reprint from another device).
+  // The Runtime prints them via the isolated print service on :3103 and
+  // sends print:ack back to the cloud.
   socket.on("print_job", async (envelope: any) => {
     try {
       await handleCloudPrintJob(envelope);
@@ -240,10 +239,9 @@ export function sendPrintAck(eventId: string, ok: boolean, error?: string | null
   });
 }
 
-// ─── Handle cloud print_job event (Phase 4: Fold Print Agent) ─────────────────
+// ─── Handle cloud print_job event ───────────────────────────────────────────
 // Receives a print_job envelope from the cloud, creates a durable print_job
 // row in SQLite, dispatches it to the print service, and sends print:ack.
-// This replaces the standalone Print Agent's socket → Tauri print path.
 
 async function handleCloudPrintJob(envelope: any): Promise<void> {
   const { type, data, eventId } = envelope;

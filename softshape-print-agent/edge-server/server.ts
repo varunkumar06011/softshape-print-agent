@@ -57,7 +57,7 @@ import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDe
 import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode } from "./socketSync.ts";
 import { acquireInstanceLock, startHeartbeatLoop, stopHeartbeatLoop, releaseInstanceLock, forceReleaseLock, getLockStatus } from "./instanceLock.ts";
 import { cloudFetch } from "./cloudFetch.ts";
-import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount, getPrintingClientCount, setClientCapability, lanBroadcast } from "./lanBroadcast.ts";
+import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount, setClientRegistered, lanBroadcast } from "./lanBroadcast.ts";
 import { printToPrinter } from "./printer.ts";
 import { startPrintService, stopPrintService, isPrintServiceReady, getPrintServiceStatus, sendToPrintService, listPrintersViaService } from "./printServiceManager.ts";
 import { deviceManager } from "./drivers/manager.ts";
@@ -1529,7 +1529,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── GET /api/edge/lan/status — LAN WebSocket client count (Bug 2) ─────────
   if (url.pathname === "/api/edge/lan/status" && req.method === "GET") {
-    return jsonResponse({ connectedClients: getLanClientCount(), printingClients: getPrintingClientCount() });
+    return jsonResponse({ connectedClients: getLanClientCount() });
   }
 
   // ── GET /api/edge/print-jobs — print job queue status (diagnostics) ────────
@@ -2246,7 +2246,7 @@ const server = Bun.serve<{ eventBus?: boolean }>({
         if (data.type === "ping") {
           ws.send(JSON.stringify({ type: "pong", ts: Date.now() }));
         } else if (data.type === "register") {
-          setClientCapability(ws, data.canPrint === true);
+          setClientRegistered(ws);
         }
       } catch {
         // Ignore non-JSON messages
