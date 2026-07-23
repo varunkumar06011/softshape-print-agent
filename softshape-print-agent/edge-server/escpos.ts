@@ -298,6 +298,7 @@ export interface BillPrintInput {
   pricesIncludeGst?: boolean;
   discountPercent?: number;
   serviceChargePercent?: number;
+  billNumber?: string | null;
 }
 
 function getEffectiveGstRate(gstRate: number | null | undefined, gstCategory: string | null | undefined, gstRegistered: boolean | null | undefined): number {
@@ -339,6 +340,12 @@ export function buildBill(input: BillPrintInput): { type: string; format: string
 
   cmds.push(
     SIZE_2X, BOLD_ON, 'BILL RECEIPT\n', BOLD_OFF, SIZE_NORMAL, separator(),
+  );
+
+  if (input.billNumber) {
+    cmds.push(LEFT, BOLD_ON, `Bill No : ${input.billNumber}\n`, BOLD_OFF);
+  }
+  cmds.push(
     LEFT, `Table : ${tableNumber}\n`,
     `Date  : ${new Date().toLocaleString('en-IN')}\n`, separator(),
     BOLD_ON, pad('ITEM', 24) + pad('QTY', 6) + 'AMT'.padStart(12) + '\n', BOLD_OFF, separator(),
@@ -357,9 +364,10 @@ export function buildBill(input: BillPrintInput): { type: string; format: string
   const liquorSubtotal = liquorItems.reduce((s, i) => s + Number(i.price || 0) * (i.quantity || 1), 0);
   const totalSubtotal = foodSubtotal + liquorSubtotal;
 
-  // Food: GST-exempt when gstEnabled=false. Liquor/bar: always GST-exempt.
+  // GST-exempt items: any item (food or liquor) with gstEnabled=false is exempt.
+  // Liquor defaults to gstEnabled=false (no GST) but admin can enable it per item.
   const gstExemptFood = foodItems.filter((i) => i.gstEnabled === false).reduce((s, i) => s + Number(i.price || 0) * (i.quantity || 1), 0);
-  const gstExemptLiquor = liquorItems.reduce((s, i) => s + Number(i.price || 0) * (i.quantity || 1), 0);
+  const gstExemptLiquor = liquorItems.filter((i) => i.gstEnabled === false).reduce((s, i) => s + Number(i.price || 0) * (i.quantity || 1), 0);
   const gstExemptTotal = gstExemptFood + gstExemptLiquor;
 
   // Discount on raw subtotal first (proportional) — matches settlement
@@ -381,7 +389,9 @@ export function buildBill(input: BillPrintInput): { type: string; format: string
     ? Math.round((discountedSubtotal + tax) * (scPercent / 100) * 100) / 100
     : 0;
 
-  const total = Math.round(Math.max(0, discountedSubtotal + tax + serviceChargeAmount) * 100) / 100;
+  const rawTotal = Math.max(0, discountedSubtotal + tax + serviceChargeAmount);
+  const roundedTotal = Math.round(rawTotal * 100) / 100;
+  const roundOff = Math.round((roundedTotal - rawTotal) * 100) / 100;
 
   // ── Render totals ──────────────────────────────────────────────────────
   cmds.push(separator());
@@ -406,11 +416,16 @@ export function buildBill(input: BillPrintInput): { type: string; format: string
     cmds.push(BOLD_OFF);
   }
 
+  // Round off line — only print if non-zero (matches frontend billing.js)
+  if (roundOff !== 0) {
+    cmds.push(padRight('Round Off', 'Rs.' + roundOff.toFixed(2)) + '\n');
+  }
+
   cmds.push(
     separator('='),
-    BOLD_ON, padRight('TOTAL', 'Rs.' + total.toFixed(2)) + '\n', BOLD_OFF,
+    BOLD_ON, padRight('TOTAL', 'Rs.' + roundedTotal.toFixed(2)) + '\n', BOLD_OFF,
     separator(), CENTER, 'Thank you! Visit again.\n', '\n',
-    `Powered by ${restaurant?.name || 'Softshape'}\n`, '\n\n\n', CUT,
+    'Powered by Softshape.ai\n', '\n\n\n', CUT,
   );
 
   return [{ type: 'raw', format: 'plain', data: cmds.join('') }];

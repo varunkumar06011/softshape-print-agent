@@ -11,18 +11,86 @@
 // Total: 15-40ms from button press to printer starting.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, getNextKotNumber, enqueueSync, getKolkataDateString, createPrintJob, updatePrintJobStatus, getPendingPrintJobs, claimPrintJob, reclaimStalePrintingJobs, getPrintJobByEventId } from "./db.ts";
+import { getDb, getNextKotNumber, enqueueSync, getKolkataDateString, createPrintJob, updatePrintJobStatus, getPendingPrintJobs, claimPrintJob, reclaimStalePrintingJobs, getPrintJobByEventId, lookupCommand, recordCommand, nextTableRevision, nextOrderRevision } from "./db.ts";
 import { buildFoodKOT, buildLiquorKOT, buildCancelKOT, buildBill, type PrintItem, type OrderData } from "./escpos.ts";
-import { resolvePrinterName } from "./printer.ts";
-import { lanBroadcast, getPrintingClientCount, broadcastPrintJob, waitForPrintAck } from "./lanBroadcast.ts";
-import { relayPrintViaCloud, isCloudSocketConnected } from "./socketSync.ts";
+import { resolvePrinterName, printToPrinter } from "./printer.ts";
+import { lanBroadcast } from "./lanBroadcast.ts";
+import { relayPrintViaCloud } from "./socketSync.ts";
 
-// ─── LAN print dispatch ───────────────────────────────────────────────────────
-// The edge server (Bun process) does NOT have window.__TAURI__. Only the Tauri
-// webview frontend (cashier) can invoke print_raw to physical printers.
-// All print jobs are broadcast via WebSocket to connected Tauri frontends.
-// The Tauri frontend sends a print_ack back confirming success/failure.
-// If no clients are connected, returns ok:false so the caller can fall back.
+// ─── Phase 1: Command metadata + durable idempotency ─────────────────────────
+// Every edge business command carries CommandMeta for idempotency and optimistic
+// concurrency control. The command_log table stores the original result so a
+// replay of the same (restaurantId, requestId, commandType) returns the original
+// response without reapplying side effects.
+
+export interface CommandMeta {
+  requestId?: string;
+  deviceId?: string;
+  expectedRevision?: number;
+}
+
+export interface RevisionResponse {
+  revision?: number;
+  tableRevision?: number;
+}
+
+function checkCommandIdempotency<T>(
+  restaurantId: string,
+  meta: CommandMeta | undefined,
+  commandType: string,
+  entityId: string,
+): { replay: boolean; result?: T } {
+  if (!meta?.requestId) return { replay: false };
+  const entry = lookupCommand(restaurantId, meta.requestId, commandType);
+  if (!entry) return { replay: false };
+  if (entry.status === "applied" && entry.response_json) {
+    try {
+      const result = JSON.parse(entry.response_json) as T;
+      return { replay: true, result };
+    } catch {
+      return { replay: false };
+    }
+  }
+  if (entry.status === "rejected" || entry.status === "failed") {
+    return { replay: true, result: { success: false, error: entry.error_message || "Command previously rejected" } as any };
+  }
+  return { replay: false };
+}
+
+function recordCommandResult(
+  restaurantId: string,
+  meta: CommandMeta | undefined,
+  commandType: string,
+  entityType: string,
+  entityId: string,
+  status: "applied" | "rejected" | "failed",
+  response: any,
+  resultingRevision?: number | null,
+  errorMessage?: string | null,
+): void {
+  if (!meta?.requestId) return;
+  recordCommand({
+    restaurant_id: restaurantId,
+    request_id: meta.requestId,
+    command_type: commandType,
+    entity_type: entityType,
+    entity_id: entityId,
+    device_id: meta.deviceId ?? null,
+    command_ts: Date.now(),
+    expected_revision: meta.expectedRevision ?? null,
+    resulting_revision: resultingRevision ?? null,
+    status,
+    response_json: JSON.stringify(response),
+    error_message: errorMessage ?? null,
+  });
+}
+
+// ─── Print dispatch via HTTP bridge ───────────────────────────────────────────
+// The edge server (Bun process) does NOT have window.__TAURI__. It sends print
+// jobs to the cashier-desktop's print bridge (HTTP POST to port 3102), which
+// runs inside the Tauri Rust core and calls print_raw / print_network directly.
+// If the bridge is unreachable (cashier app not running), falls back to cloud
+// relay via the cloud WebSocket socket.
 
 interface PrintGroup {
   printerName: string | null;
@@ -30,15 +98,11 @@ interface PrintGroup {
   type: string;
 }
 
-const PRINT_ACK_TIMEOUT_MS = 20000;
-
 async function printWithLanFallback(
   groups: PrintGroup[],
   requestId?: string,
 ): Promise<any[]> {
-  const clientCount = getPrintingClientCount();
   const results: any[] = [];
-  const ackPromises: Promise<void>[] = [];
 
   for (let i = 0; i < groups.length; i++) {
     const group = groups[i];
@@ -46,57 +110,35 @@ async function printWithLanFallback(
       results.push({ ok: false, printerName: group.printerName || "unknown", bytes: 0, error: "No print data", method: "noop" });
       continue;
     }
-    if (clientCount === 0) {
-      console.warn(`[Print] No printing-capable LAN clients — falling back to cloud relay for ${group.type} → ${group.printerName || "(auto)"}`);
-      const eventId = `${group.type}-${requestId || Date.now()}-${i}`;
-      const relayed = relayPrintViaCloud({
-        type: group.type,
-        data: { printerName: group.printerName || null, escposData: group.escposData, requestId: requestId || null },
-        eventId,
-      });
-      results.push({
-        ok: relayed,
-        printerName: group.printerName || null,
-        bytes: 0,
-        error: relayed ? null : "No printing clients and cloud socket not connected",
-        method: relayed ? "cloud_relay" : "lan_ws",
-        eventId,
-      });
-      continue;
-    }
 
     const eventId = `${group.type}-${requestId || Date.now()}-${i}`;
-    broadcastPrintJob("print_job", {
+
+    // Try the print service first (isolated Rust process on :3103)
+    if (group.printerName) {
+      const result = await printToPrinter(group.printerName, group.escposData, eventId, group.type);
+      if (result.ok) {
+        results.push({ ok: true, printerName: group.printerName, bytes: result.bytes, method: "print_service", eventId });
+        continue;
+      }
+      console.warn(`[Print] Print service failed for ${group.type} → ${group.printerName}: ${result.error} — trying cloud relay`);
+    }
+
+    // Fallback: relay via cloud WebSocket socket
+    const relayed = relayPrintViaCloud({
       type: group.type,
-      data: {
-        printerName: group.printerName || null,
-        escposData: group.escposData,
-        requestId: requestId || null,
-      },
+      data: { printerName: group.printerName || null, escposData: group.escposData, requestId: requestId || null },
       eventId,
-      ts: Date.now(),
     });
-
-    // Wait for print_ack from Tauri frontend (with timeout)
-    const idx = i;
-    const printerName = group.printerName;
-    const ackPromise = waitForPrintAck(eventId, PRINT_ACK_TIMEOUT_MS).then((ack) => {
-      results[idx] = {
-        ok: ack.ok,
-        printerName,
-        bytes: 0,
-        error: ack.error || null,
-        method: "lan_ws",
-        eventId,
-      };
+    results.push({
+      ok: relayed,
+      printerName: group.printerName || null,
+      bytes: 0,
+      error: relayed ? null : "Bridge unavailable and cloud socket not connected",
+      method: relayed ? "cloud_relay" : "noop",
+      eventId,
     });
-    ackPromises.push(ackPromise);
-
-    // Placeholder — will be replaced by ack result
-    results.push({ ok: null, printerName, bytes: 0, method: "lan_ws_pending", eventId });
   }
 
-  await Promise.all(ackPromises);
   return results;
 }
 
@@ -106,31 +148,24 @@ async function printSingleWithLanFallback(
   type: string,
   requestId?: string,
 ): Promise<any> {
-  if (getPrintingClientCount() === 0) {
-    console.warn(`[Print] No printing-capable LAN clients — falling back to cloud relay for ${type} → ${printerName || "(auto)"}`);
-    const eventId = `${type}-${requestId || Date.now()}`;
-    const relayed = relayPrintViaCloud({
-      type,
-      data: { printerName: printerName || null, escposData, requestId: requestId || null },
-      eventId,
-    });
-    return { ok: relayed, printerName, bytes: 0, error: relayed ? null : "No printing clients and cloud socket not connected", method: relayed ? "cloud_relay" : "lan_ws", eventId };
+  const eventId = `${type}-${requestId || Date.now()}`;
+
+  // Try the print service first (isolated Rust process on :3103)
+  if (printerName) {
+    const result = await printToPrinter(printerName, escposData, eventId, type);
+    if (result.ok) {
+      return { ok: true, printerName, bytes: result.bytes, method: "print_service", eventId };
+    }
+    console.warn(`[Print] Print service failed for ${type} → ${printerName}: ${result.error} — trying cloud relay`);
   }
 
-  const eventId = `${type}-${requestId || Date.now()}`;
-  broadcastPrintJob("print_job", {
+  // Fallback: relay via cloud WebSocket socket
+  const relayed = relayPrintViaCloud({
     type,
-    data: {
-      printerName: printerName || null,
-      escposData,
-      requestId: requestId || null,
-    },
+    data: { printerName: printerName || null, escposData, requestId: requestId || null },
     eventId,
-    ts: Date.now(),
   });
-
-  const ack = await waitForPrintAck(eventId, PRINT_ACK_TIMEOUT_MS);
-  return { ok: ack.ok, printerName, bytes: 0, error: ack.error || null, method: "lan_ws", eventId };
+  return { ok: relayed, printerName, bytes: 0, error: relayed ? null : "Bridge unavailable and cloud socket not connected", method: relayed ? "cloud_relay" : "noop", eventId };
 }
 
 // ─── Durable print queue integration ──────────────────────────────────────────
@@ -235,57 +270,41 @@ export async function dispatchSinglePrintJob(
   }
 
   try {
-    const clientCount = getPrintingClientCount();
-
-    if (clientCount === 0) {
-      // No printing-capable LAN clients — try cloud relay
-      const relayed = relayPrintViaCloud({
-        type: group.type,
-        data: { printerName: group.printerName || null, escposData: group.escposData, requestId: requestId || null },
-        eventId,
-      });
-      if (relayed) {
-        // Cloud relay accepted — leave as 'printing' so the background loop
-        // doesn't re-dispatch. The cloud ack path or lease expiry will resolve it.
+    // Try the print service first (isolated Rust process on :3103)
+    if (group.printerName) {
+      const result = await printToPrinter(group.printerName, group.escposData, eventId, group.type);
+      if (result.ok) {
+        updatePrintJobStatus(eventId, "printed", null, "local");
+        console.log(`[Print] Job ${eventId} → ${group.printerName} ✓`);
         return;
       }
-      // No printing clients and no cloud — mark for retry
-      updatePrintJobStatus(eventId, "needs_retry", "No printing clients and cloud socket unavailable");
+      console.warn(`[Print] Job ${eventId} → ${group.printerName} print service failed: ${result.error} — trying cloud relay`);
+    }
+
+    // Fallback: relay via cloud WebSocket socket
+    const relayed = relayPrintViaCloud({
+      type: group.type,
+      data: { printerName: group.printerName || null, escposData: group.escposData, requestId: requestId || null },
+      eventId,
+    });
+    if (relayed) {
+      // Cloud relay accepted — leave as 'printing' so the background loop
+      // doesn't re-dispatch. The cloud ack path or lease expiry will resolve it.
       return;
     }
-
-    // Broadcast to printing-capable LAN WebSocket clients only
-    broadcastPrintJob("print_job", {
-      type: group.type,
-      data: {
-        printerName: group.printerName || null,
-        escposData: group.escposData,
-        requestId: requestId || null,
-      },
-      eventId,
-      ts: Date.now(),
-    });
-
-    // Wait for print_ack from Tauri frontend
-    const ack = await waitForPrintAck(eventId, PRINT_ACK_TIMEOUT_MS);
-    if (ack.ok) {
-      updatePrintJobStatus(eventId, "printed", null, "lan_ws");
-      console.log(`[Print] Job ${eventId} → ${group.printerName || "(auto)"} ✓`);
-    } else {
-      updatePrintJobStatus(eventId, "needs_retry", ack.error || "Print ack failed");
-      console.warn(`[Print] Job ${eventId} → ${group.printerName || "(auto)"} ✗ ${ack.error}`);
-    }
+    // Bridge unavailable and cloud socket not connected — mark for retry
+    updatePrintJobStatus(eventId, "retrying", "Print service unavailable and cloud socket not connected");
   } catch (err: any) {
-    updatePrintJobStatus(eventId, "needs_retry", err?.message || String(err));
+    updatePrintJobStatus(eventId, "retrying", err?.message || String(err));
     console.error(`[Print] Job ${eventId} dispatch error:`, err);
   }
 }
 
 // ─── Background dispatch loop for pending print jobs ──────────────────────────
-// Called periodically by server.ts. Picks up print_job rows in 'accepted' or
-// 'needs_retry' status and re-dispatches them. Enforces per-printer serialization
+// Called periodically by server.ts. Picks up print_job rows in 'queued' or
+// 'retrying' status and re-dispatches them. Enforces per-printer serialization
 // by processing jobs in id ASC order and only dispatching one job per printer
-// per cycle (the ack from the Tauri frontend will free the printer for the next).
+// per cycle (the ack from the print service will free the printer for the next).
 
 let _dispatchRunning = false;
 
@@ -487,6 +506,8 @@ export interface CreateOrderInput {
   localPrinted?: boolean;
   preReservedKotNumber?: number | null;
   kotEventIds?: string[] | null;
+  deviceId?: string;
+  expectedRevision?: number;
 }
 
 export interface CreateOrderResult {
@@ -499,6 +520,8 @@ export interface CreateOrderResult {
   printResults?: any[];
   error?: string;
   statusCode?: number;
+  revision?: number;
+  tableRevision?: number;
 }
 
 // ─── Helper: Safe JSON parse ──────────────────────────────────────────────────
@@ -631,19 +654,30 @@ export async function createOrder(
 
   const db = getDb();
 
-  // ── Idempotency check: if requestId already exists, return existing order ──
+  // ── Phase 1: Durable idempotency check via command_log ────────────────────
+  // If this requestId was already processed for createOrder, return the original
+  // result without reapplying any side effects (no duplicate KOTs, items, prints).
+  const idem = checkCommandIdempotency<CreateOrderResult>(restaurantId, input, "createOrder", tableId);
+  if (idem.replay && idem.result) {
+    return idem.result;
+  }
+
+  // ── Legacy idempotency check: if requestId already exists, return existing order ──
   if (requestId) {
     const existing = db.query("SELECT * FROM order_record WHERE last_request_id = ?").get(requestId) as any;
     if (existing) {
       // Return the existing order — duplicate request
       const existingItems = db.query("SELECT * FROM order_item WHERE order_id = ?").all(existing.id) as any[];
-      return {
+      const replayResult: CreateOrderResult = {
         success: true,
         orderId: existing.id,
         kotNumber: 0, // Already created before
         order: { ...existing, items: existingItems },
+        revision: existing.revision ?? 1,
         error: "Duplicate request — returning existing order",
       };
+      recordCommandResult(restaurantId, input, "createOrder", "table", tableId, "applied", replayResult, existing.revision ?? 1);
+      return replayResult;
     }
   }
 
@@ -653,23 +687,29 @@ export async function createOrder(
   ).get(tableId, restaurantId, ...ACTIVE_ORDER_STATUSES) as any;
 
   if (activeOrder) {
-    return {
+    const rejectResult = {
       success: false,
       error: "Table already has an active order — use update items instead",
       statusCode: 409,
       orderId: activeOrder.id,
     };
+    recordCommandResult(restaurantId, input, "createOrder", "table", tableId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
   }
 
   // ── Get table + outlet info ────────────────────────────────────────────────
   const table = getTableWithSection(tableId);
   if (!table) {
-    return { success: false, error: "Table not found", statusCode: 404 };
+    const rejectResult = { success: false, error: "Table not found", statusCode: 404 };
+    recordCommandResult(restaurantId, input, "createOrder", "table", tableId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
   }
 
   const outlet = getOutlet(restaurantId);
   if (!outlet) {
-    return { success: false, error: "Outlet not found in local DB", statusCode: 404 };
+    const rejectResult = { success: false, error: "Outlet not found in local DB", statusCode: 404 };
+    recordCommandResult(restaurantId, input, "createOrder", "table", tableId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
   }
 
   // ── Get menu items with categories for printer routing ─────────────────────
@@ -680,13 +720,19 @@ export async function createOrder(
   for (const item of items) {
     const mi = menuItemMap.get(item.menuItemId);
     if (!mi) {
-      return { success: false, error: `Menu item not found: ${item.name}`, statusCode: 400 };
+      const rejectResult = { success: false, error: `Menu item not found: ${item.name}`, statusCode: 400 };
+      recordCommandResult(restaurantId, input, "createOrder", "table", tableId, "rejected", rejectResult, null, rejectResult.error);
+      return rejectResult;
     }
     if (mi.is_deleted) {
-      return { success: false, error: `Menu item deleted: ${item.name}`, statusCode: 400 };
+      const rejectResult = { success: false, error: `Menu item deleted: ${item.name}`, statusCode: 400 };
+      recordCommandResult(restaurantId, input, "createOrder", "table", tableId, "rejected", rejectResult, null, rejectResult.error);
+      return rejectResult;
     }
     if (!mi.is_available) {
-      return { success: false, error: `Menu item not available: ${item.name}`, statusCode: 400 };
+      const rejectResult = { success: false, error: `Menu item not available: ${item.name}`, statusCode: 400 };
+      recordCommandResult(restaurantId, input, "createOrder", "table", tableId, "rejected", rejectResult, null, rejectResult.error);
+      return rejectResult;
     }
   }
 
@@ -779,9 +825,10 @@ export async function createOrder(
       `).run(kotItemId, kotId, oi.id, oi.menu_item_id, oi.name, oi.quantity, oi.price, oi.notes, now);
     }
 
-    // 5. Update table status
-    db.query(`UPDATE "table" SET status = 'OCCUPIED', workflow_status = 'Preparing', current_bill = current_bill + ?, updated_at = ? WHERE id = ?`)
-      .run(totalAmount, now, tableId);
+    // 5. Update table status + increment table revision
+    const newTableRev = nextTableRevision(tableId);
+    db.query(`UPDATE "table" SET status = 'OCCUPIED', workflow_status = 'Preparing', current_bill = current_bill + ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+      .run(totalAmount, newTableRev, requestId || null, now, tableId);
 
     // 6. Update KOT history on table (safe parse — corrupted JSON should not crash the transaction)
     let currentHistory: any[] = [];
@@ -803,14 +850,25 @@ export async function createOrder(
 
     // 8. Persist print intents in the same transaction (atomicity guarantee)
     persistPrintIntentsInTx(printIntents, restaurantId, orderId, kotId, kotNumber, tableId, captainName);
+
+    // 9. Set order revision = 1 (new aggregate) and last_command_id
+    db.query("UPDATE order_record SET revision = 1, last_command_id = ? WHERE id = ?")
+      .run(requestId || null, orderId);
+
+    // Return the new revisions from the transaction scope
+    return { newTableRev };
   });
 
+  let newTableRev = 1;
   try {
-    tx();
+    const txResult = tx();
+    newTableRev = (txResult as any)?.newTableRev ?? 1;
   } catch (err: any) {
     // UNIQUE constraint violation on last_request_id — duplicate request
     if (err.message && err.message.includes("UNIQUE")) {
-      return { success: false, error: "Duplicate request — order already exists", statusCode: 409 };
+      const rejectResult: CreateOrderResult = { success: false, error: "Duplicate request — order already exists", statusCode: 409 };
+      recordCommandResult(restaurantId, input, "createOrder", "table", tableId, "rejected", rejectResult, null, rejectResult.error);
+      return rejectResult;
     }
     throw err;
   }
@@ -820,8 +878,8 @@ export async function createOrder(
   const printResults = localPrinted ? [] : dispatchPrintIntents(printIntents, requestId);
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
-  lanBroadcast("order:created", { order: { id: orderId, tableId, kotNumber, totalAmount }, tableId, requestId });
-  lanBroadcast("table:updated", { table: { id: tableId, status: "OCCUPIED", workflowStatus: "Preparing" }, tableId, requestId });
+  lanBroadcast("order:created", { order: { id: orderId, tableId, kotNumber, totalAmount, revision: 1 }, tableId, requestId, revision: 1, tableRevision: newTableRev, commandId: requestId });
+  lanBroadcast("table:updated", { table: { id: tableId, status: "OCCUPIED", workflowStatus: "Preparing", revision: newTableRev }, tableId, requestId, tableRevision: newTableRev, commandId: requestId });
 
   // ── Return result ──────────────────────────────────────────────────────────
   const updatedTable = db.query(`
@@ -831,11 +889,13 @@ export async function createOrder(
 
   const orderItems = db.query("SELECT * FROM order_item WHERE order_id = ?").all(orderId) as any[];
 
-  return {
+  const result: CreateOrderResult = {
     success: true,
     orderId,
     kotNumber,
     kotId: kotId,
+    revision: 1,
+    tableRevision: newTableRev,
     order: {
       id: orderId,
       tableId,
@@ -851,6 +911,9 @@ export async function createOrder(
     },
     printResults,
   };
+
+  recordCommandResult(restaurantId, input, "createOrder", "order", orderId, "applied", result, 1);
+  return result;
 }
 
 // ─── Helper: safe-parse kot_history JSON ─────────────────────────────────────
@@ -886,6 +949,8 @@ export interface UpdateOrderItemsInput {
   localPrinted?: boolean;
   preReservedKotNumber?: number | null;
   kotEventIds?: string[] | null;
+  deviceId?: string;
+  expectedRevision?: number;
 }
 
 export interface UpdateOrderItemsResult {
@@ -898,6 +963,8 @@ export interface UpdateOrderItemsResult {
   printResults?: any[];
   error?: string;
   statusCode?: number;
+  revision?: number;
+  tableRevision?: number;
 }
 
 export async function updateOrderItems(
@@ -922,36 +989,51 @@ export async function updateOrderItems(
 
   const db = getDb();
 
+  // ── Phase 1: Durable idempotency check via command_log ────────────────────
+  const idem = checkCommandIdempotency<UpdateOrderItemsResult>(restaurantId, input, "updateOrderItems", orderId);
+  if (idem.replay && idem.result) {
+    return idem.result;
+  }
+
   // ── Idempotency check — scoped to the target order to avoid matching other orders ──
   if (requestId) {
     const existing = db.query("SELECT * FROM order_record WHERE id = ? AND last_request_id = ?").get(orderId, requestId) as any;
     if (existing) {
       const existingItems = db.query("SELECT * FROM order_item WHERE order_id = ?").all(existing.id) as any[];
-      return {
+      const replayResult: UpdateOrderItemsResult = {
         success: true,
         orderId: existing.id,
         kotNumber: 0,
         order: { ...existing, items: existingItems },
+        revision: existing.revision ?? 1,
         error: "Duplicate request — returning existing order",
       };
+      recordCommandResult(restaurantId, input, "updateOrderItems", "order", orderId, "applied", replayResult, existing.revision ?? 1);
+      return replayResult;
     }
   }
 
   // ── Look up existing order ──────────────────────────────────────────────────
   const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
   if (!order) {
-    return { success: false, error: "Order not found", statusCode: 404 };
+    const rejectResult = { success: false, error: "Order not found", statusCode: 404 };
+    recordCommandResult(restaurantId, input, "updateOrderItems", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
   }
 
   // ── Get table + outlet info ────────────────────────────────────────────────
   const table = getTableWithSection(tableId);
   if (!table) {
-    return { success: false, error: "Table not found", statusCode: 404 };
+    const rejectResult = { success: false, error: "Table not found", statusCode: 404 };
+    recordCommandResult(restaurantId, input, "updateOrderItems", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
   }
 
   const outlet = getOutlet(restaurantId);
   if (!outlet) {
-    return { success: false, error: "Outlet not found in local DB", statusCode: 404 };
+    const rejectResult = { success: false, error: "Outlet not found in local DB", statusCode: 404 };
+    recordCommandResult(restaurantId, input, "updateOrderItems", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
   }
 
   // ── Get menu items with categories for printer routing ─────────────────────
@@ -962,13 +1044,19 @@ export async function updateOrderItems(
   for (const item of items) {
     const mi = menuItemMap.get(item.menuItemId);
     if (!mi) {
-      return { success: false, error: `Menu item not found: ${item.name}`, statusCode: 400 };
+      const rejectResult = { success: false, error: `Menu item not found: ${item.name}`, statusCode: 400 };
+      recordCommandResult(restaurantId, input, "updateOrderItems", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+      return rejectResult;
     }
     if (mi.is_deleted) {
-      return { success: false, error: `Menu item deleted: ${item.name}`, statusCode: 400 };
+      const rejectResult = { success: false, error: `Menu item deleted: ${item.name}`, statusCode: 400 };
+      recordCommandResult(restaurantId, input, "updateOrderItems", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+      return rejectResult;
     }
     if (!mi.is_available) {
-      return { success: false, error: `Menu item not available: ${item.name}`, statusCode: 400 };
+      const rejectResult = { success: false, error: `Menu item not available: ${item.name}`, statusCode: 400 };
+      recordCommandResult(restaurantId, input, "updateOrderItems", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+      return rejectResult;
     }
   }
 
@@ -1055,14 +1143,16 @@ export async function updateOrderItems(
       `).run(kotItemId, kotId, newOrderItemIds[i], resolvedItems[i].menuItemId, resolvedItems[i].name, resolvedItems[i].quantity, Number(resolvedItems[i].price), resolvedItems[i].notes || null, now);
     }
 
-    // 4. Bump order total + update timestamp
+    // 4. Bump order total + increment order revision + update timestamp
+    const newOrderRev = nextOrderRevision(orderId);
     const newTotal = Number(order.total_amount) + additionalAmount;
-    db.query("UPDATE order_record SET total_amount = ?, updated_at = ?, last_request_id = ? WHERE id = ?")
-      .run(newTotal, now, requestId || null, orderId);
+    db.query("UPDATE order_record SET total_amount = ?, updated_at = ?, last_request_id = ?, revision = ?, last_command_id = ? WHERE id = ?")
+      .run(newTotal, now, requestId || null, newOrderRev, requestId || null, orderId);
 
-    // 5. Update table current_bill
-    db.query(`UPDATE "table" SET current_bill = current_bill + ?, updated_at = ? WHERE id = ?`)
-      .run(additionalAmount, now, tableId);
+    // 5. Update table current_bill + increment table revision
+    const newTableRev = nextTableRevision(tableId);
+    db.query(`UPDATE "table" SET current_bill = current_bill + ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+      .run(additionalAmount, newTableRev, requestId || null, now, tableId);
 
     // 6. Update KOT history on table (safe parse — corrupted JSON should not crash the transaction)
     let currentHistory: any[] = [];
@@ -1086,13 +1176,20 @@ export async function updateOrderItems(
 
     // 8. Persist print intents in the same transaction (atomicity guarantee)
     persistPrintIntentsInTx(printIntents, restaurantId, orderId, kotId, kotNumber, tableId, captainName);
+
+    return { newOrderRev, newTableRev };
   });
 
+  let newOrderRev = 1, newTableRev = 1;
   try {
-    tx();
+    const txResult = tx();
+    newOrderRev = (txResult as any)?.newOrderRev ?? 1;
+    newTableRev = (txResult as any)?.newTableRev ?? 1;
   } catch (err: any) {
     if (err.message && err.message.includes("UNIQUE")) {
-      return { success: false, error: "Duplicate request — order already updated", statusCode: 409 };
+      const rejectResult: UpdateOrderItemsResult = { success: false, error: "Duplicate request — order already updated", statusCode: 409 };
+      recordCommandResult(restaurantId, input, "updateOrderItems", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+      return rejectResult;
     }
     throw err;
   }
@@ -1102,8 +1199,8 @@ export async function updateOrderItems(
   const printResults = localPrinted ? [] : dispatchPrintIntents(printIntents, requestId);
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
-  lanBroadcast("order:updated", { orderId, tableId, kotNumber, requestId });
-  lanBroadcast("table:updated", { table: { id: tableId }, tableId, requestId });
+  lanBroadcast("order:updated", { orderId, tableId, kotNumber, requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: requestId });
+  lanBroadcast("table:updated", { table: { id: tableId, revision: newTableRev }, tableId, requestId, tableRevision: newTableRev, commandId: requestId });
 
   // ── Return result ──────────────────────────────────────────────────────────
   const updatedTable = db.query(`
@@ -1114,11 +1211,13 @@ export async function updateOrderItems(
   const orderItems = db.query("SELECT * FROM order_item WHERE order_id = ?").all(orderId) as any[];
   const updatedOrder = db.query("SELECT * FROM order_record WHERE id = ?").get(orderId) as any;
 
-  return {
+  const result: UpdateOrderItemsResult = {
     success: true,
     orderId,
     kotNumber,
     kotId,
+    revision: newOrderRev,
+    tableRevision: newTableRev,
     order: {
       id: orderId,
       tableId,
@@ -1134,6 +1233,9 @@ export async function updateOrderItems(
     },
     printResults,
   };
+
+  recordCommandResult(restaurantId, input, "updateOrderItems", "order", orderId, "applied", result, newOrderRev);
+  return result;
 }
 
 // ─── Cancel KOT Item ─────────────────────────────────────────────────────────
@@ -1147,21 +1249,33 @@ export interface CancelItemInput {
   tableNumber?: string | number;
   requestId?: string;
   localPrinted?: boolean;
+  deviceId?: string;
+  expectedRevision?: number;
 }
 
-export async function cancelKotItem(input: CancelItemInput): Promise<{ success: boolean; error?: string; printResult?: any }> {
+export async function cancelKotItem(input: CancelItemInput): Promise<{ success: boolean; error?: string; printResult?: any; revision?: number; tableRevision?: number }> {
   const db = getDb();
   const { orderId, restaurantId, orderItemId, cancelQuantity, cancelledBy, localPrinted } = input;
+
+  // ── Phase 1: Durable idempotency check via command_log ────────────────────
+  const idem = checkCommandIdempotency<{ success: boolean; error?: string; printResult?: any; revision?: number; tableRevision?: number }>(restaurantId, input, "cancelKotItem", orderItemId);
+  if (idem.replay && idem.result) {
+    return idem.result;
+  }
 
   // Scope by restaurantId to prevent cross-tenant access
   const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
   if (!order) {
-    return { success: false, error: "Order not found" };
+    const rejectResult = { success: false, error: "Order not found" };
+    recordCommandResult(restaurantId, input, "cancelKotItem", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
   }
 
   const orderItem = db.query("SELECT * FROM order_item WHERE id = ? AND order_id = ?").get(orderItemId, orderId) as any;
   if (!orderItem) {
-    return { success: false, error: "Order item not found" };
+    const rejectResult = { success: false, error: "Order item not found" };
+    recordCommandResult(restaurantId, input, "cancelKotItem", "order_item", orderItemId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
   }
 
   const qtyToCancel = cancelQuantity || orderItem.quantity;
@@ -1190,9 +1304,10 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
         .run(orderItem.id);
     }
 
-    // 3. Reduce order total_amount
-    db.query("UPDATE order_record SET total_amount = MAX(0, total_amount - ?), updated_at = ? WHERE id = ?")
-      .run(cancelAmount, now, orderId);
+    // 3. Reduce order total_amount + increment order revision
+    const newOrderRev = nextOrderRevision(orderId);
+    db.query("UPDATE order_record SET total_amount = MAX(0, total_amount - ?), updated_at = ?, revision = ?, last_command_id = ? WHERE id = ?")
+      .run(cancelAmount, now, newOrderRev, input.requestId || null, orderId);
 
     // 4. Check if all items on this order are now fully cancelled
     const remainingItems = db.query(
@@ -1201,13 +1316,14 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
 
     const allCancelled = remainingItems.cnt === 0;
 
-    // 5. Reduce table current_bill; free the table if everything is cancelled
+    // 5. Reduce table current_bill; free the table if everything is cancelled + increment table revision
+    const newTableRev = nextTableRevision(order.table_id);
     if (allCancelled) {
-      db.query(`UPDATE "table" SET status = 'AVAILABLE', workflow_status = 'Free', current_bill = 0, captain_id = NULL, guests = 0, session_started_at = NULL, kot_history = '[]', discount = NULL, updated_at = ? WHERE id = ?`)
-        .run(now, order.table_id);
+      db.query(`UPDATE "table" SET status = 'AVAILABLE', workflow_status = 'Free', current_bill = 0, captain_id = NULL, guests = 0, session_started_at = NULL, kot_history = '[]', discount = NULL, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+        .run(newTableRev, input.requestId || null, now, order.table_id);
     } else {
-      db.query(`UPDATE "table" SET current_bill = MAX(0, current_bill - ?), updated_at = ? WHERE id = ?`)
-        .run(cancelAmount, now, order.table_id);
+      db.query(`UPDATE "table" SET current_bill = MAX(0, current_bill - ?), revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+        .run(cancelAmount, newTableRev, input.requestId || null, now, order.table_id);
     }
 
     // 6. Enqueue sync records
@@ -1220,17 +1336,34 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
     for (const kotId of cancelledKotIds) {
       enqueueSync("kot", kotId, "update");
     }
+
+    return { newOrderRev, newTableRev };
   });
 
-  tx();
+  let newOrderRev = 1, newTableRev = 1;
+  try {
+    const txResult = tx();
+    newOrderRev = (txResult as any)?.newOrderRev ?? 1;
+    newTableRev = (txResult as any)?.newTableRev ?? 1;
+  } catch (err: any) {
+    const failResult = { success: false, error: `Cancel failed: ${err.message}` };
+    recordCommandResult(restaurantId, input, "cancelKotItem", "order", orderId, "failed", failResult, null, failResult.error);
+    throw err;
+  }
 
   // Get table + outlet for print context
   const table = getTableWithSection(order.table_id);
   const outlet = getOutlet(restaurantId);
 
   if (!table || !outlet) {
-    return { success: true }; // Cancelled in DB but can't print
+    const noPrintResult = { success: true, revision: newOrderRev, tableRevision: newTableRev };
+    recordCommandResult(restaurantId, input, "cancelKotItem", "order", orderId, "applied", noPrintResult, newOrderRev);
+    return noPrintResult; // Cancelled in DB but can't print
   }
+
+  // ── Broadcast to LAN clients ──────────────────────────────────────────────
+  lanBroadcast("order:updated", { orderId, tableId: order.table_id, requestId: input.requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: input.requestId });
+  lanBroadcast("table:updated", { table: { id: order.table_id, revision: newTableRev }, tableId: order.table_id, requestId: input.requestId, tableRevision: newTableRev, commandId: input.requestId });
 
   // Build cancel KOT
   const formattedTableNumber = formatTableNumber(table);
@@ -1273,7 +1406,9 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
     printResult = await printSingleWithLanFallback(printerName || null, escposData, "CANCEL_KOT");
   }
 
-  return { success: true, printResult };
+  const result = { success: true, printResult, revision: newOrderRev, tableRevision: newTableRev };
+  recordCommandResult(restaurantId, input, "cancelKotItem", "order", orderId, "applied", result, newOrderRev);
+  return result;
 }
 
 // ─── Reprint KOT ─────────────────────────────────────────────────────────────
@@ -1413,32 +1548,58 @@ function getNextBillNumber(restaurantId: string): string {
 export async function requestBillingEdge(
   restaurantId: string,
   orderId: string,
-): Promise<{ success: boolean; error?: string; order?: any }> {
+  meta?: CommandMeta,
+): Promise<{ success: boolean; error?: string; order?: any; revision?: number; tableRevision?: number }> {
   const db = getDb();
+
+  // ── Phase 1: Durable idempotency check via command_log ────────────────────
+  const idem = checkCommandIdempotency<{ success: boolean; error?: string; order?: any; revision?: number; tableRevision?: number }>(restaurantId, meta, "requestBilling", orderId);
+  if (idem.replay && idem.result) {
+    return idem.result;
+  }
+
   const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
   if (!order) {
-    return { success: false, error: "Order not found" };
+    const rejectResult = { success: false, error: "Order not found" };
+    recordCommandResult(restaurantId, meta, "requestBilling", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
   }
 
   const now = Date.now();
+  let newOrderRev = order.revision ?? 1;
+  let newTableRev = 1;
   const tx = db.transaction(() => {
-    db.query("UPDATE order_record SET billing_requested = 1, billing_requested_at = ?, updated_at = ?, status = 'BILLING_REQUESTED' WHERE id = ?")
-      .run(now, now, orderId);
+    newOrderRev = nextOrderRevision(orderId);
+    db.query("UPDATE order_record SET billing_requested = 1, billing_requested_at = ?, updated_at = ?, status = 'BILLING_REQUESTED', revision = ?, last_command_id = ? WHERE id = ?")
+      .run(now, now, newOrderRev, meta?.requestId || null, orderId);
 
-    db.query(`UPDATE "table" SET workflow_status = 'Waiting Bill', updated_at = ? WHERE id = ?`)
-      .run(now, order.table_id);
+    newTableRev = nextTableRevision(order.table_id);
+    db.query(`UPDATE "table" SET workflow_status = 'Waiting Bill', revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+      .run(newTableRev, meta?.requestId || null, now, order.table_id);
 
     enqueueSync("order", orderId, "update");
     enqueueSync("table", order.table_id, "update");
+
+    return { newOrderRev, newTableRev };
   });
 
-  tx();
+  try {
+    const txResult = tx();
+    newOrderRev = (txResult as any)?.newOrderRev ?? newOrderRev;
+    newTableRev = (txResult as any)?.newTableRev ?? newTableRev;
+  } catch (err: any) {
+    const failResult = { success: false, error: `Billing request failed: ${err.message}` };
+    recordCommandResult(restaurantId, meta, "requestBilling", "order", orderId, "failed", failResult, null, failResult.error);
+    throw err;
+  }
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
-  lanBroadcast("order:updated", { orderId, status: "BILLING_REQUESTED" });
-  lanBroadcast("table:updated", { table: { id: order.table_id, workflowStatus: "Waiting Bill" }, tableId: order.table_id });
+  lanBroadcast("order:updated", { orderId, status: "BILLING_REQUESTED", requestId: meta?.requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: meta?.requestId });
+  lanBroadcast("table:updated", { table: { id: order.table_id, workflowStatus: "Waiting Bill", revision: newTableRev }, tableId: order.table_id, requestId: meta?.requestId, tableRevision: newTableRev, commandId: meta?.requestId });
 
-  return { success: true, order: { id: orderId, status: "BILLING_REQUESTED" } };
+  const result = { success: true, order: { id: orderId, status: "BILLING_REQUESTED" }, revision: newOrderRev, tableRevision: newTableRev };
+  recordCommandResult(restaurantId, meta, "requestBilling", "order", orderId, "applied", result, newOrderRev);
+  return result;
 }
 
 // ─── Print Bill (assign bill number + print) ──────────────────────────────────
@@ -1451,23 +1612,36 @@ export interface PrintBillInput {
   kotNumbers?: string;
   localPrinted?: boolean;
   billEventId?: string;
+  requestId?: string;
+  deviceId?: string;
+  expectedRevision?: number;
 }
 
-export async function printBillEdge(input: PrintBillInput): Promise<{ success: boolean; error?: string; billNumber?: string; printResults?: any[]; printPending?: boolean }> {
+export async function printBillEdge(input: PrintBillInput): Promise<{ success: boolean; error?: string; billNumber?: string; printResults?: any[]; printPending?: boolean; revision?: number }> {
   const db = getDb();
   const { orderId, restaurantId, discountPercent, localPrinted } = input;
 
-  const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
-  if (!order) {
-    return { success: false, error: "Order not found" };
+  // ── Phase 1: Durable idempotency check via command_log ────────────────────
+  const idem = checkCommandIdempotency<{ success: boolean; error?: string; billNumber?: string; printResults?: any[]; printPending?: boolean; revision?: number }>(restaurantId, input, "printBill", orderId);
+  if (idem.replay && idem.result) {
+    return idem.result;
   }
 
-  // Assign bill number if not already assigned
+  const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
+  if (!order) {
+    const rejectResult = { success: false, error: "Order not found" };
+    recordCommandResult(restaurantId, input, "printBill", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
+  }
+
+  // Assign bill number if not already assigned + increment order revision
   let billNumber = order.bill_number;
+  let newOrderRev = order.revision ?? 1;
   if (!billNumber) {
     billNumber = getNextBillNumber(restaurantId);
-    db.query("UPDATE order_record SET bill_number = ?, updated_at = ? WHERE id = ?")
-      .run(billNumber, Date.now(), orderId);
+    newOrderRev = nextOrderRevision(orderId);
+    db.query("UPDATE order_record SET bill_number = ?, updated_at = ?, revision = ?, last_command_id = ? WHERE id = ?")
+      .run(billNumber, Date.now(), newOrderRev, input.requestId || null, orderId);
   }
   // Always enqueue sync after bill print so the cloud receives the bill_number,
   // even if a prior sync cycle pushed the order before the number was assigned.
@@ -1475,7 +1649,9 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
 
   // If the frontend already printed locally, skip edge printing — just assign bill number + sync
   if (localPrinted) {
-    return { success: true, billNumber, printResults: [] };
+    const result = { success: true, billNumber, printResults: [] as any[], revision: newOrderRev };
+    recordCommandResult(restaurantId, input, "printBill", "order", orderId, "applied", result, newOrderRev);
+    return result;
   }
 
   // Get table + outlet for print context
@@ -1483,7 +1659,9 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
   const outlet = getOutlet(restaurantId);
   if (!table || !outlet) {
     console.error(`[printBillEdge] Cannot print bill for order ${orderId} — table or outlet not found in local DB`);
-    return { success: false, error: "Table or outlet not found — cannot print bill", billNumber };
+    const failResult = { success: false, error: "Table or outlet not found — cannot print bill", billNumber };
+    recordCommandResult(restaurantId, input, "printBill", "order", orderId, "failed", failResult, newOrderRev, failResult.error);
+    return failResult;
   }
 
   // Get order items with gst_enabled from menu_item (excluding fully cancelled and removed from bill)
@@ -1528,6 +1706,7 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
     pricesIncludeGst: outlet.prices_include_gst,
     discountPercent: discountPercent || 0,
     serviceChargePercent,
+    billNumber,
   });
 
   // Resolve bill printer — use per-venue override from table if available (same pattern as KOT path)
@@ -1558,19 +1737,19 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
       itemSummary: [],
       captainName: null,
     });
-    // Await the dispatch so we get the real print ack result.
-    // dispatchSinglePrintJob waits for the Tauri frontend's print_ack (up to 20s)
+    // Await the dispatch so we get the real print result.
+    // dispatchSinglePrintJob POSTs to the print bridge (HTTP, up to 10s timeout)
     // or falls back to cloud relay. This ensures the HTTP response reflects the
     // actual print status, not a fire-and-forget "queued" placeholder.
     await dispatchSinglePrintJob(eventId, billGroup, undefined);
     const job = getPrintJobByEventId(eventId);
     if (job?.status === "printed") {
-      printResults.push({ ok: true, printerName: billPrinterName, bytes: 0, method: job.acked_via || "lan_ws", eventId });
+      printResults.push({ ok: true, printerName: billPrinterName, bytes: 0, method: job.acked_via || "print_service", eventId });
     } else if (job?.status === "printing") {
       // Cloud relay accepted — print is pending, not yet confirmed
       printResults.push({ ok: null, printerName: billPrinterName, bytes: 0, method: "cloud_relay", eventId, pending: true });
     } else {
-      // needs_retry, failed, dead_letter, etc.
+      // retrying, failed, dead_letter, etc.
       printResults.push({ ok: false, printerName: billPrinterName || "unknown", bytes: 0, error: job?.last_error || "Print failed — will retry automatically", method: "durable_queued", eventId });
     }
   }
@@ -1581,16 +1760,24 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
   const anyPending = printResults.some(r => r.ok === null);
 
   if (allPrinted) {
-    return { success: true, billNumber, printResults };
+    const result = { success: true, billNumber, printResults, revision: newOrderRev };
+    recordCommandResult(restaurantId, input, "printBill", "order", orderId, "applied", result, newOrderRev);
+    return result;
   } else if (anyFailed && !anyPending) {
     // All failed, none pending — bill number was assigned but print failed
-    return { success: false, error: printResults.find(r => r.ok === false)?.error || "Bill print failed", billNumber, printResults };
+    const result = { success: false, error: printResults.find(r => r.ok === false)?.error || "Bill print failed", billNumber, printResults, revision: newOrderRev };
+    recordCommandResult(restaurantId, input, "printBill", "order", orderId, "applied", result, newOrderRev);
+    return result;
   } else if (anyPending && !anyFailed) {
     // Print pending (cloud relay) — bill number assigned, print in progress
-    return { success: true, billNumber, printResults, printPending: true };
+    const result = { success: true, billNumber, printResults, printPending: true, revision: newOrderRev };
+    recordCommandResult(restaurantId, input, "printBill", "order", orderId, "applied", result, newOrderRev);
+    return result;
   } else {
     // Mixed: some failed, some pending — partial failure
-    return { success: true, billNumber, printResults, printPending: true };
+    const result = { success: true, billNumber, printResults, printPending: true, revision: newOrderRev };
+    recordCommandResult(restaurantId, input, "printBill", "order", orderId, "applied", result, newOrderRev);
+    return result;
   }
 }
 
@@ -1615,14 +1802,22 @@ export interface SettleOrderInput {
   roundOff?: number;
   localTxnId?: string;
   requestId?: string;
+  deviceId?: string;
+  expectedRevision?: number;
 }
 
-export async function settleOrderEdge(input: SettleOrderInput): Promise<{ success: boolean; error?: string; order?: any; table?: any; transaction?: any; statusCode?: number }> {
+export async function settleOrderEdge(input: SettleOrderInput): Promise<{ success: boolean; error?: string; order?: any; table?: any; transaction?: any; statusCode?: number; revision?: number; tableRevision?: number }> {
   const db = getDb();
   const { orderId, restaurantId, paymentMethod, requestId } = input;
   // Always generate a localTxnId — this ensures a transaction sync record is
   // always enqueued so the cloud receives the settlement payment.
   const localTxnId = input.localTxnId || `edge-txn-${orderId}-${Date.now()}`;
+
+  // ── Phase 1: Durable idempotency check via command_log ────────────────────
+  const idem = checkCommandIdempotency<{ success: boolean; error?: string; order?: any; table?: any; transaction?: any; statusCode?: number; revision?: number; tableRevision?: number }>(restaurantId, input, "settleOrder", orderId);
+  if (idem.replay && idem.result) {
+    return idem.result;
+  }
 
   // Idempotency check — scoped to the target order to avoid matching other orders
   if (requestId) {
@@ -1649,24 +1844,30 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
           }
         }
       } catch { /* ignore parse errors */ }
-      return { success: true, order: existing, transaction: existingTxn, error: "Duplicate request — already settled" };
+      const replayResult = { success: true, order: existing, transaction: existingTxn, error: "Duplicate request — already settled", revision: existing.revision ?? 1 };
+      recordCommandResult(restaurantId, input, "settleOrder", "order", orderId, "applied", replayResult, existing.revision ?? 1);
+      return replayResult;
     }
   }
 
   const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
   if (!order) {
-    return { success: false, error: "Order not found" };
+    const rejectResult = { success: false, error: "Order not found" };
+    recordCommandResult(restaurantId, input, "settleOrder", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
   }
 
   const now = Date.now();
   const tx = db.transaction(() => {
-    // Mark order as settled
-    db.query("UPDATE order_record SET status = 'SETTLED', paid_at = ?, updated_at = ?, last_request_id = ? WHERE id = ?")
-      .run(now, now, requestId || null, orderId);
+    // Mark order as settled + increment order revision
+    const newOrderRev = nextOrderRevision(orderId);
+    db.query("UPDATE order_record SET status = 'SETTLED', paid_at = ?, updated_at = ?, last_request_id = ?, revision = ?, last_command_id = ? WHERE id = ?")
+      .run(now, now, requestId || null, newOrderRev, requestId || null, orderId);
 
-    // Free the table
-    db.query(`UPDATE "table" SET status = 'AVAILABLE', workflow_status = 'Free', captain_id = NULL, guests = 0, session_started_at = NULL, current_bill = 0, kot_history = '[]', discount = NULL, updated_at = ? WHERE id = ?`)
-      .run(now, order.table_id);
+    // Free the table + increment table revision
+    const newTableRev = nextTableRevision(order.table_id);
+    db.query(`UPDATE "table" SET status = 'AVAILABLE', workflow_status = 'Free', captain_id = NULL, guests = 0, session_started_at = NULL, current_bill = 0, kot_history = '[]', discount = NULL, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+      .run(newTableRev, requestId || null, now, order.table_id);
 
     // Store payment details for sync worker to create cloud transaction.
     // Always store — even if paymentMethod is missing, default to CASH.
@@ -1700,14 +1901,23 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
     enqueueSync("order", orderId, "update");
     enqueueSync("table", order.table_id, "update");
     enqueueSync("transaction", localTxnId, "insert");
+
+    return { newOrderRev, newTableRev };
   });
 
+  let newOrderRev = 1, newTableRev = 1;
   try {
-    tx();
+    const txResult = tx();
+    newOrderRev = (txResult as any)?.newOrderRev ?? 1;
+    newTableRev = (txResult as any)?.newTableRev ?? 1;
   } catch (err: any) {
     if (err.message && err.message.includes("UNIQUE")) {
-      return { success: false, error: "Duplicate settle request", statusCode: 409 };
+      const rejectResult = { success: false, error: "Duplicate settle request", statusCode: 409 };
+      recordCommandResult(restaurantId, input, "settleOrder", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+      return rejectResult;
     }
+    const failResult = { success: false, error: `Settle failed: ${err.message}` };
+    recordCommandResult(restaurantId, input, "settleOrder", "order", orderId, "failed", failResult, null, failResult.error);
     throw err;
   }
 
@@ -1715,8 +1925,8 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
   const updatedTable = db.query(`SELECT t.*, s.name as section_name FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?`).get(order.table_id) as any;
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
-  lanBroadcast("order:settled", { orderId, tableId: order.table_id, requestId });
-  lanBroadcast("table:updated", { table: { id: order.table_id, status: "AVAILABLE", workflowStatus: "Free" }, tableId: order.table_id });
+  lanBroadcast("order:settled", { orderId, tableId: order.table_id, requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: requestId });
+  lanBroadcast("table:updated", { table: { id: order.table_id, status: "AVAILABLE", workflowStatus: "Free", revision: newTableRev }, tableId: order.table_id, requestId, tableRevision: newTableRev, commandId: requestId });
 
   // Build a local transaction object so the cashier UI can display it
   // immediately without synthesizing its own.
@@ -1741,12 +1951,17 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
     settledAt: now,
   };
 
-  return {
+  const result = {
     success: true,
     order: updatedOrder,
     table: { ...updatedTable, kot_history: safeParseKotHistory(updatedTable.kot_history) },
     transaction,
+    revision: newOrderRev,
+    tableRevision: newTableRev,
   };
+
+  recordCommandResult(restaurantId, input, "settleOrder", "order", orderId, "applied", result, newOrderRev);
+  return result;
 }
 
 // ─── Swap Table (move order from one table to another) ────────────────────────
@@ -1756,14 +1971,23 @@ export async function swapTableEdge(
   sourceTableId: string,
   targetTableId: string,
   swappedBy: string,
-): Promise<{ success: boolean; error?: string; sourceTable?: any; targetTable?: any }> {
+  meta?: CommandMeta,
+): Promise<{ success: boolean; error?: string; sourceTable?: any; targetTable?: any; sourceTableRevision?: number; targetTableRevision?: number; orderRevision?: number }> {
   const db = getDb();
+
+  // ── Phase 1: Durable idempotency check via command_log ────────────────────
+  const idem = checkCommandIdempotency<{ success: boolean; error?: string; sourceTable?: any; targetTable?: any; sourceTableRevision?: number; targetTableRevision?: number; orderRevision?: number }>(restaurantId, meta, "swapTable", `${sourceTableId}->${targetTableId}`);
+  if (idem.replay && idem.result) {
+    return idem.result;
+  }
 
   const sourceTable = db.query(`SELECT * FROM "table" WHERE id = ? AND restaurant_id = ?`).get(sourceTableId, restaurantId) as any;
   const targetTable = db.query(`SELECT * FROM "table" WHERE id = ? AND restaurant_id = ?`).get(targetTableId, restaurantId) as any;
 
   if (!sourceTable || !targetTable) {
-    return { success: false, error: "Source or target table not found" };
+    const rejectResult = { success: false, error: "Source or target table not found" };
+    recordCommandResult(restaurantId, meta, "swapTable", "table", sourceTableId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
   }
 
   // Find active order on source table — use the full active status list
@@ -1772,38 +1996,57 @@ export async function swapTableEdge(
   ).get(sourceTableId, restaurantId, ...ACTIVE_ORDER_STATUSES) as any;
 
   const now = Date.now();
+  let newSourceTableRev = 1, newTargetTableRev = 1, newOrderRev: number | undefined;
   const tx = db.transaction(() => {
     if (activeOrder) {
-      // Move order to target table
-      db.query("UPDATE order_record SET table_id = ?, updated_at = ? WHERE id = ?")
-        .run(targetTableId, now, activeOrder.id);
+      // Move order to target table + increment order revision
+      newOrderRev = nextOrderRevision(activeOrder.id);
+      db.query("UPDATE order_record SET table_id = ?, updated_at = ?, revision = ?, last_command_id = ? WHERE id = ?")
+        .run(targetTableId, now, newOrderRev, meta?.requestId || null, activeOrder.id);
       enqueueSync("order", activeOrder.id, "update");
     }
 
-    // Swap table statuses, captain, guests, kot history, current bill
-    db.query(`UPDATE "table" SET status = ?, workflow_status = ?, captain_id = ?, guests = ?, session_started_at = ?, current_bill = ?, kot_history = ?, discount = ?, updated_at = ? WHERE id = ?`)
-      .run(targetTable.status, targetTable.workflow_status, targetTable.captain_id, targetTable.guests, targetTable.session_started_at, targetTable.current_bill, targetTable.kot_history, targetTable.discount, now, sourceTableId);
-    db.query(`UPDATE "table" SET status = ?, workflow_status = ?, captain_id = ?, guests = ?, session_started_at = ?, current_bill = ?, kot_history = ?, discount = ?, updated_at = ? WHERE id = ?`)
-      .run(sourceTable.status, sourceTable.workflow_status, sourceTable.captain_id, sourceTable.guests, sourceTable.session_started_at, sourceTable.current_bill, sourceTable.kot_history, sourceTable.discount, now, targetTableId);
+    // Swap table statuses, captain, guests, kot history, current bill + increment revisions
+    newSourceTableRev = nextTableRevision(sourceTableId);
+    newTargetTableRev = nextTableRevision(targetTableId);
+    db.query(`UPDATE "table" SET status = ?, workflow_status = ?, captain_id = ?, guests = ?, session_started_at = ?, current_bill = ?, kot_history = ?, discount = ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+      .run(targetTable.status, targetTable.workflow_status, targetTable.captain_id, targetTable.guests, targetTable.session_started_at, targetTable.current_bill, targetTable.kot_history, targetTable.discount, newSourceTableRev, meta?.requestId || null, now, sourceTableId);
+    db.query(`UPDATE "table" SET status = ?, workflow_status = ?, captain_id = ?, guests = ?, session_started_at = ?, current_bill = ?, kot_history = ?, discount = ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+      .run(sourceTable.status, sourceTable.workflow_status, sourceTable.captain_id, sourceTable.guests, sourceTable.session_started_at, sourceTable.current_bill, sourceTable.kot_history, sourceTable.discount, newTargetTableRev, meta?.requestId || null, now, targetTableId);
 
     enqueueSync("table", sourceTableId, "update");
     enqueueSync("table", targetTableId, "update");
+    return { newSourceTableRev, newTargetTableRev, newOrderRev };
   });
 
-  tx();
+  try {
+    const txResult = tx();
+    newSourceTableRev = (txResult as any)?.newSourceTableRev ?? newSourceTableRev;
+    newTargetTableRev = (txResult as any)?.newTargetTableRev ?? newTargetTableRev;
+    newOrderRev = (txResult as any)?.newOrderRev ?? newOrderRev;
+  } catch (err: any) {
+    const failResult = { success: false, error: `Swap failed: ${err.message}` };
+    recordCommandResult(restaurantId, meta, "swapTable", "table", sourceTableId, "failed", failResult, null, failResult.error);
+    throw err;
+  }
 
   const updatedSource = db.query(`SELECT t.*, s.name as section_name FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?`).get(sourceTableId) as any;
   const updatedTarget = db.query(`SELECT t.*, s.name as section_name FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?`).get(targetTableId) as any;
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
-  lanBroadcast("table:updated", { table: { id: sourceTableId }, tableId: sourceTableId });
-  lanBroadcast("table:updated", { table: { id: targetTableId }, tableId: targetTableId });
+  lanBroadcast("table:updated", { table: { id: sourceTableId, revision: newSourceTableRev }, tableId: sourceTableId, requestId: meta?.requestId, tableRevision: newSourceTableRev, commandId: meta?.requestId });
+  lanBroadcast("table:updated", { table: { id: targetTableId, revision: newTargetTableRev }, tableId: targetTableId, requestId: meta?.requestId, tableRevision: newTargetTableRev, commandId: meta?.requestId });
 
-  return {
+  const result = {
     success: true,
     sourceTable: { ...updatedSource, kot_history: safeParseKotHistory(updatedSource.kot_history) },
     targetTable: { ...updatedTarget, kot_history: safeParseKotHistory(updatedTarget.kot_history) },
+    sourceTableRevision: newSourceTableRev,
+    targetTableRevision: newTargetTableRev,
+    orderRevision: newOrderRev,
   };
+  recordCommandResult(restaurantId, meta, "swapTable", "table", sourceTableId, "applied", result, newSourceTableRev);
+  return result;
 }
 
 // ─── Transfer Items (move items between tables) ───────────────────────────────
@@ -1814,11 +2057,20 @@ export async function transferItemsEdge(
   targetTableId: string,
   orderItemIds: string[],
   transferredBy: string,
-): Promise<{ success: boolean; error?: string; sourceTable?: any; targetTable?: any }> {
+  meta?: CommandMeta,
+): Promise<{ success: boolean; error?: string; sourceTable?: any; targetTable?: any; sourceOrderRevision?: number; targetOrderRevision?: number; sourceTableRevision?: number; targetTableRevision?: number }> {
   const db = getDb();
 
+  // ── Phase 1: Durable idempotency check via command_log ────────────────────
+  const idem = checkCommandIdempotency<{ success: boolean; error?: string; sourceTable?: any; targetTable?: any; sourceOrderRevision?: number; targetOrderRevision?: number; sourceTableRevision?: number; targetTableRevision?: number }>(restaurantId, meta, "transferItems", `${sourceTableId}->${targetTableId}`);
+  if (idem.replay && idem.result) {
+    return idem.result;
+  }
+
   if (!orderItemIds || orderItemIds.length === 0) {
-    return { success: false, error: "No items to transfer" };
+    const rejectResult = { success: false, error: "No items to transfer" };
+    recordCommandResult(restaurantId, meta, "transferItems", "table", sourceTableId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
   }
 
   // Find active orders on both tables — use the full active status list
@@ -1826,7 +2078,9 @@ export async function transferItemsEdge(
     `SELECT * FROM order_record WHERE table_id = ? AND restaurant_id = ? AND status IN (${ACTIVE_ORDER_STATUSES.map(() => "?").join(",")}) AND is_deleted = 0`
   ).get(sourceTableId, restaurantId, ...ACTIVE_ORDER_STATUSES) as any;
   if (!sourceOrder) {
-    return { success: false, error: "No active order on source table" };
+    const rejectResult = { success: false, error: "No active order on source table" };
+    recordCommandResult(restaurantId, meta, "transferItems", "table", sourceTableId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
   }
 
   let targetOrder = db.query(
@@ -1834,12 +2088,13 @@ export async function transferItemsEdge(
   ).get(targetTableId, restaurantId, ...ACTIVE_ORDER_STATUSES) as any;
 
   const now = Date.now();
+  let newSourceOrderRev = 1, newTargetOrderRev = 1, newSourceTableRev = 1, newTargetTableRev = 1;
   const tx = db.transaction(() => {
     // Create target order if it doesn't exist
     if (!targetOrder) {
       const newOrderId = crypto.randomUUID();
-      db.query("INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at, cloud_synced) VALUES (?, ?, ?, 'PREPARING', 0, ?, ?, 0)")
-        .run(newOrderId, targetTableId, restaurantId, now, now);
+      db.query("INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at, cloud_synced, revision, last_command_id) VALUES (?, ?, ?, 'PREPARING', 0, ?, ?, 0, 1, ?)")
+        .run(newOrderId, targetTableId, restaurantId, now, now, meta?.requestId || null);
       enqueueSync("order", newOrderId, "insert");
       targetOrder = { id: newOrderId, table_id: targetTableId, total_amount: 0 };
     }
@@ -1867,38 +2122,59 @@ export async function transferItemsEdge(
       enqueueSync("order_item", itemId, "update");
     }
 
-    // Update order totals
-    db.query("UPDATE order_record SET total_amount = total_amount - ?, updated_at = ? WHERE id = ?")
-      .run(transferredAmount, now, sourceOrder.id);
-    db.query("UPDATE order_record SET total_amount = total_amount + ?, updated_at = ? WHERE id = ?")
-      .run(transferredAmount, now, targetOrder.id);
+    // Update order totals + increment order revisions
+    newSourceOrderRev = nextOrderRevision(sourceOrder.id);
+    newTargetOrderRev = nextOrderRevision(targetOrder.id);
+    db.query("UPDATE order_record SET total_amount = total_amount - ?, updated_at = ?, revision = ?, last_command_id = ? WHERE id = ?")
+      .run(transferredAmount, now, newSourceOrderRev, meta?.requestId || null, sourceOrder.id);
+    db.query("UPDATE order_record SET total_amount = total_amount + ?, updated_at = ?, revision = ?, last_command_id = ? WHERE id = ?")
+      .run(transferredAmount, now, newTargetOrderRev, meta?.requestId || null, targetOrder.id);
 
-    // Update table current bills
-    db.query(`UPDATE "table" SET current_bill = MAX(0, current_bill - ?), updated_at = ? WHERE id = ?`)
-      .run(transferredAmount, now, sourceTableId);
-    db.query(`UPDATE "table" SET current_bill = current_bill + ?, updated_at = ? WHERE id = ?`)
-      .run(transferredAmount, now, targetTableId);
+    // Update table current bills + increment table revisions
+    newSourceTableRev = nextTableRevision(sourceTableId);
+    newTargetTableRev = nextTableRevision(targetTableId);
+    db.query(`UPDATE "table" SET current_bill = MAX(0, current_bill - ?), revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+      .run(transferredAmount, newSourceTableRev, meta?.requestId || null, now, sourceTableId);
+    db.query(`UPDATE "table" SET current_bill = current_bill + ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+      .run(transferredAmount, newTargetTableRev, meta?.requestId || null, now, targetTableId);
 
     enqueueSync("order", sourceOrder.id, "update");
     enqueueSync("order", targetOrder.id, "update");
     enqueueSync("table", sourceTableId, "update");
     enqueueSync("table", targetTableId, "update");
+    return { newSourceOrderRev, newTargetOrderRev, newSourceTableRev, newTargetTableRev };
   });
 
-  tx();
+  try {
+    const txResult = tx();
+    newSourceOrderRev = (txResult as any)?.newSourceOrderRev ?? newSourceOrderRev;
+    newTargetOrderRev = (txResult as any)?.newTargetOrderRev ?? newTargetOrderRev;
+    newSourceTableRev = (txResult as any)?.newSourceTableRev ?? newSourceTableRev;
+    newTargetTableRev = (txResult as any)?.newTargetTableRev ?? newTargetTableRev;
+  } catch (err: any) {
+    const failResult = { success: false, error: `Transfer failed: ${err.message}` };
+    recordCommandResult(restaurantId, meta, "transferItems", "table", sourceTableId, "failed", failResult, null, failResult.error);
+    throw err;
+  }
 
   const updatedSource = db.query(`SELECT t.*, s.name as section_name FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?`).get(sourceTableId) as any;
   const updatedTarget = db.query(`SELECT t.*, s.name as section_name FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?`).get(targetTableId) as any;
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
-  lanBroadcast("table:updated", { table: { id: sourceTableId }, tableId: sourceTableId });
-  lanBroadcast("table:updated", { table: { id: targetTableId }, tableId: targetTableId });
+  lanBroadcast("table:updated", { table: { id: sourceTableId, revision: newSourceTableRev }, tableId: sourceTableId, requestId: meta?.requestId, tableRevision: newSourceTableRev, commandId: meta?.requestId });
+  lanBroadcast("table:updated", { table: { id: targetTableId, revision: newTargetTableRev }, tableId: targetTableId, requestId: meta?.requestId, tableRevision: newTargetTableRev, commandId: meta?.requestId });
 
-  return {
+  const result = {
     success: true,
     sourceTable: { ...updatedSource, kot_history: safeParseKotHistory(updatedSource.kot_history) },
     targetTable: { ...updatedTarget, kot_history: safeParseKotHistory(updatedTarget.kot_history) },
+    sourceOrderRevision: newSourceOrderRev,
+    targetOrderRevision: newTargetOrderRev,
+    sourceTableRevision: newSourceTableRev,
+    targetTableRevision: newTargetTableRev,
   };
+  recordCommandResult(restaurantId, meta, "transferItems", "table", sourceTableId, "applied", result, newSourceTableRev);
+  return result;
 }
 
 // ─── Edit Bill (remove items, edit quantities before settlement) ──────────────
@@ -1906,14 +2182,22 @@ export async function transferItemsEdge(
 export async function editBillEdge(
   restaurantId: string,
   orderId: string,
-  edits: { removedItemIds?: string[]; editQuantities?: Record<string, number>; addedItems?: any[]; editedBy?: string },
-): Promise<{ success: boolean; error?: string; order?: any; printResults?: any[] }> {
+  edits: { removedItemIds?: string[]; editQuantities?: Record<string, number>; addedItems?: any[]; editedBy?: string; meta?: CommandMeta },
+): Promise<{ success: boolean; error?: string; order?: any; printResults?: any[]; revision?: number; tableRevision?: number }> {
   const db = getDb();
-  const { removedItemIds, editQuantities, addedItems, editedBy } = edits;
+  const { removedItemIds, editQuantities, addedItems, editedBy, meta } = edits;
+
+  // ── Phase 1: Durable idempotency check via command_log ────────────────────
+  const idem = checkCommandIdempotency<{ success: boolean; error?: string; order?: any; printResults?: any[]; revision?: number; tableRevision?: number }>(restaurantId, meta, "editBill", orderId);
+  if (idem.replay && idem.result) {
+    return idem.result;
+  }
 
   const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
   if (!order) {
-    return { success: false, error: "Order not found" };
+    const rejectResult = { success: false, error: "Order not found" };
+    recordCommandResult(restaurantId, meta, "editBill", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
   }
 
   // ── Bug 1: Resolve prices for added items server-side ──────────────────────
@@ -2016,18 +2300,32 @@ export async function editBillEdge(
       enqueueSync("kot", addedKotId, "insert");
     }
 
-    // Sync table current_bill with the net bill delta
+    // Sync table current_bill with the net bill delta + increment table revision
+    let newTableRev: number | undefined;
     if (billDelta !== 0) {
-      db.query(`UPDATE "table" SET current_bill = MAX(0, current_bill + ?), updated_at = ? WHERE id = ?`)
-        .run(billDelta, now, order.table_id);
+      newTableRev = nextTableRevision(order.table_id);
+      db.query(`UPDATE "table" SET current_bill = MAX(0, current_bill + ?), revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+        .run(billDelta, newTableRev, meta?.requestId || null, now, order.table_id);
       enqueueSync("table", order.table_id, "update");
     }
 
-    db.query("UPDATE order_record SET updated_at = ? WHERE id = ?").run(now, orderId);
+    // Increment order revision + update timestamp
+    const newOrderRev = nextOrderRevision(orderId);
+    db.query("UPDATE order_record SET updated_at = ?, revision = ?, last_command_id = ? WHERE id = ?").run(now, newOrderRev, meta?.requestId || null, orderId);
     enqueueSync("order", orderId, "update");
+    return { newOrderRev, newTableRev };
   });
 
-  tx();
+  let newOrderRev = 1, newTableRev: number | undefined;
+  try {
+    const txResult = tx();
+    newOrderRev = (txResult as any)?.newOrderRev ?? 1;
+    newTableRev = (txResult as any)?.newTableRev;
+  } catch (err: any) {
+    const failResult = { success: false, error: `Edit bill failed: ${err.message}` };
+    recordCommandResult(restaurantId, meta, "editBill", "order", orderId, "failed", failResult, null, failResult.error);
+    throw err;
+  }
 
   // ── Bug 3: Print KOT for cashier-added items ────────────────────────────────
   let printResults: any[] = [];
@@ -2080,11 +2378,13 @@ export async function editBillEdge(
   }
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
-  lanBroadcast("order:updated", { orderId, tableId: order.table_id, addedItems: resolvedAddedItems.length });
-  lanBroadcast("table:updated", { table: { id: order.table_id }, tableId: order.table_id });
+  lanBroadcast("order:updated", { orderId, tableId: order.table_id, addedItems: resolvedAddedItems.length, requestId: meta?.requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: meta?.requestId });
+  lanBroadcast("table:updated", { table: { id: order.table_id, revision: newTableRev }, tableId: order.table_id, requestId: meta?.requestId, tableRevision: newTableRev, commandId: meta?.requestId });
 
   const updatedOrder = db.query("SELECT * FROM order_record WHERE id = ?").get(orderId) as any;
-  return { success: true, order: updatedOrder, printResults };
+  const result = { success: true, order: updatedOrder, printResults, revision: newOrderRev, tableRevision: newTableRev };
+  recordCommandResult(restaurantId, meta, "editBill", "order", orderId, "applied", result, newOrderRev);
+  return result;
 }
 
 // ─── Confirm Payment (record payment for a settled order) ─────────────────────
@@ -2093,8 +2393,15 @@ export async function confirmPaymentEdge(
   restaurantId: string,
   transactionId: string,
   paymentDetails: { paymentMethod?: string; cashAmount?: number; cardAmount?: number; tipAmount?: number; cashTipAmount?: number; cardTipAmount?: number },
+  meta?: CommandMeta,
 ): Promise<{ success: boolean; error?: string }> {
   const db = getDb();
+
+  // ── Phase 1: Durable idempotency check via command_log ────────────────────
+  const idem = checkCommandIdempotency<{ success: boolean; error?: string }>(restaurantId, meta, "confirmPayment", transactionId);
+  if (idem.replay && idem.result) {
+    return idem.result;
+  }
 
   // Store payment details in edge_config for sync to cloud
   const paymentKey = `payment:${transactionId}`;
@@ -2105,7 +2412,9 @@ export async function confirmPaymentEdge(
   // Enqueue sync for the payment confirmation
   enqueueSync("transaction", transactionId, "update");
 
-  return { success: true };
+  const result = { success: true };
+  recordCommandResult(restaurantId, meta, "confirmPayment", "transaction", transactionId, "applied", result);
+  return result;
 }
 
 // ─── Update Order Status ──────────────────────────────────────────────────────
@@ -2114,18 +2423,30 @@ export async function updateOrderStatusEdge(
   restaurantId: string,
   orderId: string,
   status: string,
-): Promise<{ success: boolean; error?: string; order?: any }> {
+  meta?: CommandMeta,
+): Promise<{ success: boolean; error?: string; order?: any; revision?: number; tableRevision?: number }> {
   const db = getDb();
+
+  // ── Phase 1: Durable idempotency check via command_log ────────────────────
+  const idem = checkCommandIdempotency<{ success: boolean; error?: string; order?: any; revision?: number; tableRevision?: number }>(restaurantId, meta, "updateOrderStatus", orderId);
+  if (idem.replay && idem.result) {
+    return idem.result;
+  }
 
   const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
   if (!order) {
-    return { success: false, error: "Order not found" };
+    const rejectResult = { success: false, error: "Order not found" };
+    recordCommandResult(restaurantId, meta, "updateOrderStatus", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
   }
 
   const now = Date.now();
+  let newOrderRev = order.revision ?? 1;
+  let newTableRev: number | undefined;
   const tx = db.transaction(() => {
-    db.query("UPDATE order_record SET status = ?, updated_at = ? WHERE id = ?")
-      .run(status, now, orderId);
+    newOrderRev = nextOrderRevision(orderId);
+    db.query("UPDATE order_record SET status = ?, updated_at = ?, revision = ?, last_command_id = ? WHERE id = ?")
+      .run(status, now, newOrderRev, meta?.requestId || null, orderId);
 
     // Update table workflow status to match
     const workflowMap: Record<string, string> = {
@@ -2136,21 +2457,33 @@ export async function updateOrderStatusEdge(
     };
     const workflowStatus = workflowMap[status];
     if (workflowStatus) {
-      db.query(`UPDATE "table" SET workflow_status = ?, updated_at = ? WHERE id = ?`)
-        .run(workflowStatus, now, order.table_id);
+      newTableRev = nextTableRevision(order.table_id);
+      db.query(`UPDATE "table" SET workflow_status = ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+        .run(workflowStatus, newTableRev, meta?.requestId || null, now, order.table_id);
       enqueueSync("table", order.table_id, "update");
     }
 
     enqueueSync("order", orderId, "update");
+    return { newOrderRev, newTableRev };
   });
 
-  tx();
+  try {
+    const txResult = tx();
+    newOrderRev = (txResult as any)?.newOrderRev ?? newOrderRev;
+    newTableRev = (txResult as any)?.newTableRev ?? newTableRev;
+  } catch (err: any) {
+    const failResult = { success: false, error: `Status update failed: ${err.message}` };
+    recordCommandResult(restaurantId, meta, "updateOrderStatus", "order", orderId, "failed", failResult, null, failResult.error);
+    throw err;
+  }
 
   const updatedOrder = db.query("SELECT * FROM order_record WHERE id = ?").get(orderId) as any;
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
-  lanBroadcast("order:updated", { orderId, status: updatedOrder?.status });
-  lanBroadcast("table:updated", { table: { id: order.table_id }, tableId: order.table_id });
-  return { success: true, order: updatedOrder };
+  lanBroadcast("order:updated", { orderId, status: updatedOrder?.status, requestId: meta?.requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: meta?.requestId });
+  lanBroadcast("table:updated", { table: { id: order.table_id, revision: newTableRev }, tableId: order.table_id, requestId: meta?.requestId, tableRevision: newTableRev, commandId: meta?.requestId });
+  const result = { success: true, order: updatedOrder, revision: newOrderRev, tableRevision: newTableRev };
+  recordCommandResult(restaurantId, meta, "updateOrderStatus", "order", orderId, "applied", result, newOrderRev);
+  return result;
 }
 
 // ─── Mark Order Paid (simple status update, no settlement) ───────────────────
@@ -2159,25 +2492,48 @@ export async function markOrderPaidEdge(
   restaurantId: string,
   orderId: string,
   paymentMethod: string = "CASH",
-): Promise<{ success: boolean; error?: string; order?: any }> {
+  meta?: CommandMeta,
+): Promise<{ success: boolean; error?: string; order?: any; revision?: number }> {
   const db = getDb();
+
+  // ── Phase 1: Durable idempotency check via command_log ────────────────────
+  const idem = checkCommandIdempotency<{ success: boolean; error?: string; order?: any; revision?: number }>(restaurantId, meta, "markOrderPaid", orderId);
+  if (idem.replay && idem.result) {
+    return idem.result;
+  }
 
   const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
   if (!order) {
-    return { success: false, error: "Order not found" };
+    const rejectResult = { success: false, error: "Order not found" };
+    recordCommandResult(restaurantId, meta, "markOrderPaid", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
   }
 
   const now = Date.now();
+  let newOrderRev = order.revision ?? 1;
   const tx = db.transaction(() => {
-    db.query("UPDATE order_record SET status = 'PAID', paid_at = ?, updated_at = ? WHERE id = ?")
-      .run(now, now, orderId);
+    newOrderRev = nextOrderRevision(orderId);
+    db.query("UPDATE order_record SET status = 'PAID', paid_at = ?, updated_at = ?, revision = ?, last_command_id = ? WHERE id = ?")
+      .run(now, now, newOrderRev, meta?.requestId || null, orderId);
     enqueueSync("order", orderId, "update");
+    return { newOrderRev };
   });
 
-  tx();
+  try {
+    const txResult = tx();
+    newOrderRev = (txResult as any)?.newOrderRev ?? newOrderRev;
+  } catch (err: any) {
+    const failResult = { success: false, error: `Mark paid failed: ${err.message}` };
+    recordCommandResult(restaurantId, meta, "markOrderPaid", "order", orderId, "failed", failResult, null, failResult.error);
+    throw err;
+  }
 
   const updatedOrder = db.query("SELECT * FROM order_record WHERE id = ?").get(orderId) as any;
-  return { success: true, order: updatedOrder };
+  // ── Broadcast to LAN clients ──────────────────────────────────────────────
+  lanBroadcast("order:updated", { orderId, status: "PAID", requestId: meta?.requestId, revision: newOrderRev, commandId: meta?.requestId });
+  const result = { success: true, order: updatedOrder, revision: newOrderRev };
+  recordCommandResult(restaurantId, meta, "markOrderPaid", "order", orderId, "applied", result, newOrderRev);
+  return result;
 }
 
 // ─── Save Walk-in Transaction (no order, no table) ───────────────────────────
@@ -2205,8 +2561,15 @@ export async function saveTransactionEdge(
     billNumber?: string | null;
     platform?: string;
   },
+  meta?: CommandMeta,
 ): Promise<{ success: boolean; transaction?: any; error?: string }> {
   const db = getDb();
+
+  // ── Phase 1: Durable idempotency check via command_log ────────────────────
+  const idem = checkCommandIdempotency<{ success: boolean; transaction?: any; error?: string }>(restaurantId, meta, "saveTransaction", meta?.requestId || `walkin-${Date.now()}`);
+  if (idem.replay && idem.result) {
+    return idem.result;
+  }
 
   const localId = `edge-txn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const now = Date.now();
@@ -2244,7 +2607,7 @@ export async function saveTransactionEdge(
 
   enqueueSync("walkin_transaction", localId, "insert");
 
-  return {
+  const result = {
     success: true,
     transaction: {
       id: localId,
@@ -2252,6 +2615,9 @@ export async function saveTransactionEdge(
       paidAt: new Date(now).toISOString(),
     },
   };
+
+  recordCommandResult(restaurantId, meta, "saveTransaction", "transaction", localId, "applied", result);
+  return result;
 }
 
 // ─── List Transactions (for edge-local Past Transactions) ───────────────────

@@ -311,14 +311,15 @@ test("buildFinalBill vs buildBill parity — GST + 5% service charge + 10% disco
   const scPercent = 5;
   const discPercent = 10;
 
-  const tax = Math.round((foodSubtotal * gstRate / 100) * 100) / 100;
+  // buildBill formula: discount first, then tax on discountedSubtotal, then service charge on (discountedSubtotal + tax)
+  const totalSubtotal = foodSubtotal + liquorSubtotal;
+  const discountAmount = Math.round(totalSubtotal * (discPercent / 100) * 100) / 100;
+  const discountedSubtotal = Math.max(0, totalSubtotal - discountAmount);
+  const tax = Math.round(discountedSubtotal * gstRate / 100 * 100) / 100;
   const cgst = Math.round(tax / 2 * 100) / 100;
   const sgst = Math.round(tax / 2 * 100) / 100;
-  const displayedSubtotal = foodSubtotal + liquorSubtotal;
-  const serviceChargeAmount = Math.round((displayedSubtotal + tax) * (scPercent / 100) * 100) / 100;
-  const preDiscountTotal = displayedSubtotal + tax + serviceChargeAmount;
-  const discountAmount = Math.round(preDiscountTotal * (discPercent / 100) * 100) / 100;
-  const total = Math.round(Math.max(0, preDiscountTotal - discountAmount) * 100) / 100;
+  const serviceChargeAmount = Math.round((discountedSubtotal + tax) * (scPercent / 100) * 100) / 100;
+  const total = Math.round(Math.max(0, discountedSubtotal + tax + serviceChargeAmount) * 100) / 100;
 
   const buildBillInput = {
     items: TEST_ITEMS.map((i) => ({ name: i.name, quantity: i.quantity, price: i.price, menuType: i.menuType })),
@@ -334,7 +335,7 @@ test("buildFinalBill vs buildBill parity — GST + 5% service charge + 10% disco
   };
 
   const finalBillData = makeBillData({
-    subtotal: Math.round(displayedSubtotal),
+    subtotal: Math.round(totalSubtotal),
     discount: { percent: discPercent, amount: Math.round(discountAmount) },
     serviceCharge: { percent: scPercent, amount: Math.round(serviceChargeAmount) },
     tax: { cgst, sgst, total: tax },
@@ -356,11 +357,12 @@ test("buildFinalBill vs buildBill parity — no service charge, no discount", ()
   const liquorSubtotal = TEST_ITEMS.filter((i) => i.menuType !== "FOOD").reduce((s, i) => s + i.price * i.quantity, 0);
   const gstRate = 5;
 
-  const tax = Math.round((foodSubtotal * gstRate / 100) * 100) / 100;
+  // buildBill formula: tax on full subtotal (no gstEnabled=false on any item)
+  const totalSubtotal = foodSubtotal + liquorSubtotal;
+  const tax = Math.round(totalSubtotal * gstRate / 100 * 100) / 100;
   const cgst = Math.round(tax / 2 * 100) / 100;
   const sgst = Math.round(tax / 2 * 100) / 100;
-  const displayedSubtotal = foodSubtotal + liquorSubtotal;
-  const total = Math.round(displayedSubtotal + tax);
+  const total = Math.round(totalSubtotal + tax);
 
   const buildBillInput = {
     items: TEST_ITEMS.map((i) => ({ name: i.name, quantity: i.quantity, price: i.price, menuType: i.menuType })),
@@ -374,7 +376,7 @@ test("buildFinalBill vs buildBill parity — no service charge, no discount", ()
   };
 
   const finalBillData = makeBillData({
-    subtotal: Math.round(displayedSubtotal),
+    subtotal: Math.round(totalSubtotal),
     tax: { cgst, sgst, total: tax },
     grandTotal: total,
   });
@@ -393,12 +395,13 @@ test("buildFinalBill vs buildBill parity — 10% service charge only (no discoun
   const gstRate = 12;
   const scPercent = 10;
 
-  const tax = Math.round((foodSubtotal * gstRate / 100) * 100) / 100;
+  // buildBill formula: tax on full subtotal (no gstEnabled=false), no discount, service charge on (subtotal + tax)
+  const totalSubtotal = foodSubtotal + liquorSubtotal;
+  const tax = Math.round(totalSubtotal * gstRate / 100 * 100) / 100;
   const cgst = Math.round(tax / 2 * 100) / 100;
   const sgst = Math.round(tax / 2 * 100) / 100;
-  const displayedSubtotal = foodSubtotal + liquorSubtotal;
-  const serviceChargeAmount = Math.round((displayedSubtotal + tax) * (scPercent / 100) * 100) / 100;
-  const total = Math.round(displayedSubtotal + tax + serviceChargeAmount);
+  const serviceChargeAmount = Math.round((totalSubtotal + tax) * (scPercent / 100) * 100) / 100;
+  const total = Math.round(totalSubtotal + tax + serviceChargeAmount);
 
   const buildBillInput = {
     items: TEST_ITEMS.map((i) => ({ name: i.name, quantity: i.quantity, price: i.price, menuType: i.menuType })),
@@ -413,7 +416,7 @@ test("buildFinalBill vs buildBill parity — 10% service charge only (no discoun
   };
 
   const finalBillData = makeBillData({
-    subtotal: Math.round(displayedSubtotal),
+    subtotal: Math.round(totalSubtotal),
     serviceCharge: { percent: scPercent, amount: Math.round(serviceChargeAmount) },
     tax: { cgst, sgst, total: tax },
     grandTotal: total,

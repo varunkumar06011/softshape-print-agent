@@ -15,8 +15,11 @@
 // Run with: bun test offline-edge-cases.test.ts
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { test, expect, mock, beforeEach } from "bun:test";
+import { test, expect, mock, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
+
+// Save original fetch so we can restore it after each test
+const originalFetch = globalThis.fetch;
 
 // Helper: create a fresh in-memory test DB with the edge server schema
 function createTestDb(): Database {
@@ -41,6 +44,8 @@ function createTestDb(): Database {
       captain_id TEXT, guests INTEGER DEFAULT 0,
       session_started_at INTEGER, current_bill REAL DEFAULT 0,
       kot_history TEXT DEFAULT '[]', discount REAL, section_tag TEXT,
+      revision INTEGER NOT NULL DEFAULT 1,
+      last_command_id TEXT,
       updated_at INTEGER NOT NULL DEFAULT (unixepoch())
     );
 
@@ -54,7 +59,10 @@ function createTestDb(): Database {
       bill_number TEXT, paid_at INTEGER, last_request_id TEXT,
       inventory_deducted INTEGER DEFAULT 0,
       captain_id TEXT, platform TEXT DEFAULT 'DINE_IN',
-      created_by_user_id TEXT, cloud_synced INTEGER DEFAULT 0
+      created_by_user_id TEXT, cloud_synced INTEGER DEFAULT 0,
+      revision INTEGER NOT NULL DEFAULT 1,
+      last_command_id TEXT,
+      UNIQUE(last_request_id)
     );
 
     CREATE TABLE IF NOT EXISTS order_item (
@@ -126,6 +134,24 @@ function createTestDb(): Database {
     CREATE TABLE IF NOT EXISTS edge_config (
       key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0
     );
+
+    CREATE TABLE IF NOT EXISTS command_log (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      restaurant_id     TEXT NOT NULL,
+      request_id        TEXT NOT NULL,
+      command_type      TEXT NOT NULL,
+      entity_type       TEXT NOT NULL,
+      entity_id         TEXT NOT NULL,
+      device_id         TEXT,
+      command_ts        INTEGER NOT NULL,
+      expected_revision INTEGER,
+      resulting_revision INTEGER,
+      status            TEXT NOT NULL,
+      response_json     TEXT,
+      error_message     TEXT,
+      applied_at        INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_command_log_dedup ON command_log(restaurant_id, request_id, command_type);
   `);
 
   return db;
@@ -135,24 +161,28 @@ const RESTAURANT_ID = "test-restaurant-001";
 const DEVICE_A = "device-aaa";
 const DEVICE_B = "device-bbb";
 
-// ── Test 1: Two devices editing the same table simultaneously ────────────────
-test("concurrent table edits — last write wins, no crash", () => {
+// ── Test 1: Two devices editing the same table — revision-based concurrency ──
+test("concurrent table edits — revision increments monotonically, newer revision wins", () => {
   const db = createTestDb();
   db.exec(`INSERT INTO outlet (id, name, slug, restaurant_code) VALUES ('${RESTAURANT_ID}', 'Test', 'test', 'TEST001')`);
   db.exec(`INSERT INTO section (id, name, restaurant_id) VALUES ('sec1', 'Main', '${RESTAURANT_ID}')`);
-  db.exec(`INSERT INTO "table" (id, number, section_id, restaurant_id, status, workflow_status) VALUES ('table1', 1, 'sec1', '${RESTAURANT_ID}', 'AVAILABLE', 'Free')`);
+  db.exec(`INSERT INTO "table" (id, number, section_id, restaurant_id, status, workflow_status, revision, last_command_id) VALUES ('table1', 1, 'sec1', '${RESTAURANT_ID}', 'AVAILABLE', 'Free', 1, NULL)`);
 
-  // Device A sets table to OCCUPIED
-  db.query(`UPDATE "table" SET status = 'OCCUPIED', captain_id = '${DEVICE_A}', updated_at = ? WHERE id = 'table1'`)
-    .run(Date.now());
+  // Device A sets table to OCCUPIED + increments revision
+  const revA = (db.query('SELECT revision FROM "table" WHERE id = ?').get('table1') as any)?.revision + 1;
+  db.query(`UPDATE "table" SET status = 'OCCUPIED', captain_id = '${DEVICE_A}', revision = ?, last_command_id = 'cmd-A', updated_at = ? WHERE id = 'table1'`)
+    .run(revA, Date.now());
 
-  // Device B sets table to OCCUPIED with a different captain (simultaneous)
-  db.query(`UPDATE "table" SET status = 'OCCUPIED', captain_id = '${DEVICE_B}', updated_at = ? WHERE id = 'table1'`)
-    .run(Date.now() + 1);
+  // Device B sets table to OCCUPIED with a different captain + increments revision
+  const revB = (db.query('SELECT revision FROM "table" WHERE id = ?').get('table1') as any)?.revision + 1;
+  db.query(`UPDATE "table" SET status = 'OCCUPIED', captain_id = '${DEVICE_B}', revision = ?, last_command_id = 'cmd-B', updated_at = ? WHERE id = 'table1'`)
+    .run(revB, Date.now() + 1);
 
   const tableState = db.query(`SELECT * FROM "table" WHERE id = 'table1'`).get() as any;
   expect(tableState.captain_id).toBe(DEVICE_B);
   expect(tableState.status).toBe('OCCUPIED');
+  expect(tableState.revision).toBe(3);
+  expect(tableState.last_command_id).toBe('cmd-B');
 });
 
 // ── Test 2: Power loss mid-order (order saved but KOT not printed) ───────────
@@ -188,6 +218,11 @@ beforeEach(async () => {
   const { setDb } = await import("../db.ts");
   setDb(null);
   testDb = createTestDb();
+});
+
+afterEach(() => {
+  // Restore original fetch so mocks don't leak into other test files
+  globalThis.fetch = originalFetch;
 });
 
 test("full shift offline — 50 orders synced via real pushSyncBatch with mocked fetch", async () => {
@@ -243,12 +278,12 @@ test("full shift offline — 50 orders synced via real pushSyncBatch with mocked
   const callArgs = fetchMock.mock.calls[0];
   expect(callArgs[0]).toContain("/api/edge/sync");
 
-  // Verify sync_queue records are actually marked synced in the DB
+  // Verify sync_queue records are actually removed (markSynced deletes rows)
   const pendingAfter = testDb.query(`SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0`).get() as any;
   expect(pendingAfter.count).toBe(0);
 
-  const syncedCount = testDb.query(`SELECT COUNT(*) as count FROM sync_queue WHERE synced = 1`).get() as any;
-  expect(syncedCount.count).toBe(50);
+  const totalRemaining = testDb.query(`SELECT COUNT(*) as count FROM sync_queue`).get() as any;
+  expect(totalRemaining.count).toBe(0);
 
   // Restore
   setDb(null);
@@ -493,11 +528,11 @@ test("offline -> online end-to-end sync — correct records, no duplicates", asy
   expect(onlineResult.accepted).toBe(3);
   expect(onlineResult.rejected).toBe(0);
 
-  // 6. Verify sync_queue records are marked synced
+  // 6. Verify sync_queue records are removed (markSynced deletes rows)
   const pendingAfterOnline = testDb.query(`SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0`).get() as any;
   expect(pendingAfterOnline.count).toBe(0);
-  const syncedCount = testDb.query(`SELECT COUNT(*) as count FROM sync_queue WHERE synced = 1`).get() as any;
-  expect(syncedCount.count).toBe(3);
+  const totalRemaining = testDb.query(`SELECT COUNT(*) as count FROM sync_queue`).get() as any;
+  expect(totalRemaining.count).toBe(0);
 
   // 7. Verify cloud received the correct records in the correct order with no duplicates
   expect(acceptFetchMock).toHaveBeenCalledTimes(1);
@@ -528,5 +563,159 @@ test("offline -> online end-to-end sync — correct records, no duplicates", asy
   expect(tablePayload.data.status).toBe("OCCUPIED");
 
   // Restore
+  setDb(null);
+});
+
+// ── Test 9: Durable idempotency — replaying same requestId returns original result ──
+test("durable idempotency — replaying same requestId returns original result from command_log", () => {
+  const db = createTestDb();
+  db.exec(`INSERT INTO outlet (id, name, slug, restaurant_code) VALUES ('${RESTAURANT_ID}', 'Test', 'test', 'TEST009')`);
+  db.exec(`INSERT INTO section (id, name, restaurant_id) VALUES ('sec9', 'Main', '${RESTAURANT_ID}')`);
+  db.exec(`INSERT INTO "table" (id, number, section_id, restaurant_id, status, workflow_status, revision) VALUES ('tbl9', 1, 'sec9', '${RESTAURANT_ID}', 'AVAILABLE', 'Free', 1)`);
+
+  const requestId = "req-idempotency-001";
+  const commandType = "createOrder";
+  const originalResult = { success: true, orderId: "order-9", revision: 1, tableRevision: 2 };
+
+  // Simulate recording a command result (as recordCommandResult does)
+  db.query(`INSERT INTO command_log
+    (restaurant_id, request_id, command_type, entity_type, entity_id, device_id,
+     command_ts, expected_revision, resulting_revision, status, response_json, error_message, applied_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(
+      RESTAURANT_ID, requestId, commandType, "table", "tbl9", DEVICE_A,
+      Date.now(), 1, 2, "applied", JSON.stringify(originalResult), null, Date.now()
+    );
+
+  // Simulate idempotency check: lookup by (restaurant_id, request_id, command_type)
+  const entry = db.query("SELECT * FROM command_log WHERE restaurant_id = ? AND request_id = ? AND command_type = ?")
+    .get(RESTAURANT_ID, requestId, commandType) as any;
+
+  expect(entry).toBeDefined();
+  expect(entry.status).toBe("applied");
+  expect(entry.response_json).toBeDefined();
+
+  const replayedResult = JSON.parse(entry.response_json);
+  expect(replayedResult.success).toBe(true);
+  expect(replayedResult.orderId).toBe("order-9");
+  expect(replayedResult.revision).toBe(1);
+  expect(replayedResult.tableRevision).toBe(2);
+});
+
+// ── Test 10: command_log ON CONFLICT — re-recording same command updates, doesn't throw ──
+test("command_log ON CONFLICT — re-recording same (restaurant_id, request_id, command_type) updates instead of throwing", () => {
+  const db = createTestDb();
+  db.exec(`INSERT INTO outlet (id, name, slug, restaurant_code) VALUES ('${RESTAURANT_ID}', 'Test', 'test', 'TEST010')`);
+
+  const requestId = "req-conflict-001";
+  const commandType = "settleOrder";
+
+  // First insert
+  db.query(`INSERT INTO command_log
+    (restaurant_id, request_id, command_type, entity_type, entity_id, device_id,
+     command_ts, expected_revision, resulting_revision, status, response_json, error_message, applied_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(RESTAURANT_ID, requestId, commandType, "order", "order-10", DEVICE_A,
+      Date.now(), 1, 2, "applied", JSON.stringify({ success: true }), null, Date.now());
+
+  // Second insert with same key — should NOT throw, should update
+  expect(() => {
+    db.query(`INSERT INTO command_log
+      (restaurant_id, request_id, command_type, entity_type, entity_id, device_id,
+       command_ts, expected_revision, resulting_revision, status, response_json, error_message, applied_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(restaurant_id, request_id, command_type) DO UPDATE SET
+        status = excluded.status,
+        response_json = excluded.response_json,
+        error_message = excluded.error_message,
+        resulting_revision = excluded.resulting_revision,
+        applied_at = excluded.applied_at`)
+      .run(RESTAURANT_ID, requestId, commandType, "order", "order-10", DEVICE_A,
+        Date.now(), 1, 3, "applied", JSON.stringify({ success: true, revision: 3 }), null, Date.now());
+  }).not.toThrow();
+
+  // Verify only one row exists and it has the updated values
+  const rows = db.query("SELECT * FROM command_log WHERE request_id = ? AND command_type = ?")
+    .all(requestId, commandType) as any[];
+  expect(rows).toHaveLength(1);
+  expect(rows[0].resulting_revision).toBe(3);
+  const parsed = JSON.parse(rows[0].response_json);
+  expect(parsed.revision).toBe(3);
+});
+
+// ── Test 11: Revision increment — nextTableRevision and nextOrderRevision ──────
+test("revision increment — nextTableRevision and nextOrderRevision return monotonically increasing values", async () => {
+  const db = createTestDb();
+  db.exec(`INSERT INTO outlet (id, name, slug, restaurant_code) VALUES ('${RESTAURANT_ID}', 'Test', 'test', 'TEST011')`);
+  db.exec(`INSERT INTO section (id, name, restaurant_id) VALUES ('sec11', 'Main', '${RESTAURANT_ID}')`);
+  db.exec(`INSERT INTO "table" (id, number, section_id, restaurant_id, status, workflow_status, revision) VALUES ('tbl11', 1, 'sec11', '${RESTAURANT_ID}', 'AVAILABLE', 'Free', 1)`);
+  db.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at, revision) VALUES (?, ?, ?, 'OPEN', 0, ?, ?, 1)`)
+    .run("order11", "tbl11", RESTAURANT_ID, Date.now(), Date.now());
+
+  const { setDb, nextTableRevision, nextOrderRevision } = await import("../db.ts");
+  setDb(db);
+
+  // Table revision: 1 → 2 → 3
+  expect(nextTableRevision("tbl11")).toBe(2);
+  db.query(`UPDATE "table" SET revision = 2 WHERE id = 'tbl11'`).run();
+  expect(nextTableRevision("tbl11")).toBe(3);
+  db.query(`UPDATE "table" SET revision = 3 WHERE id = 'tbl11'`).run();
+
+  // Order revision: 1 → 2 → 3
+  expect(nextOrderRevision("order11")).toBe(2);
+  db.query(`UPDATE order_record SET revision = 2 WHERE id = 'order11'`).run();
+  expect(nextOrderRevision("order11")).toBe(3);
+
+  setDb(null);
+});
+
+// ── Test 12: Sync payload includes revision and lastCommandId ──────────────────
+test("sync payload includes revision and lastCommandId for order and table records", async () => {
+  testDb.exec(`INSERT INTO outlet (id, name, slug, restaurant_code) VALUES ('${RESTAURANT_ID}', 'Test', 'test', 'TEST012')`);
+
+  // Seed session
+  testDb.query(`INSERT INTO edge_config (key, value, updated_at) VALUES ('session_token', 'test-jwt-token', ?)`).run(Date.now());
+  testDb.query(`INSERT INTO edge_config (key, value, updated_at) VALUES ('restaurant_id', '${RESTAURANT_ID}', ?)`).run(Date.now());
+  testDb.query(`INSERT INTO edge_config (key, value, updated_at) VALUES ('backend_url', 'http://mock-backend', ?)`).run(Date.now());
+  testDb.query(`INSERT INTO edge_config (key, value, updated_at) VALUES ('session_expires_at', '${Date.now() + 3600000}', ?)`).run(Date.now());
+  testDb.query(`INSERT INTO edge_config (key, value, updated_at) VALUES ('device_id', '${DEVICE_A}', ?)`).run(Date.now());
+
+  // Create order and table with revision + last_command_id
+  testDb.exec(`INSERT INTO section (id, name, restaurant_id) VALUES ('sec12', 'Main', '${RESTAURANT_ID}')`);
+  testDb.query(`INSERT INTO "table" (id, number, section_id, restaurant_id, status, workflow_status, revision, last_command_id) VALUES (?, 1, 'sec12', ?, 'OCCUPIED', 'Preparing', 5, 'cmd-table-12')`)
+    .run('tbl12', RESTAURANT_ID);
+  testDb.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at, revision, last_command_id) VALUES (?, ?, ?, 'PREPARING', 250, ?, ?, 3, 'cmd-order-12')`)
+    .run('order12', 'tbl12', RESTAURANT_ID, Date.now(), Date.now());
+
+  testDb.query(`INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)`).run("order", "order12", "update", Date.now());
+  testDb.query(`INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)`).run("table", "tbl12", "update", Date.now());
+
+  let capturedBatch: any = null;
+  const fetchMock = mock(async (url: string, opts: any) => {
+    capturedBatch = JSON.parse(opts.body).batch;
+    const accepted = capturedBatch.map((b: any) => b.queueId);
+    return new Response(JSON.stringify({ accepted, rejected: [] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  });
+  globalThis.fetch = fetchMock as any;
+
+  const { setDb } = await import("../db.ts");
+  setDb(testDb);
+
+  const { pushSyncBatch } = await import("../sync.ts");
+  await pushSyncBatch();
+
+  expect(capturedBatch).toHaveLength(2);
+
+  const orderPayload = capturedBatch.find((b: any) => b.tableName === "order");
+  const tablePayload = capturedBatch.find((b: any) => b.tableName === "table");
+
+  expect(orderPayload.data.revision).toBe(3);
+  expect(orderPayload.data.lastCommandId).toBe('cmd-order-12');
+  expect(tablePayload.data.revision).toBe(5);
+  expect(tablePayload.data.lastCommandId).toBe('cmd-table-12');
+
   setDb(null);
 });

@@ -10,7 +10,10 @@
 //   { type: "register", canPrint: true }  — Tauri desktop with physical printers
 //   { type: "register", canPrint: false } — Captain web/APK (no local printers)
 // This allows the edge server to distinguish printing clients from non-printing
-// ones, so print_job events are only sent to clients that can actually print.
+// ones (used by the LAN status diagnostic endpoint).
+// Note: print jobs are NO LONGER dispatched via WebSocket — they are sent via
+// HTTP POST to the cashier-desktop print bridge (port 3102). The canPrint flag
+// is retained only for diagnostic visibility.
 //
 // Event format (JSON): { type: "order:created", data: { ... }, ts: <epoch_ms> }
 //
@@ -19,7 +22,6 @@
 //   order:updated   — items added to existing order
 //   order:settled   — order settled + table freed
 //   table:updated   — table state changed (status, workflow, bill)
-//   print_job       — print job dispatched to printing clients only
 // ─────────────────────────────────────────────────────────────────────────────
 
 type ClientWS = { readyState: number; send(data: string): void };
@@ -92,69 +94,17 @@ export function lanBroadcast(type: string, data: any) {
   }
 }
 
-// Broadcast a print_job event ONLY to printing-capable clients (Tauri desktops).
-// Returns true if at least one printing client received the message.
-export function broadcastPrintJob(type: string, data: any): boolean {
-  const message = JSON.stringify({
-    type,
-    data,
-    ts: Date.now(),
-  });
-
-  let sent = false;
-  for (const [ws, info] of clients) {
-    if (!info.canPrint) continue;
-    try {
-      if (ws.readyState === WS_OPEN) {
-        ws.send(message);
-        sent = true;
-      }
-    } catch {
-      clients.delete(ws);
-    }
-  }
-  return sent;
-}
-
 // Get the total number of connected clients (for status endpoint)
 export function getLanClientCount(): number {
   return clients.size;
 }
 
 // Get the number of printing-capable clients (Tauri desktops with printers).
-// Used by the print dispatch logic to decide whether to broadcast via LAN WS
-// or fall back to cloud relay.
+// Used by the LAN status diagnostic endpoint.
 export function getPrintingClientCount(): number {
   let count = 0;
   for (const info of clients.values()) {
     if (info.canPrint) count++;
   }
   return count;
-}
-
-// ── Print ack registry ───────────────────────────────────────────────────────
-// When the edge server broadcasts a print_job via WebSocket, it waits for the
-// Tauri frontend to send back a print_ack confirming the print succeeded (or
-// failed). This provides end-to-end print confirmation instead of fire-and-forget.
-
-const pendingPrintAcks = new Map<string, { resolve: (result: { ok: boolean; error?: string }) => void; timeout: any }>();
-
-export function waitForPrintAck(eventId: string, timeoutMs: number = 20000): Promise<{ ok: boolean; error?: string }> {
-  return new Promise((resolve) => {
-    const timeout = setTimeout(() => {
-      if (pendingPrintAcks.delete(eventId)) {
-        resolve({ ok: false, error: "Print ack timeout" });
-      }
-    }, timeoutMs);
-    pendingPrintAcks.set(eventId, { resolve, timeout });
-  });
-}
-
-export function resolvePrintAck(eventId: string, ok: boolean, error?: string) {
-  const pending = pendingPrintAcks.get(eventId);
-  if (pending) {
-    clearTimeout(pending.timeout);
-    pendingPrintAcks.delete(eventId);
-    pending.resolve({ ok, error });
-  }
 }

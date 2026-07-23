@@ -37,6 +37,8 @@ function createTestDb(): Database {
       session_started_at INTEGER, current_bill REAL DEFAULT 0,
       kot_history TEXT DEFAULT '[]', discount REAL, section_tag TEXT,
       bill_printer_name TEXT, kot_printer_name TEXT,
+      revision INTEGER NOT NULL DEFAULT 1,
+      last_command_id TEXT,
       updated_at INTEGER NOT NULL DEFAULT (unixepoch())
     );
 
@@ -56,7 +58,10 @@ function createTestDb(): Database {
       bill_number TEXT, paid_at INTEGER, last_request_id TEXT,
       inventory_deducted INTEGER DEFAULT 0,
       captain_id TEXT, platform TEXT DEFAULT 'DINE_IN',
-      created_by_user_id TEXT, cloud_synced INTEGER DEFAULT 0
+      created_by_user_id TEXT, cloud_synced INTEGER DEFAULT 0,
+      revision INTEGER NOT NULL DEFAULT 1,
+      last_command_id TEXT,
+      UNIQUE(last_request_id)
     );
 
     CREATE TABLE IF NOT EXISTS order_item (
@@ -105,7 +110,7 @@ function createTestDb(): Database {
       escpos_data     TEXT NOT NULL,
       item_summary    TEXT,
       captain_name    TEXT,
-      status          TEXT NOT NULL DEFAULT 'accepted',
+      status          TEXT NOT NULL DEFAULT 'queued',
       attempts        INTEGER DEFAULT 0,
       last_error      TEXT,
       created_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
@@ -121,6 +126,24 @@ function createTestDb(): Database {
     CREATE TABLE IF NOT EXISTS edge_config (
       key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0
     );
+
+    CREATE TABLE IF NOT EXISTS command_log (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      restaurant_id     TEXT NOT NULL,
+      request_id        TEXT NOT NULL,
+      command_type      TEXT NOT NULL,
+      entity_type       TEXT NOT NULL,
+      entity_id         TEXT NOT NULL,
+      device_id         TEXT,
+      command_ts        INTEGER NOT NULL,
+      expected_revision INTEGER,
+      resulting_revision INTEGER,
+      status            TEXT NOT NULL,
+      response_json     TEXT,
+      error_message     TEXT,
+      applied_at        INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_command_log_dedup ON command_log(restaurant_id, request_id, command_type);
   `);
 
   return db;
@@ -180,11 +203,11 @@ test("printBillEdge return logic: printed job → success=true, ok=true", () => 
   const eventId = "BILL-order-001-1234";
 
   // Simulate: createPrintJob was called, then dispatchSinglePrintJob completed
-  // with a successful print ack, updating status to 'printed'
+  // with a successful print, updating status to 'printed'
   const now = Date.now();
   testDb.query(`INSERT INTO print_job
     (event_id, restaurant_id, order_id, table_id, printer_name, job_type, escpos_data, status, acked_via, printed_at, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'printed', 'lan_ws', ?, ?, ?)`).run(
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'printed', 'http', ?, ?, ?)`).run(
     eventId, RESTAURANT_ID, ORDER_ID, TABLE_ID, "BILL_PRINTER", "BILL",
     JSON.stringify([{ type: "text", format: "plain", data: "test" }]),
     now, now, now
@@ -201,7 +224,7 @@ test("printBillEdge return logic: printed job → success=true, ok=true", () => 
     ok: job.status === "printed",
     printerName: "BILL_PRINTER",
     bytes: 0,
-    method: job.acked_via || "lan_ws",
+    method: job.acked_via || "http",
     eventId,
   };
 
@@ -212,15 +235,15 @@ test("printBillEdge return logic: printed job → success=true, ok=true", () => 
   expect(allPrinted).toBe(true);
 });
 
-// ── Test 2: printBillEdge returns failure when print job needs_retry ──────────
+// ── Test 2: printBillEdge returns failure when print job retrying ───────────
 
-test("printBillEdge return logic: needs_retry job → success=false, ok=false", () => {
+test("printBillEdge return logic: retrying job → success=false, ok=false", () => {
   const eventId = "BILL-order-001-5678";
 
   const now = Date.now();
   testDb.query(`INSERT INTO print_job
     (event_id, restaurant_id, order_id, table_id, printer_name, job_type, escpos_data, status, last_error, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'needs_retry', 'Printer not connected', ?, ?)`).run(
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'retrying', 'Printer not connected', ?, ?)`).run(
     eventId, RESTAURANT_ID, ORDER_ID, TABLE_ID, "BILL_PRINTER", "BILL",
     JSON.stringify([{ type: "text", format: "plain", data: "test" }]),
     now, now
@@ -228,7 +251,7 @@ test("printBillEdge return logic: needs_retry job → success=false, ok=false", 
 
   const job = testDb.query("SELECT * FROM print_job WHERE event_id = ?").get(eventId) as any;
 
-  expect(job.status).toBe("needs_retry");
+  expect(job.status).toBe("retrying");
 
   // The printResults entry for a failed job should have ok=false
   const printResult = {
@@ -327,7 +350,7 @@ test("printBillEdge: bill number assigned even when print fails", () => {
   const now = Date.now();
   testDb.query(`INSERT INTO print_job
     (event_id, restaurant_id, order_id, table_id, printer_name, job_type, escpos_data, status, last_error, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'needs_retry', 'No paper', ?, ?)`).run(
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'retrying', 'No paper', ?, ?)`).run(
     eventId, RESTAURANT_ID, ORDER_ID, TABLE_ID, "BILL_PRINTER", "BILL",
     JSON.stringify([{ type: "text", format: "plain", data: "test" }]),
     now, now

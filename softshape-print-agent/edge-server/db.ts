@@ -32,7 +32,14 @@ export function getKolkataDateString(date = new Date()): string {
   return corrected.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
 }
 
-const CURRENT_SCHEMA_VERSION = 2;
+const CURRENT_SCHEMA_VERSION = 4;
+
+// Schema versions that can be migrated in place (via runMigrations) without
+// wiping the database. Any version not in this set triggers the existing
+// backup + rebuild path. v2 → v3 adds revision columns and the command_log
+// table via idempotent ALTER TABLE / CREATE TABLE IF NOT EXISTS, so it is
+// safe to apply to a live production DB without data loss.
+const SAFE_INPLACE_MIGRATION_FROM = new Set<number>([2, 3]);
 
 let db: Database | null = null;
 let recoveryStatus: RecoveryResult = { recovered: false, corruptPath: null, message: "" };
@@ -114,7 +121,8 @@ export function getDb(): Database {
   const hasPreVersioningTables = onDiskVersion === 0 &&
     !!db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='outlet'").get();
 
-  if ((onDiskVersion !== 0 && onDiskVersion !== CURRENT_SCHEMA_VERSION) || hasPreVersioningTables) {
+  const canMigrateInPlace = onDiskVersion !== 0 && SAFE_INPLACE_MIGRATION_FROM.has(onDiskVersion) && !hasPreVersioningTables;
+  if ((onDiskVersion !== 0 && onDiskVersion !== CURRENT_SCHEMA_VERSION && !canMigrateInPlace) || hasPreVersioningTables) {
     console.warn(`[DB] Schema version mismatch: on-disk=${onDiskVersion}, expected=${CURRENT_SCHEMA_VERSION}${hasPreVersioningTables ? ' (pre-versioning DB detected)' : ''}. Rebuilding fresh DB.`);
 
     // ── Backup before rebuild (VACUUM INTO) ──────────────────────────────────
@@ -158,6 +166,8 @@ export function getDb(): Database {
         "Menu and settings will be re-downloaded from the cloud when connected.",
     };
     console.warn(`[DB] ${recoveryStatus.message}`);
+  } else if (canMigrateInPlace && onDiskVersion !== CURRENT_SCHEMA_VERSION) {
+    console.log(`[DB] In-place migration: on-disk=${onDiskVersion} → target=${CURRENT_SCHEMA_VERSION}. Running migrations without rebuild.`);
   }
 
   initSchema(db);
@@ -324,10 +334,13 @@ function initSchema(database: Database) {
       discount          REAL,
       section_tag       TEXT,
       last_waiter_call_at INTEGER,  -- epoch ms
+      revision         INTEGER NOT NULL DEFAULT 1,  -- monotonic per-table aggregate revision
+      last_command_id  TEXT,                       -- most recent command_log request_id applied
       updated_at        INTEGER NOT NULL DEFAULT (unixepoch())
     );
     CREATE INDEX IF NOT EXISTS idx_table_restaurant_status ON "table"(restaurant_id, status);
     CREATE INDEX IF NOT EXISTS idx_table_section ON "table"(section_id);
+    CREATE INDEX IF NOT EXISTS idx_table_revision ON "table"(revision);
 
     -- Categories
     CREATE TABLE IF NOT EXISTS category (
@@ -442,11 +455,14 @@ function initSchema(database: Database) {
       platform            TEXT DEFAULT 'DINE_IN',
       created_by_user_id  TEXT,
       cloud_synced        INTEGER DEFAULT 0,  -- 0 = not yet pushed to cloud, 1 = synced
+      revision            INTEGER NOT NULL DEFAULT 1,  -- monotonic per-order aggregate revision
+      last_command_id     TEXT,                       -- most recent command_log request_id applied
       UNIQUE(last_request_id)  -- idempotency: one order per requestId
     );
     CREATE INDEX IF NOT EXISTS idx_order_restaurant_status ON order_record(restaurant_id, status);
     CREATE INDEX IF NOT EXISTS idx_order_table_status ON order_record(table_id, status);
     CREATE INDEX IF NOT EXISTS idx_order_cloud_synced ON order_record(cloud_synced) WHERE cloud_synced = 0;
+    CREATE INDEX IF NOT EXISTS idx_order_revision ON order_record(revision);
 
     -- Order Items
     CREATE TABLE IF NOT EXISTS order_item (
@@ -578,19 +594,23 @@ function initSchema(database: Database) {
       escpos_data     TEXT NOT NULL,           -- JSON array of {type,format,data}
       item_summary    TEXT,                    -- JSON: [{name,qty}] for audit UI
       captain_name    TEXT,
-      status          TEXT NOT NULL DEFAULT 'accepted',  -- accepted|printing|printed|failed|needs_retry|dead_letter|cancelled
+      status          TEXT NOT NULL DEFAULT 'queued',  -- queued|printing|printed|failed|retrying|dead_letter|cancelled
       attempts        INTEGER DEFAULT 0,
+      max_attempts    INTEGER DEFAULT 3,
       last_error      TEXT,
       created_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
       updated_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+      queued_at       INTEGER,
+      printing_at     INTEGER,
       printed_at      INTEGER,
-      acked_via       TEXT,                    -- 'lan_ws' | 'cloud_relay' | 'local'
+      failed_at       INTEGER,
+      acked_via       TEXT,                    -- 'http' | 'cloud_relay' | 'local'
       next_attempt_at INTEGER,                 -- exponential backoff scheduling
       lease_until     INTEGER,                 -- claim lease expiry for stale recovery
       copy_number     INTEGER DEFAULT 0,       -- reprint copy counter
       payload_version INTEGER DEFAULT 1        -- ESC/POS payload schema version
     );
-    CREATE INDEX IF NOT EXISTS idx_print_job_status ON print_job(status) WHERE status IN ('accepted', 'needs_retry');
+    CREATE INDEX IF NOT EXISTS idx_print_job_status ON print_job(status) WHERE status IN ('queued', 'retrying');
     CREATE INDEX IF NOT EXISTS idx_print_job_printer_status ON print_job(printer_name, status);
     CREATE INDEX IF NOT EXISTS idx_print_job_order ON print_job(order_id);
 
@@ -607,6 +627,30 @@ function initSchema(database: Database) {
     );
     CREATE INDEX IF NOT EXISTS idx_users_outlet ON users(outlet_id);
     CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active) WHERE is_active = 1;
+
+    -- Command Log (durable idempotency + audit for every edge business command)
+    -- One row per applied/rejected command. Replay of the same (restaurant_id,
+    -- request_id, command_type) returns the original response without reapplying
+    -- side effects. Retention is bounded by operational cleanup, not deletion.
+    CREATE TABLE IF NOT EXISTS command_log (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      restaurant_id     TEXT NOT NULL,
+      request_id        TEXT NOT NULL,
+      command_type      TEXT NOT NULL,          -- 'createOrder','updateOrderItems','cancelKotItem','settleOrder', etc.
+      entity_type       TEXT NOT NULL,          -- 'table' | 'order' | 'transaction'
+      entity_id         TEXT NOT NULL,
+      device_id         TEXT,
+      command_ts        INTEGER NOT NULL,       -- client-supplied command timestamp
+      expected_revision INTEGER,                -- caller's view of current revision (optimistic)
+      resulting_revision INTEGER,               -- revision after apply (null if rejected)
+      status            TEXT NOT NULL,          -- 'applied' | 'rejected' | 'failed'
+      response_json     TEXT,                   -- JSON of original response/result metadata
+      error_message     TEXT,
+      applied_at        INTEGER NOT NULL DEFAULT (unixepoch() * 1000)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_command_log_dedup ON command_log(restaurant_id, request_id, command_type);
+    CREATE INDEX IF NOT EXISTS idx_command_log_entity ON command_log(entity_type, entity_id, applied_at);
+    CREATE INDEX IF NOT EXISTS idx_command_log_status ON command_log(status) WHERE status IN ('rejected','failed');
   `);
 }
 
@@ -615,7 +659,7 @@ function initSchema(database: Database) {
 // This runs idempotent ALTER TABLE statements guarded by column-existence checks.
 function runMigrations(database: Database) {
   const hasColumn = (table: string, col: string): boolean => {
-    const cols = database.query(`PRAGMA table_info(${table})`).all() as { name: string }[];
+    const cols = database.query(`PRAGMA table_info("${table}")`).all() as { name: string }[];
     return cols.some(c => c.name === col);
   };
 
@@ -637,6 +681,45 @@ function runMigrations(database: Database) {
   if (!hasColumn("print_job", "payload_version")) {
     database.exec(`ALTER TABLE print_job ADD COLUMN payload_version INTEGER DEFAULT 1`);
   }
+
+  // ── v4: Print queue state machine columns ────────────────────────────────
+  if (!hasColumn("print_job", "max_attempts")) {
+    database.exec(`ALTER TABLE print_job ADD COLUMN max_attempts INTEGER DEFAULT 3`);
+  }
+  if (!hasColumn("print_job", "queued_at")) {
+    database.exec(`ALTER TABLE print_job ADD COLUMN queued_at INTEGER`);
+  }
+  if (!hasColumn("print_job", "printing_at")) {
+    database.exec(`ALTER TABLE print_job ADD COLUMN printing_at INTEGER`);
+  }
+  if (!hasColumn("print_job", "failed_at")) {
+    database.exec(`ALTER TABLE print_job ADD COLUMN failed_at INTEGER`);
+  }
+  // Migrate old status values to new state machine names
+  database.exec(`UPDATE print_job SET status = 'queued' WHERE status = 'accepted'`);
+  database.exec(`UPDATE print_job SET status = 'retrying' WHERE status = 'needs_retry'`);
+  // Backfill queued_at from created_at for existing queued/retrying jobs
+  database.exec(`UPDATE print_job SET queued_at = created_at WHERE queued_at IS NULL AND status IN ('queued', 'retrying')`);
+
+  // ── v3: revision columns + last_command_id on table and order_record ──────
+  // Monotonic aggregate revisions guard against stale-command overwrites. Existing
+  // rows backfill to revision=1; subsequent mutations increment within their
+  // transaction. last_command_id tracks the most recent command_log entry applied.
+  if (!hasColumn("table", "revision")) {
+    database.exec(`ALTER TABLE "table" ADD COLUMN revision INTEGER NOT NULL DEFAULT 1`);
+  }
+  if (!hasColumn("table", "last_command_id")) {
+    database.exec(`ALTER TABLE "table" ADD COLUMN last_command_id TEXT`);
+  }
+  if (!hasColumn("order_record", "revision")) {
+    database.exec(`ALTER TABLE order_record ADD COLUMN revision INTEGER NOT NULL DEFAULT 1`);
+  }
+  if (!hasColumn("order_record", "last_command_id")) {
+    database.exec(`ALTER TABLE order_record ADD COLUMN last_command_id TEXT`);
+  }
+  // Indexes for revision lookups (idempotent; CREATE INDEX IF NOT EXISTS)
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_table_revision ON "table"(revision)`);
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_order_revision ON order_record(revision)`);
 
   // outlet.organization_id NOT NULL → nullable
   // Pre-v17.1.0 DBs created organization_id as TEXT NOT NULL. The schema-version
@@ -737,6 +820,100 @@ export function enqueueSync(tableName: string, recordId: string, operation: stri
     .run(tableName, recordId, operation, Date.now());
 }
 
+// ── Command log: durable idempotency + audit for edge business commands ──────
+
+export interface CommandLogEntry {
+  id: number;
+  restaurant_id: string;
+  request_id: string;
+  command_type: string;
+  entity_type: string;
+  entity_id: string;
+  device_id: string | null;
+  command_ts: number;
+  expected_revision: number | null;
+  resulting_revision: number | null;
+  status: string;
+  response_json: string | null;
+  error_message: string | null;
+  applied_at: number;
+}
+
+export function lookupCommand(
+  restaurantId: string,
+  requestId: string,
+  commandType: string,
+): CommandLogEntry | null {
+  const db = getDb();
+  const row = db.query(
+    `SELECT * FROM command_log WHERE restaurant_id = ? AND request_id = ? AND command_type = ?`,
+  ).get(restaurantId, requestId, commandType) as CommandLogEntry | null;
+  return row ?? null;
+}
+
+export function recordCommand(entry: {
+  restaurant_id: string;
+  request_id: string;
+  command_type: string;
+  entity_type: string;
+  entity_id: string;
+  device_id?: string | null;
+  command_ts: number;
+  expected_revision?: number | null;
+  resulting_revision?: number | null;
+  status: "applied" | "rejected" | "failed";
+  response_json?: string | null;
+  error_message?: string | null;
+}): void {
+  const db = getDb();
+  db.query(
+    `INSERT INTO command_log
+      (restaurant_id, request_id, command_type, entity_type, entity_id, device_id,
+       command_ts, expected_revision, resulting_revision, status, response_json, error_message, applied_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(restaurant_id, request_id, command_type) DO UPDATE SET
+       entity_type = excluded.entity_type,
+       entity_id = excluded.entity_id,
+       device_id = excluded.device_id,
+       command_ts = excluded.command_ts,
+       expected_revision = excluded.expected_revision,
+       resulting_revision = excluded.resulting_revision,
+       status = excluded.status,
+       response_json = excluded.response_json,
+       error_message = excluded.error_message,
+       applied_at = excluded.applied_at`,
+  ).run(
+    entry.restaurant_id,
+    entry.request_id,
+    entry.command_type,
+    entry.entity_type,
+    entry.entity_id,
+    entry.device_id ?? null,
+    entry.command_ts,
+    entry.expected_revision ?? null,
+    entry.resulting_revision ?? null,
+    entry.status,
+    entry.response_json ?? null,
+    entry.error_message ?? null,
+    Date.now(),
+  );
+}
+
+// Returns the next monotonic revision for an entity, for use inside a transaction.
+// Reads the current revision and returns current+1; the caller must UPDATE the
+// row with the new value within the same transaction.
+export function nextTableRevision(tableId: string): number {
+  const db = getDb();
+  const row = db.query('SELECT revision FROM "table" WHERE id = ?').get(tableId) as { revision?: number } | null;
+  return (row?.revision ?? 0) + 1;
+}
+
+export function nextOrderRevision(orderId: string): number {
+  const db = getDb();
+  const row = db.query("SELECT revision FROM order_record WHERE id = ?").get(orderId) as { revision?: number } | null;
+  return (row?.revision ?? 0) + 1;
+}
+
 // ── Sync audit: persist permanent rejections/conflicts before dequeuing ──────
 
 export function insertSyncAudit(
@@ -835,13 +1012,13 @@ export function createPrintJob(job: {
   try {
     db.query(`INSERT INTO print_job
       (event_id, restaurant_id, order_id, kot_id, kot_number, table_id, printer_name, job_type, escpos_data, item_summary, captain_name, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
       ON CONFLICT(event_id) DO NOTHING`)
       .run(
         job.eventId, job.restaurantId, job.orderId, job.kotId || null, job.kotNumber || null,
         job.tableId || null, job.printerName, job.jobType,
         JSON.stringify(job.escposData), JSON.stringify(job.itemSummary || []),
-        job.captainName || null, now, now,
+        job.captainName || null, now, now, now,
       );
     const row = db.query("SELECT id FROM print_job WHERE event_id = ?").get(job.eventId) as { id: number } | undefined;
     return row?.id ?? null;
@@ -853,24 +1030,25 @@ export function createPrintJob(job: {
 
 export function updatePrintJobStatus(
   eventId: string,
-  status: "printing" | "printed" | "failed" | "needs_retry" | "dead_letter" | "cancelled",
+  status: "printing" | "printed" | "failed" | "retrying" | "dead_letter" | "cancelled",
   error?: string | null,
   ackedVia?: string | null,
 ): void {
   const db = getDb();
   const now = Date.now();
   const printedAt = status === "printed" ? now : null;
+  const failedAt = status === "failed" || status === "dead_letter" ? now : null;
   // Compute next_attempt_at for retryable statuses using exponential backoff
   let nextAttemptAt: number | null = null;
-  if (status === "needs_retry") {
+  if (status === "retrying") {
     // Get current attempt count to compute backoff
     const row = db.query("SELECT attempts FROM print_job WHERE event_id = ?").get(eventId) as { attempts: number } | undefined;
     const attempts = row?.attempts ?? 0;
     const backoffMs = Math.min(1000 * Math.pow(2, attempts), 60_000); // cap at 60s
     nextAttemptAt = now + backoffMs;
   }
-  db.query(`UPDATE print_job SET status = ?, last_error = ?, acked_via = COALESCE(?, acked_via), printed_at = COALESCE(?, printed_at), updated_at = ?, attempts = attempts + 1, next_attempt_at = COALESCE(?, next_attempt_at), lease_until = NULL WHERE event_id = ?`)
-    .run(status, error || null, ackedVia || null, printedAt, now, nextAttemptAt, eventId);
+  db.query(`UPDATE print_job SET status = ?, last_error = ?, acked_via = COALESCE(?, acked_via), printed_at = COALESCE(?, printed_at), failed_at = COALESCE(?, failed_at), updated_at = ?, attempts = attempts + 1, next_attempt_at = COALESCE(?, next_attempt_at), lease_until = NULL WHERE event_id = ?`)
+    .run(status, error || null, ackedVia || null, printedAt, failedAt, now, nextAttemptAt, eventId);
 }
 
 const PRINT_JOB_LEASE_MS = 30_000;
@@ -881,7 +1059,7 @@ export function claimPrintJob(eventId: string): boolean {
   const now = Date.now();
   const leaseUntil = now + PRINT_JOB_LEASE_MS;
   const result = db.query(
-    `UPDATE print_job SET status = 'printing', updated_at = ?, lease_until = ? WHERE event_id = ? AND status IN ('accepted', 'needs_retry') AND (next_attempt_at IS NULL OR next_attempt_at <= ?)`,
+    `UPDATE print_job SET status = 'printing', printing_at = ?, updated_at = ?, lease_until = ? WHERE event_id = ? AND status IN ('queued', 'retrying') AND (next_attempt_at IS NULL OR next_attempt_at <= ?)`,
   ).run(now, leaseUntil, eventId, now);
   return result.changes > 0;
 }
@@ -893,15 +1071,15 @@ export function reclaimStalePrintingJobs(): number {
   // updated_at heuristic (for jobs created before the lease_until column existed)
   const cutoff = now - PRINT_JOB_LEASE_MS;
   const result = db.query(
-    `UPDATE print_job SET status = 'accepted', updated_at = ?, lease_until = NULL
+    `UPDATE print_job SET status = 'queued', updated_at = ?, lease_until = NULL
      WHERE status = 'printing'
      AND (lease_until IS NOT NULL AND lease_until < ? OR lease_until IS NULL AND updated_at < ?)`,
   ).run(now, now, cutoff);
 
   // Transition jobs that exceeded max attempts to dead_letter
   const deadLetterResult = db.query(
-    `UPDATE print_job SET status = 'dead_letter', updated_at = ?
-     WHERE status = 'needs_retry' AND attempts >= ?`,
+    `UPDATE print_job SET status = 'dead_letter', failed_at = ?, updated_at = ?
+     WHERE status = 'retrying' AND attempts >= ?`,
   ).run(now, PRINT_JOB_MAX_ATTEMPTS);
   if (deadLetterResult.changes > 0) {
     console.warn(`[PrintQueue] ${deadLetterResult.changes} job(s) moved to dead_letter after ${PRINT_JOB_MAX_ATTEMPTS} attempts`);
@@ -916,7 +1094,7 @@ export function getPendingPrintJobs(limit = 50): any[] {
   // Only pick jobs that are ready for dispatch (next_attempt_at is null or in the past)
   return db.query(
     `SELECT * FROM print_job
-     WHERE status IN ('accepted', 'needs_retry')
+     WHERE status IN ('queued', 'retrying')
      AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
      ORDER BY id ASC LIMIT ?`
   ).all(now, limit) as any[];
@@ -938,7 +1116,7 @@ export function cancelPrintJob(eventId: string): boolean {
   const db = getDb();
   const now = Date.now();
   const result = db.query(
-    `UPDATE print_job SET status = 'cancelled', updated_at = ?, lease_until = NULL WHERE event_id = ? AND status IN ('accepted', 'needs_retry', 'dead_letter')`,
+    `UPDATE print_job SET status = 'cancelled', updated_at = ?, lease_until = NULL WHERE event_id = ? AND status IN ('queued', 'retrying', 'dead_letter')`,
   ).run(now, eventId);
   return result.changes > 0;
 }

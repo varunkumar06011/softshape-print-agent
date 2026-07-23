@@ -35,12 +35,21 @@
 //   POST /api/edge/sync/push    — manually trigger sync push
 //   POST /api/edge/sync/retry   — retry dead-lettered records
 //   GET  /api/edge/sync/socket  — socket connection status
+//   GET  /api/edge/update-check — Runtime update status (Host polls this)
+//   GET  /api/edge/drivers      — list all drivers and their health
+//   POST /api/edge/drivers/reload — hot-reload external plugins
+//   GET  /runtime/status        — Runtime status (§1.1)
+//   POST /runtime/restart       — restart Runtime (admin-only, §1.1)
+//   POST /runtime/rotate-token  — rotate runtime token (admin-only, §5.3)
+//   GET  /devices               — list all devices (§1.6)
+//   GET  /devices/printers      — list available printers (§1.6)
+//   WS   /events                — Runtime event bus (§3)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enqueueSync, getRecoveryStatus, updatePrintJobStatus, getPendingPrintJobs, getOrderSyncStatus, getPrintJobByEventId, cancelPrintJob, reprintPrintJob, getPrintJobsByOrder, insertSyncAudit, getSyncAuditRecords } from "./db.ts";
 import os from "os";
 import { runDailyMaintenance, runPeriodicBackup } from "./backup.ts";
-import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
+import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getSessionToken, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { downloadFullConfig, pullIncrementalChanges } from "./config.ts";
 import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders } from "./reads.ts";
@@ -48,7 +57,20 @@ import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDe
 import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode, relayPrintViaCloud } from "./socketSync.ts";
 import { acquireInstanceLock, startHeartbeatLoop, stopHeartbeatLoop, releaseInstanceLock, forceReleaseLock, getLockStatus } from "./instanceLock.ts";
 import { cloudFetch } from "./cloudFetch.ts";
-import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount, getPrintingClientCount, setClientCapability, lanBroadcast, broadcastPrintJob, resolvePrintAck, waitForPrintAck } from "./lanBroadcast.ts";
+import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount, getPrintingClientCount, setClientCapability, lanBroadcast } from "./lanBroadcast.ts";
+import { printToPrinter } from "./printer.ts";
+import { startPrintService, stopPrintService, isPrintServiceReady, getPrintServiceStatus, sendToPrintService, listPrintersViaService } from "./printServiceManager.ts";
+import { deviceManager } from "./drivers/manager.ts";
+import { PrinterDriver } from "./drivers/printer/index.ts";
+import { PaymentDriver } from "./drivers/payment/index.ts";
+import { BarcodeDriver } from "./drivers/barcode/index.ts";
+import { ScaleDriver } from "./drivers/scale/index.ts";
+import { DisplayDriver } from "./drivers/display/index.ts";
+import { loadPlugins, reloadPlugins, getLoadedPlugins } from "./drivers/pluginLoader.ts";
+import { getOrCreateRuntimeToken, validateRuntimeToken, rotateRuntimeToken, PUBLIC_PATHS } from "./contract/auth.ts";
+import { registerEventClient, handleEventMessage, unregisterEventClient, emitEvent, getEventClientCount, getAuthenticatedClientCount } from "./eventBus.ts";
+import { EVENT_NAMES } from "./contract/events.ts";
+import { runtimeLog } from "./contract/logger.ts";
 import { hashSync } from "bcryptjs";
 
 const PORT = parseInt(process.env.EDGE_PORT || "3101", 10);
@@ -145,13 +167,25 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     }
   }
 
+  // ── Runtime token auth (§5 of platform contract) ────────────────────────────
+  // Every non-public request must carry a valid Bearer token.
+  // The token is generated on first boot and stored in edge_config.
+  // During onboarding (before setup completes), token enforcement is relaxed
+  // so the initial pairing flow can proceed.
+  if (!PUBLIC_PATHS.has(url.pathname) && isLocalReady()) {
+    const authHeader = req.headers.get("Authorization");
+    if (!validateRuntimeToken(authHeader)) {
+      return errorResponse("Missing or invalid runtime token", 401);
+    }
+  }
+
   // ── GET /health ─────────────────────────────────────────────────────────────
   if (url.pathname === "/health" && req.method === "GET") {
     if (startupState !== "ready") {
       return jsonResponse({
         status: startupState === "error" ? "error" : "initializing",
         service: "softshape-edge-server",
-        version: "22.7.0",
+        version: "22.8.0",
         uptime: process.uptime(),
         error: startupError || null,
       });
@@ -184,10 +218,10 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       const db = getDb();
       const summary = db.query(`
         SELECT
-          SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END) as accepted,
+          SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) as queued,
           SUM(CASE WHEN status = 'printing' THEN 1 ELSE 0 END) as printing,
           SUM(CASE WHEN status = 'printed' THEN 1 ELSE 0 END) as printed,
-          SUM(CASE WHEN status = 'needs_retry' THEN 1 ELSE 0 END) as needs_retry,
+          SUM(CASE WHEN status = 'retrying' THEN 1 ELSE 0 END) as retrying,
           SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
           SUM(CASE WHEN status = 'dead_letter' THEN 1 ELSE 0 END) as dead_letter,
           SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelled
@@ -199,7 +233,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse({
       status: "ok",
       service: "softshape-edge-server",
-      version: "22.7.0",
+      version: "22.8.0",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
@@ -219,13 +253,65 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         lastSyncAt: syncMetrics.lastSyncAt,
       } : null,
       printQueue: printMetrics,
+      printService: getPrintServiceStatus(),
+      drivers: deviceManager.getDeviceHealths(),
     });
   }
 
-  // ── POST /print — relay print job to Tauri frontend via LAN WebSocket ───────
+  // ── GET /runtime/status — Runtime status (§1.1) ─────────────────────────────
+  if (url.pathname === "/runtime/status" && req.method === "GET") {
+    const printStatus = getPrintServiceStatus();
+    const syncStatus = getSocketStatus();
+    return jsonResponse({
+      running: true,
+      ready: startupState === "ready",
+      state: startupState === "ready" ? "READY" : startupState === "error" ? "CRASH_LOOP" : "STARTING",
+      services: {
+        printService: { pid: printStatus.pid, state: printStatus.state },
+        sync: { state: syncStatus.connected ? "CONNECTED" : "DISCONNECTED" },
+      },
+      lastError: startupError || null,
+    });
+  }
+
+  // ── POST /runtime/restart — Restart the Runtime (§1.1, admin-only) ──────────
+  if (url.pathname === "/runtime/restart" && req.method === "POST") {
+    // Graceful shutdown — the Host will respawn the Runtime
+    runtimeLog.info("Runtime restart requested via API");
+    setTimeout(() => {
+      try { stopSocketSync(); } catch {}
+      try { stopSyncWorker(); } catch {}
+      try { stopHeartbeat(); } catch {}
+      try { stopHeartbeatLoop(); } catch {}
+      try { releaseInstanceLock(); } catch {}
+      process.exit(0);
+    }, 500);
+    return jsonResponse({ ok: true });
+  }
+
+  // ── POST /runtime/rotate-token — Rotate the runtime token (§1.1, §5.3) ──────
+  if (url.pathname === "/runtime/rotate-token" && req.method === "POST") {
+    const newToken = rotateRuntimeToken();
+    runtimeLog.info("Runtime token rotated via API");
+    return jsonResponse({ ok: true, token: newToken });
+  }
+
+  // ── GET /devices — list all devices and their health (§1.6) ─────────────────
+  if (url.pathname === "/devices" && req.method === "GET") {
+    return jsonResponse({ devices: deviceManager.getDeviceHealths() });
+  }
+
+  // ── GET /devices/printers — list available printers (§1.6) ──────────────────
+  if (url.pathname === "/devices/printers" && req.method === "GET") {
+    const printers = await listPrintersViaService();
+    return jsonResponse({ printers });
+  }
+
+  // ── POST /print — relay print job to cashier-desktop print bridge ───────────
   // This is the fast LAN print path for Captain apps on the same network.
-  // The Captain POSTs ESC/POS data directly to the edge server, which broadcasts
-  // via WebSocket to the connected Tauri frontend (cashier) for physical printing.
+  // The Captain POSTs ESC/POS data to the edge server, which forwards it to
+  // the cashier-desktop print bridge (HTTP POST to port 3102) for physical
+  // printing. If the bridge is unreachable, falls back to cloud relay.
   // No auth required — this is a LAN-only endpoint (edge server binds to 0.0.0.0
   // but is typically behind a firewall/router on the local network).
   if (url.pathname === "/print" && req.method === "POST") {
@@ -238,10 +324,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     }
 
     const targetPrinter = printerName || data?.printerName || null;
-    // Don't reject if printerName is missing — the Tauri frontend will resolve
-    // it from its local printer mapping (kitchen/bar/bill dropdowns).
 
-    // Normalize ESC/POS data to the format the Tauri frontend expects
+    // Normalize ESC/POS data to the format the print bridge expects
     let normalizedEscpos = escposData;
     if (!normalizedEscpos && bytes) {
       // Legacy format: convert raw bytes to escposData structure
@@ -254,42 +338,29 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       return jsonResponse({ ok: false, error: "Missing print payload (escposData, bytes, or text required)" }, 400);
     }
 
-    const clientCount = getPrintingClientCount();
-    if (clientCount === 0) {
-      const printEventId = eventId || `${effectiveType}-${Date.now()}`;
-      const relayed = relayPrintViaCloud({
-        type: effectiveType,
-        data: { printerName: targetPrinter, escposData: normalizedEscpos, requestId: data?.requestId || null },
-        eventId: printEventId,
-      });
-      if (relayed) {
-        console.log(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} via cloud fallback (no printing clients)`);
-        return jsonResponse({ ok: true, queued: false, clients: 0, method: "cloud_relay", eventId: printEventId });
-      }
-      return jsonResponse({ ok: false, error: "No printing-capable LAN WebSocket clients connected and cloud socket not available", queued: false }, 503);
-    }
-
     const printEventId = eventId || `${effectiveType}-${Date.now()}`;
-    broadcastPrintJob("print_job", {
-      type: effectiveType,
-      data: {
-        printerName: targetPrinter,
-        escposData: normalizedEscpos,
-        requestId: data?.requestId || null,
-      },
-      eventId: printEventId,
-      ts: Date.now(),
-    });
 
-    // Wait for print_ack from Tauri frontend (with 10s timeout)
-    const ack = await waitForPrintAck(printEventId, 20000);
-    if (ack.ok) {
-      console.log(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} ✓ (${clientCount} client(s))`);
-      return jsonResponse({ ok: true, queued: false, clients: clientCount });
-    } else {
-      console.warn(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} FAILED: ${ack.error}`);
-      return jsonResponse({ ok: false, error: ack.error || "Print failed", queued: false }, 502);
+    // Try the print service first (isolated Rust process on :3103)
+    if (targetPrinter) {
+      const result = await printToPrinter(targetPrinter, normalizedEscpos, printEventId, effectiveType);
+      if (result.ok) {
+        console.log(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} ✓ (print service)`);
+        return jsonResponse({ ok: true, queued: false, method: "print_service", eventId: printEventId });
+      }
+      console.warn(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} print service failed: ${result.error} — trying cloud relay`);
     }
+
+    // Fallback: relay via cloud WebSocket socket
+    const relayed = relayPrintViaCloud({
+      type: effectiveType,
+      data: { printerName: targetPrinter, escposData: normalizedEscpos, requestId: data?.requestId || null },
+      eventId: printEventId,
+    });
+    if (relayed) {
+      console.log(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} via cloud fallback`);
+      return jsonResponse({ ok: true, queued: false, method: "cloud_relay", eventId: printEventId });
+    }
+    return jsonResponse({ ok: false, error: "Print service unavailable and cloud socket not available", queued: false }, 503);
   }
 
   // ── GET /api/edge/status ────────────────────────────────────────────────────
@@ -526,6 +597,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       localPrinted: body.localPrinted || false,
       preReservedKotNumber: body.preReservedKotNumber ?? null,
       kotEventIds: body.kotEventIds || null,
+      deviceId: body.deviceId,
+      expectedRevision: body.expectedRevision,
     });
 
     if (!result.success) {
@@ -564,6 +637,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       localPrinted: body.localPrinted || false,
       preReservedKotNumber: body.preReservedKotNumber ?? null,
       kotEventIds: body.kotEventIds || null,
+      deviceId: body.deviceId,
+      expectedRevision: body.expectedRevision,
     });
 
     if (!result.success) {
@@ -594,6 +669,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       tableNumber: body.tableNumber,
       requestId: body.requestId,
       localPrinted: body.localPrinted || false,
+      deviceId: body.deviceId,
+      expectedRevision: body.expectedRevision,
     });
 
     if (!result.success) {
@@ -613,6 +690,25 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     const items = body.items || [];
     if (!items.length) return errorResponse("No items to cancel", 400);
 
+    // Pre-validate all items before cancelling any to prevent partial state.
+    // If any item is invalid (order/item not found), reject the entire batch
+    // so the caller can correct and retry without inconsistent DB state.
+    const db = getDb();
+    const order = db.query("SELECT id FROM order_record WHERE id = ? AND restaurant_id = ?").get(body.orderId, restaurantId) as any;
+    if (!order) return errorResponse("Order not found", 404);
+
+    for (const item of items) {
+      const orderItem = db.query("SELECT id, quantity, cancelled_quantity FROM order_item WHERE id = ? AND order_id = ?").get(item.orderItemId, body.orderId) as any;
+      if (!orderItem) {
+        return errorResponse(`Order item ${item.orderItemId} not found — no items were cancelled`, 404);
+      }
+      const qtyToCancel = item.cancelQuantity || 1;
+      const newCancelledQty = (orderItem.cancelled_quantity || 0) + qtyToCancel;
+      if (newCancelledQty > orderItem.quantity) {
+        return errorResponse(`Cannot cancel ${qtyToCancel} of item ${item.orderItemId} — exceeds remaining quantity. No items were cancelled.`, 400);
+      }
+    }
+
     const results = [];
     for (const item of items) {
       const result = await cancelKotItem({
@@ -624,6 +720,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         tableNumber: body.tableNumber,
         requestId: body.requestId,
         localPrinted: body.localPrinted || false,
+        deviceId: body.deviceId,
+        expectedRevision: body.expectedRevision,
       });
       results.push({ orderItemId: item.orderItemId, success: result.success, error: result.error });
     }
@@ -671,7 +769,11 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     const body = await req.json().catch(() => ({}));
     const restaurantId = getRestaurantId();
     if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
-    const result = await requestBillingEdge(restaurantId, body.orderId);
+    const result = await requestBillingEdge(restaurantId, body.orderId, {
+      requestId: body.requestId,
+      deviceId: body.deviceId,
+      expectedRevision: body.expectedRevision,
+    });
     if (!result.success) return errorResponse(result.error || "Request billing failed", 400);
     return jsonResponse(result);
   }
@@ -690,6 +792,9 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       kotNumbers: body.kotNumbers,
       localPrinted: body.localPrinted,
       billEventId: body.billEventId,
+      requestId: body.requestId,
+      deviceId: body.deviceId,
+      expectedRevision: body.expectedRevision,
     });
     if (!result.success) return errorResponse(result.error || "Print bill failed", 400);
     return jsonResponse(result);
@@ -707,6 +812,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       await editBillEdge(restaurantId, body.orderId, {
         removedItemIds: body.removedItemIds,
         editedBy: body.removedBy || "Cashier",
+        meta: { requestId: body.requestId, deviceId: body.deviceId, expectedRevision: body.expectedRevision },
       });
     }
 
@@ -728,6 +834,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       roundOff: body.roundOff,
       localTxnId: body.localTxnId,
       requestId: body.requestId,
+      deviceId: body.deviceId,
+      expectedRevision: body.expectedRevision,
     });
     if (!result.success) return errorResponse(result.error || "Settle failed", 400);
     return jsonResponse(result);
@@ -739,7 +847,11 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     const body = await req.json().catch(() => ({}));
     const restaurantId = getRestaurantId();
     if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
-    const result = await swapTableEdge(restaurantId, body.sourceTableId, body.targetTableId, body.swappedBy || "Cashier");
+    const result = await swapTableEdge(restaurantId, body.sourceTableId, body.targetTableId, body.swappedBy || "Cashier", {
+      requestId: body.requestId,
+      deviceId: body.deviceId,
+      expectedRevision: body.expectedRevision,
+    });
     if (!result.success) return errorResponse(result.error || "Swap failed", 400);
     return jsonResponse(result);
   }
@@ -750,7 +862,11 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     const body = await req.json().catch(() => ({}));
     const restaurantId = getRestaurantId();
     if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
-    const result = await transferItemsEdge(restaurantId, body.sourceTableId, body.targetTableId, body.orderItemIds || [], body.transferredBy || "Cashier");
+    const result = await transferItemsEdge(restaurantId, body.sourceTableId, body.targetTableId, body.orderItemIds || [], body.transferredBy || "Cashier", {
+      requestId: body.requestId,
+      deviceId: body.deviceId,
+      expectedRevision: body.expectedRevision,
+    });
     if (!result.success) return errorResponse(result.error || "Transfer failed", 400);
     return jsonResponse(result);
   }
@@ -766,6 +882,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       editQuantities: body.editQuantities,
       addedItems: body.addedItems,
       editedBy: body.editedBy,
+      meta: { requestId: body.requestId, deviceId: body.deviceId, expectedRevision: body.expectedRevision },
     });
     if (!result.success) return errorResponse(result.error || "Edit bill failed", 400);
     return jsonResponse(result);
@@ -784,6 +901,10 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       tipAmount: body.tipAmount,
       cashTipAmount: body.cashTipAmount,
       cardTipAmount: body.cardTipAmount,
+    }, {
+      requestId: body.requestId,
+      deviceId: body.deviceId,
+      expectedRevision: body.expectedRevision,
     });
     if (!result.success) return errorResponse(result.error || "Confirm payment failed", 400);
     return jsonResponse(result);
@@ -795,7 +916,11 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     const body = await req.json().catch(() => ({}));
     const restaurantId = getRestaurantId();
     if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
-    const result = await updateOrderStatusEdge(restaurantId, body.orderId, body.status);
+    const result = await updateOrderStatusEdge(restaurantId, body.orderId, body.status, {
+      requestId: body.requestId,
+      deviceId: body.deviceId,
+      expectedRevision: body.expectedRevision,
+    });
     if (!result.success) return errorResponse(result.error || "Status update failed", 400);
     return jsonResponse(result);
   }
@@ -806,7 +931,11 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     const body = await req.json().catch(() => ({}));
     const restaurantId = getRestaurantId();
     if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
-    const result = await markOrderPaidEdge(restaurantId, body.orderId, body.paymentMethod || "CASH");
+    const result = await markOrderPaidEdge(restaurantId, body.orderId, body.paymentMethod || "CASH", {
+      requestId: body.requestId,
+      deviceId: body.deviceId,
+      expectedRevision: body.expectedRevision,
+    });
     if (!result.success) return errorResponse(result.error || "Mark paid failed", 400);
     return jsonResponse(result);
   }
@@ -817,7 +946,11 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     const body = await req.json().catch(() => ({}));
     const restaurantId = getRestaurantId();
     if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
-    const result = await saveTransactionEdge(restaurantId, body);
+    const result = await saveTransactionEdge(restaurantId, body, {
+      requestId: body.requestId,
+      deviceId: body.deviceId,
+      expectedRevision: body.expectedRevision,
+    });
     if (!result.success) return errorResponse(result.error || "Save transaction failed", 400);
     return jsonResponse(result);
   }
@@ -872,6 +1005,24 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     const workflowStatus = body.status ?? existing.workflow_status ?? "Free";
     const isFree = workflowStatus === "Free";
 
+    // Phase 0 data-loss hotfix: a client-supplied Free state must not destroy live
+    // KOTs. Only allow the Free transition when the table is server-authoritatively
+    // terminal (no active orders). If active orders exist, the caller must use the
+    // explicit DELETE /api/edge/table/:id/session route (which cancels orders
+    // transactionally) or settle the order first. This prevents stale client UI
+    // state from wiping kot_history and KOT rows.
+    if (isFree) {
+      const activeOrders = db.query(
+        `SELECT id FROM order_record WHERE table_id = ? AND restaurant_id = ? AND status NOT IN ('SETTLED', 'CANCELLED') AND is_deleted = 0`
+      ).all(tableId, restaurantId) as any[];
+      if (activeOrders.length > 0) {
+        return errorResponse(
+          `Cannot free table with ${activeOrders.length} active order(s); use DELETE /api/edge/table/:id/session or settle first`,
+          409,
+        );
+      }
+    }
+
     // Cloud maps workflowStatus to table.status the same way it maps to backend status
     const backendStatus = (() => {
       switch (workflowStatus) {
@@ -909,36 +1060,46 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     }
 
     const now = Date.now();
-    db.query(`UPDATE "table" SET
-      status = ?,
-      workflow_status = ?,
-      captain_id = ?,
-      guests = ?,
-      session_started_at = ?,
-      current_bill = ?,
-      kot_history = ?,
-      updated_at = ?
-      WHERE id = ? AND restaurant_id = ?
-    `).run(
-      backendStatus,
-      workflowStatus,
-      isFree ? null : (body.captainId ?? existing.captain_id ?? null),
-      isFree ? 0 : (body.guests ?? existing.guests ?? 0),
-      sessionStartedAt,
-      isFree ? 0 : (body.currentBill ?? existing.current_bill ?? 0),
-      isFree ? "[]" : existing.kot_history,
-      now,
-      tableId,
-      restaurantId,
-    );
+    let newTableRev = existing.revision ?? 1;
+    const applySessionUpdate = db.transaction(() => {
+      newTableRev = ((db.query('SELECT revision FROM "table" WHERE id = ?').get(tableId) as { revision?: number } | null)?.revision ?? 0) + 1;
+      db.query(`UPDATE "table" SET
+        status = ?,
+        workflow_status = ?,
+        captain_id = ?,
+        guests = ?,
+        session_started_at = ?,
+        current_bill = ?,
+        kot_history = ?,
+        revision = ?,
+        last_command_id = ?,
+        updated_at = ?
+        WHERE id = ? AND restaurant_id = ?
+      `).run(
+        backendStatus,
+        workflowStatus,
+        isFree ? null : (body.captainId ?? existing.captain_id ?? null),
+        isFree ? 0 : (body.guests ?? existing.guests ?? 0),
+        sessionStartedAt,
+        isFree ? 0 : (body.currentBill ?? existing.current_bill ?? 0),
+        isFree ? "[]" : existing.kot_history,
+        newTableRev,
+        body.requestId ?? null,
+        now,
+        tableId,
+        restaurantId,
+      );
 
-    // Terminating a session clears live KOTs (same as cloud)
-    if (isFree) {
-      db.query("DELETE FROM kot WHERE table_id = ?").run(tableId);
-    }
+      // Terminating a session clears live KOTs (same as cloud). Safe because the
+      // Phase 0 guard above already rejected Free when active orders exist.
+      if (isFree) {
+        db.query("DELETE FROM kot WHERE table_id = ?").run(tableId);
+      }
+    });
+    applySessionUpdate();
 
     enqueueSync("table", tableId, "update");
-    return jsonResponse({ success: true, id: tableId });
+    return jsonResponse({ success: true, id: tableId, revision: newTableRev });
   }
 
   // ── DELETE /api/edge/table/:id/session — terminate table session ───────────
@@ -964,17 +1125,19 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     ).all(tableId, restaurantId) as any[];
 
     const tx = db.transaction(() => {
-      // 1. Cancel all active orders
+      // 1. Cancel all active orders + increment order revisions
       for (const order of activeOrders) {
-        db.query("UPDATE order_record SET status = 'CANCELLED', updated_at = ? WHERE id = ?")
-          .run(now, order.id);
+        const orderRev = ((db.query("SELECT revision FROM order_record WHERE id = ?").get(order.id) as { revision?: number } | null)?.revision ?? 0) + 1;
+        db.query("UPDATE order_record SET status = 'CANCELLED', updated_at = ?, revision = ? WHERE id = ?")
+          .run(now, orderRev, order.id);
         // Delete order items
         db.query("DELETE FROM order_item WHERE order_id = ?").run(order.id);
         // Enqueue sync for the cancelled order
         enqueueSync("order", order.id, "update");
       }
 
-      // 2. Reset table to Free
+      // 2. Reset table to Free + increment table revision
+      const tableRev = ((db.query('SELECT revision FROM "table" WHERE id = ?').get(tableId) as { revision?: number } | null)?.revision ?? 0) + 1;
       db.query(`UPDATE "table" SET
         status = 'AVAILABLE',
         workflow_status = 'Free',
@@ -984,24 +1147,30 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
         current_bill = 0,
         kot_history = '[]',
         discount = NULL,
+        revision = ?,
+        last_command_id = ?,
         updated_at = ?
         WHERE id = ? AND restaurant_id = ?
-      `).run(now, tableId, restaurantId);
+      `).run(tableRev, null, now, tableId, restaurantId);
 
       // 3. Clear KOTs for this table
       db.query("DELETE FROM kot WHERE table_id = ?").run(tableId);
 
       // 4. Enqueue table sync
       enqueueSync("table", tableId, "update");
+
+      return { tableRev };
     });
 
+    let tableRev = existing.revision ?? 1;
     try {
-      tx();
+      const txResult = tx();
+      tableRev = (txResult as any)?.tableRev ?? tableRev;
     } catch (err: any) {
       return errorResponse(`Terminate failed: ${err.message}`, 500);
     }
 
-    return jsonResponse({ success: true, id: tableId, cancelledOrders: activeOrders.length });
+    return jsonResponse({ success: true, id: tableId, revision: tableRev, cancelledOrders: activeOrders.length });
   }
 
   // ── GET /api/edge/sections — sections with venue + floor info ──────────────
@@ -1286,6 +1455,75 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse(getSocketStatus());
   }
 
+  // ── GET /api/edge/drivers — list all drivers and their health (Phase 6) ────
+  if (url.pathname === "/api/edge/drivers" && req.method === "GET") {
+    return jsonResponse({
+      drivers: deviceManager.getDeviceHealths(),
+      plugins: getLoadedPlugins(),
+      initialized: deviceManager.isInitialized(),
+    });
+  }
+
+  // ── POST /api/edge/drivers/reload — hot-reload plugins (Phase 6) ──────────
+  if (url.pathname === "/api/edge/drivers/reload" && req.method === "POST") {
+    try {
+      const result = await reloadPlugins();
+      return jsonResponse({
+        ok: true,
+        loaded: result.loaded,
+        errors: result.errors,
+        removed: result.removed,
+        drivers: deviceManager.getDeviceHealths(),
+      });
+    } catch (err: any) {
+      return errorResponse(`Plugin reload failed: ${err?.message || err}`, 500);
+    }
+  }
+
+  // ── GET /api/edge/update-check — Runtime update status (Phase 5) ───────────
+  // The Runtime Host polls this endpoint hourly to check if a new Runtime
+  // binary is available. The Runtime checks the cloud's update manifest and
+  // returns the download URL if an update exists. The Host handles the
+  // download, binary swap, and restart.
+  if (url.pathname === "/api/edge/update-check" && req.method === "GET") {
+    const currentVersion = "22.8.0";
+    const backendUrl = getBackendUrl();
+    const sessionToken = getSessionToken();
+
+    if (!backendUrl || !sessionToken) {
+      return jsonResponse({
+        version: currentVersion,
+        updateAvailable: false,
+      });
+    }
+
+    try {
+      const resp = await cloudFetch(
+        `${backendUrl}/api/edge/runtime-update-check?currentVersion=${encodeURIComponent(currentVersion)}`,
+        {
+          method: "GET",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${sessionToken}`,
+          },
+        },
+      );
+      const data = await resp.json();
+      return jsonResponse({
+        version: currentVersion,
+        updateAvailable: !!data.updateAvailable,
+        downloadUrl: data.downloadUrl || null,
+        latestVersion: data.version || null,
+      });
+    } catch (err) {
+      return jsonResponse({
+        version: currentVersion,
+        updateAvailable: false,
+        error: "Failed to check for updates",
+      });
+    }
+  }
+
   // ── GET /api/edge/order/:id/sync-status — per-order cloud sync status ──────
   // Returns whether the order's sync_queue entries have been pushed to cloud.
   // The captain uses this to decide when it's safe to remove the action from
@@ -1324,8 +1562,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     }
 
     const summary = {
-      accepted: (db.query("SELECT COUNT(*) as c FROM print_job WHERE status = 'accepted'").get() as any)?.c || 0,
-      needs_retry: (db.query("SELECT COUNT(*) as c FROM print_job WHERE status = 'needs_retry'").get() as any)?.c || 0,
+      queued: (db.query("SELECT COUNT(*) as c FROM print_job WHERE status = 'queued'").get() as any)?.c || 0,
+      retrying: (db.query("SELECT COUNT(*) as c FROM print_job WHERE status = 'retrying'").get() as any)?.c || 0,
       printed: (db.query("SELECT COUNT(*) as c FROM print_job WHERE status = 'printed'").get() as any)?.c || 0,
       failed: (db.query("SELECT COUNT(*) as c FROM print_job WHERE status = 'failed'").get() as any)?.c || 0,
       dead_letter: (db.query("SELECT COUNT(*) as c FROM print_job WHERE status = 'dead_letter'").get() as any)?.c || 0,
@@ -1685,6 +1923,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     const now = Date.now();
     updates.push("updated_at = ?"); values.push(now);
+    // Increment revision for optimistic concurrency tracking
+    updates.push("revision = (SELECT revision FROM \"table\" WHERE id = ?) + 1"); values.push(tableId);
     values.push(tableId);
     db.query(`UPDATE "table" SET ${updates.join(", ")} WHERE id = ? AND restaurant_id = ?`).run(...values, restaurantId);
 
@@ -1692,9 +1932,10 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       db.query("DELETE FROM kot WHERE table_id = ?").run(tableId);
     }
 
+    const updatedRow = db.query('SELECT revision FROM "table" WHERE id = ?').get(tableId) as { revision?: number } | null;
     enqueueSync("table", tableId, "update");
 
-    return jsonResponse({ success: true, id: tableId });
+    return jsonResponse({ success: true, id: tableId, revision: updatedRow?.revision ?? 1 });
   }
 
   // ── POST /api/edge/admin/table — create table ───────────────────────────────
@@ -1722,8 +1963,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     const db = getDb();
     const restaurantId = getRestaurantId();
-    db.query("UPDATE \"table\" SET status = 'REMOVED', workflow_status = 'Removed' WHERE id = ? AND restaurant_id = ?")
-      .run(tableId, restaurantId);
+    db.query("UPDATE \"table\" SET status = 'REMOVED', workflow_status = 'Removed', revision = (SELECT revision FROM \"table\" WHERE id = ?) + 1 WHERE id = ? AND restaurant_id = ?")
+      .run(tableId, tableId, restaurantId);
     enqueueSync("table", tableId, "update");
 
     return jsonResponse({ success: true, id: tableId });
@@ -1794,7 +2035,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
     const now = Date.now();
     for (const t of toDelete) {
-      db.query("UPDATE \"table\" SET status = 'REMOVED', workflow_status = 'Removed', updated_at = ? WHERE id = ?")
+      db.query("UPDATE \"table\" SET status = 'REMOVED', workflow_status = 'Removed', revision = revision + 1, updated_at = ? WHERE id = ?")
         .run(now, t.id);
       enqueueSync("table", t.id, "update");
     }
@@ -1979,56 +2220,39 @@ process.on("unhandledRejection", (reason: any) => {
 
 // ── Start server ──────────────────────────────────────────────────────────────
 
-const server = Bun.serve({
+const server = Bun.serve<{ eventBus?: boolean }>({
   port: PORT,
   hostname: "0.0.0.0", // Listen on all interfaces for LAN access
   websocket: {
     open(ws) {
-      registerClient(ws);
+      if (ws.data?.eventBus) {
+        registerEventClient(ws);
+      } else {
+        registerClient(ws);
+      }
     },
     message(ws, message) {
+      if (ws.data?.eventBus) {
+        handleEventMessage(ws as any, message.toString());
+        return;
+      }
       try {
         const data = JSON.parse(message.toString());
         if (data.type === "ping") {
           ws.send(JSON.stringify({ type: "pong", ts: Date.now() }));
         } else if (data.type === "register") {
-          // Client declares its capabilities on connect.
-          // Tauri desktops send { type: "register", canPrint: true }
-          // Captain web/APK sends { type: "register", canPrint: false }
           setClientCapability(ws, data.canPrint === true);
-        } else if (data.type === "print_ack") {
-          // Tauri frontend confirms print success/failure
-          const ok = data.ok === true;
-          const eventId = data.eventId;
-          if (!eventId) {
-            console.warn("[EdgeWS] print_ack missing eventId — ignoring");
-          } else {
-            // Validate: check that the print_job exists and is in 'printing' state.
-            // This prevents rogue/unauthorized clients from marking arbitrary jobs.
-            const job = getPrintJobByEventId(eventId);
-            if (job && job.status !== "printing") {
-              console.warn(`[EdgeWS] print_ack for ${eventId} rejected — job status is '${job.status}', expected 'printing'`);
-            } else {
-              resolvePrintAck(eventId, ok, data.error);
-              // Also update the durable print_job table so the dispatch loop
-              // and diagnostics endpoint reflect the actual print status.
-              try {
-                updatePrintJobStatus(
-                  eventId,
-                  ok ? "printed" : "needs_retry",
-                  ok ? null : (data.error || "Print failed"),
-                  "lan_ws",
-                );
-              } catch { /* print_job row may not exist for legacy /print endpoint */ }
-            }
-          }
         }
       } catch {
         // Ignore non-JSON messages
       }
     },
     close(ws) {
-      unregisterClient(ws);
+      if (ws.data?.eventBus) {
+        unregisterEventClient(ws as any);
+      } else {
+        unregisterClient(ws);
+      }
     },
     drain(ws) {
       // Backpressure relief — nothing to do for small event payloads
@@ -2039,8 +2263,19 @@ const server = Bun.serve({
 
     // ── WebSocket upgrade for LAN real-time events (Bug 2 fix) ────────────────
     if (url.pathname === "/ws" && req.method === "GET") {
-      if (server.upgrade(req)) {
+      if (server.upgrade(req, { data: { eventBus: false } })) {
         return; // upgrade succeeded — Bun will call websocket.open
+      }
+      return errorResponse("WebSocket upgrade failed", 400);
+    }
+
+    // ── WebSocket upgrade for Runtime event bus (§3 of platform contract) ─────
+    // Clients connect to ws://localhost:3101/events and send an auth message:
+    // { "type": "auth", "token": "<runtime-token>" }
+    // After auth, they receive all RuntimeEvent broadcasts.
+    if (url.pathname === "/events" && req.method === "GET") {
+      if (server.upgrade(req, { data: { eventBus: true } })) {
+        return;
       }
       return errorResponse("WebSocket upgrade failed", 400);
     }
@@ -2061,11 +2296,39 @@ console.log(`[EdgeServer] WebSocket: ws://0.0.0.0:${server.port}/ws`);
 // Initialize LAN broadcast layer
 initLanBroadcast();
 
+// ── Start the isolated print service (Phase 2) ───────────────────────────────
+// The print service is a headless Rust process on :3103 that handles all
+// physical printing. The Runtime supervises it via supervisor.ts.
+// If the executable is not found (e.g. during development), printing falls
+// back to the legacy Tauri/HTTP bridge path.
+startPrintService();
+
+// ── Register built-in drivers with the Device Manager (Phase 6) ──────────────
+// The printer driver delegates to the print service on :3103.
+// Other drivers are stubs that return OFFLINE until real implementations exist.
+deviceManager.register(new PrinterDriver());
+deviceManager.register(new PaymentDriver());
+deviceManager.register(new BarcodeDriver());
+deviceManager.register(new ScaleDriver());
+deviceManager.register(new DisplayDriver());
+
+// Initialize all drivers (async, non-blocking)
+deviceManager.initializeAll().catch(err => {
+  console.warn("[Drivers] Driver initialization failed (non-fatal):", err);
+});
+
+// ── Load external plugins (Phase 6) ──────────────────────────────────────────
+// Scans drivers/plugins/ for external .ts/.js files implementing the Driver
+// interface. Plugins are registered alongside built-in drivers.
+loadPlugins().catch(err => {
+  console.warn("[Plugins] Plugin loading failed (non-fatal):", err);
+});
+
 // ── Background print dispatch loop ────────────────────────────────────────────
-// Every 5 seconds, pick up print_job rows in 'accepted' or 'needs_retry' status
+// Every 5 seconds, pick up print_job rows in 'queued' or 'retrying' status
 // and re-dispatch them. This handles:
-//   - Jobs created while no Tauri frontend was connected (cashier was closed)
-//   - Jobs that failed print_ack (printer offline, paper jam) — retried when fixed
+//   - Jobs created while the print bridge was unreachable (cashier was closed)
+//   - Jobs that failed print (printer offline, paper jam) — retried when fixed
 //   - Jobs from crashed edge server sessions (recovered from SQLite on restart)
 // Per-printer serialization is enforced inside dispatchPendingPrintJobs.
 setInterval(async () => {
@@ -2079,6 +2342,30 @@ setInterval(async () => {
     console.warn("[PrintDispatch] Background dispatch failed:", err);
   }
 }, 5_000);
+
+// ── Periodic driver health check (Phase 6) ───────────────────────────────────
+// Every 10 seconds, check all drivers for state transitions. Logs transitions
+// to runtime.log and emits device.state_changed events via WebSocket (§3).
+setInterval(() => {
+  try {
+    const transitions = deviceManager.checkTransitions();
+    for (const t of transitions) {
+      console.log(`[Drivers] ${t.name} (${t.type}): ${t.oldState} → ${t.newState} — ${t.reason}`);
+      emitEvent({
+        event: EVENT_NAMES.DEVICE_STATE_CHANGED,
+        data: {
+          deviceName: t.name,
+          type: t.type,
+          oldState: t.oldState,
+          newState: t.newState,
+          reason: t.reason,
+        },
+      });
+    }
+  } catch {
+    // Non-fatal — driver health check errors shouldn't crash the server
+  }
+}, 10_000);
 
 // ── Startup maintenance: backup + prune ──────────────────────────────────────
 setTimeout(() => {
@@ -2102,6 +2389,10 @@ setTimeout(() => {
     }
   }
 
+  // Generate runtime token on first boot (§5 of platform contract)
+  const token = getOrCreateRuntimeToken();
+  console.log(`[EdgeServer] Runtime token: ${token.substring(0, 8)}... (use Authorization: Bearer <token>)`);
+
   startupState = "ready";
 }, 0);
 
@@ -2119,6 +2410,7 @@ setInterval(() => {
 
 process.on("SIGINT", () => {
   console.log("[EdgeServer] Shutting down...");
+  stopPrintService();
   stopHeartbeat();
   stopSocketSync();
   stopSyncWorker();
@@ -2130,6 +2422,7 @@ process.on("SIGINT", () => {
 
 process.on("SIGTERM", () => {
   console.log("[EdgeServer] SIGTERM received, shutting down...");
+  stopPrintService();
   stopHeartbeat();
   stopSocketSync();
   stopSyncWorker();

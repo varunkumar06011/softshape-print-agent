@@ -1,4 +1,13 @@
-# SoftShape Print Agent
+# SoftShape Print Agent (DEPRECATED)
+
+> **Phase 4 — Fold Print Agent**: This standalone Tauri application is **deprecated**.
+> The SoftShape Runtime (Edge Server on port 3101) now subscribes to cloud `print_job`
+> events directly and prints via the isolated Rust print service on port 3103.
+> New deployments should use the Runtime only — this app no longer needs to be installed
+> on the printer PC.
+>
+> The code is kept for reference and to avoid breaking old installations that still
+> launch it. The `server.js` stub returns HTTP 410 Gone on all routes.
 
 Windows tray application for silent thermal printer management.
 Replaces QZ Tray — no Java, no browser certificates, no print dialogs.
@@ -55,7 +64,9 @@ If registration fails, the error message now shows:
 
 The file is kept as a stub so old shortcuts/services that still launch `node server.js` don't crash. It returns **HTTP 410 Gone** for all routes (except `/health` which returns 200 with `deprecated: true`).
 
-**All print traffic must go through the Edge Server on port 3101**, which relays print jobs via WebSocket to the Tauri frontend (the only process with `window.__TAURI__` access) for physical printing.
+**All print traffic now flows through the Runtime (Edge Server on port 3101)**, which
+receives cloud `print_job` events directly (Phase 4) and dispatches them to the isolated
+Rust print service on port 3103 for physical printing. No Tauri webview is required.
 
 ## Printer Support
 

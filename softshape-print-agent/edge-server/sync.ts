@@ -28,7 +28,7 @@ const MAX_BATCH_SIZE = 50;
 const MAX_ATTEMPTS = 5;
 const BACKOFF_BASE_MS = 10_000;   // 10 seconds
 const BACKOFF_MAX_MS = 5 * 60_000; // 5 minutes cap
-const SYNC_SCHEMA_VERSION = 1;
+const SYNC_SCHEMA_VERSION = 2;
 
 let syncRunning = false;
 let lastSyncAt = 0;
@@ -97,6 +97,8 @@ function loadRecordData(tableName: string, recordId: string): any | null {
       return {
         ...order,
         cloud_synced: undefined, // don't send this back
+        revision: order.revision ?? 1,
+        lastCommandId: order.last_command_id ?? null,
         items: items.map((i) => ({
           ...i,
           cloud_synced: undefined,
@@ -144,6 +146,8 @@ function loadRecordData(tableName: string, recordId: string): any | null {
         kotHistory: typeof table.kot_history === "string" ? JSON.parse(table.kot_history) : [],
         discount: table.discount ? Number(table.discount) : null,
         sectionTag: table.section_tag,
+        revision: table.revision ?? 1,
+        lastCommandId: table.last_command_id ?? null,
         updatedAt: table.updated_at,
       };
     }

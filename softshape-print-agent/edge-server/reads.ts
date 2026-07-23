@@ -54,6 +54,8 @@ export function getActiveOrders(statusFilter?: string): any[] {
       totalAmount: Number(order.total_amount),
       captainId: order.captain_id,
       platform: order.platform,
+      revision: order.revision ?? 1,
+      lastCommandId: order.last_command_id ?? null,
       createdAt: new Date(order.created_at).toISOString(),
       updatedAt: new Date(order.updated_at).toISOString(),
       items: items.map((i) => ({
@@ -208,6 +210,8 @@ function mapTableRow(t: any): any {
       totalAmount: Number(order.total_amount),
       captainId: order.captain_id,
       platform: order.platform,
+      revision: order.revision ?? 1,
+      lastCommandId: order.last_command_id ?? null,
       createdAt: new Date(order.created_at).toISOString(),
       updatedAt: new Date(order.updated_at).toISOString(),
       items: items.map((i) => ({
@@ -285,6 +289,8 @@ function mapTableRow(t: any): any {
     discount: t.discount ? Number(t.discount) : null,
     sectionTag: t.section_tag,
     lastWaiterCallAt: t.last_waiter_call_at ? new Date(t.last_waiter_call_at).toISOString() : null,
+    revision: t.revision ?? 1,
+    lastCommandId: t.last_command_id ?? null,
     section: t.section_name ? {
       id: t.section_id,
       name: t.section_name,
@@ -355,6 +361,8 @@ export function getSections(): any[] {
         currentBill: Number(t.current_bill),
         sectionTag: t.section_tag,
         sectionName: s.name,
+        revision: t.revision ?? 1,
+        lastCommandId: t.last_command_id ?? null,
         section: {
           id: s.id,
           name: s.name,

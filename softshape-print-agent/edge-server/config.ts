@@ -542,22 +542,26 @@ function applyChange(db: any, change: any): boolean {
       return true;
 
     // ── Table ───────────────────────────────────────────────────────────────
+    // Incremental table sync only updates config fields (number, capacity,
+    // section_id, section_tag). Business state (status, workflow_status,
+    // captain_id, guests, current_bill, kot_history, etc.) is edge-authoritative
+    // and must not be overwritten by cloud incremental sync.
     case "table":
-      db.query(`INSERT INTO "table" (id, number, capacity, status, section_id, restaurant_id, workflow_status, captain_id, guests, session_started_at, current_bill, kot_history, discount, section_tag, last_waiter_call_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
-        ON CONFLICT(id) DO UPDATE SET number=excluded.number, capacity=excluded.capacity, status=excluded.status,
-        section_id=excluded.section_id, workflow_status=excluded.workflow_status, captain_id=excluded.captain_id,
-        guests=excluded.guests, session_started_at=excluded.session_started_at, current_bill=excluded.current_bill,
-        kot_history=excluded.kot_history, discount=excluded.discount, section_tag=excluded.section_tag,
-        last_waiter_call_at=excluded.last_waiter_call_at, updated_at=unixepoch()
+      db.query(`INSERT INTO "table" (id, number, capacity, status, section_id, restaurant_id, workflow_status, updated_at)
+        VALUES (?, ?, ?, 'AVAILABLE', ?, ?, 'Free', unixepoch())
+        ON CONFLICT(id) DO UPDATE SET number=excluded.number, capacity=excluded.capacity,
+        section_id=excluded.section_id,
+        updated_at=unixepoch()
       `).run(
-        row.id, row.number, row.capacity || 4, row.status || "AVAILABLE",
-        row.sectionId, row.restaurantId, row.workflowStatus || null, row.captainId || null,
-        row.guests || 0, row.sessionStartedAt ? new Date(row.sessionStartedAt).getTime() : null,
-        Number(row.currentBill || 0), JSON.stringify(row.kotHistory || []),
-        row.discount ? Number(row.discount) : null, row.sectionTag || null,
-        row.lastWaiterCallAt ? new Date(row.lastWaiterCallAt).getTime() : null
+        row.id, row.number, row.capacity || 4,
+        row.sectionId, row.restaurantId
       );
+      // Apply section_tag separately since it may be null and the INSERT
+      // above doesn't include it (to avoid clobbering existing values)
+      if (row.sectionTag !== undefined) {
+        db.query(`UPDATE "table" SET section_tag = ?, updated_at = unixepoch() WHERE id = ?`)
+          .run(row.sectionTag || null, row.id);
+      }
       return true;
 
     // ── Category ────────────────────────────────────────────────────────────

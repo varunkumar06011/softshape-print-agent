@@ -1,31 +1,15 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// printer.ts — Direct printer communication via Tauri or fallback HTTP
+// printer.ts — Direct printer communication via isolated print service
 // ─────────────────────────────────────────────────────────────────────────────
-// Sends raw ESC/POS bytes directly to the printer. No socket relay, no Redis.
-//
-// Two modes:
-//   1. Tauri mode: window.__TAURI__.invoke('print_raw', ...) — direct USB
-//   2. HTTP fallback: POST to existing print agent's /print endpoint
-//      (used when edge server runs standalone without Tauri webview)
+// Sends raw ESC/POS bytes to the isolated Rust print service on :3103.
+// No Tauri, no HTTP bridge — the Runtime is headless.
 //
 // Printer resolution:
-//   - If printerName is an IP:port → network printer (Tauri print_network)
-//   - Otherwise → USB/local printer (Tauri print_raw)
+//   - If printerName is an IP:port → network printer
+//   - Otherwise → USB/local printer
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getConfig } from "./db.ts";
-import { cloudFetch } from "./cloudFetch.ts";
-
-// ── Tauri invoke helper ──────────────────────────────────────────────────────
-
-function getTauriInvoke(): ((cmd: string, args?: any) => Promise<any>) | null {
-  const t = (globalThis as any).window?.__TAURI__;
-  if (!t) return null;
-  if (t.core && typeof t.core.invoke === "function") return t.core.invoke.bind(t.core);
-  if (typeof t.invoke === "function") return t.invoke.bind(t);
-  if (t.tauri && typeof t.tauri.invoke === "function") return t.tauri.invoke.bind(t.tauri);
-  return null;
-}
+import { sendToPrintService, isPrintServiceReady } from "./printServiceManager.ts";
 
 // ── Convert ESC/POS data string to byte array ────────────────────────────────
 
@@ -41,83 +25,35 @@ export interface PrintResult {
   printerName: string;
   bytes: number;
   error?: string;
-  method: "tauri" | "http" | "noop";
+  method: "print_service" | "noop";
 }
 
 // ── Print to a specific printer ──────────────────────────────────────────────
 
 export async function printToPrinter(
   printerName: string,
-  escposData: { type: string; format: string; data: string }[]
+  escposData: { type: string; format: string; data: string }[],
+  eventId?: string,
+  jobType?: string,
 ): Promise<PrintResult> {
   const rawBytes = escposToBytes(escposData);
-  let tauriError: string | null = null;
+  let lastError: string | null = null;
 
   if (rawBytes.length === 0) {
     return { ok: false, printerName, bytes: 0, error: "Empty print data", method: "noop" };
   }
 
-  // ── Try Tauri first (direct USB) ──────────────────────────────────────────
-  const invoke = getTauriInvoke();
-  if (invoke) {
-    const netMatch = printerName.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)$/);
-    try {
-      if (netMatch) {
-        await invoke("print_network", {
-          ip: netMatch[1],
-          port: parseInt(netMatch[2], 10),
-          bytes: rawBytes,
-        });
-      } else {
-        await invoke("print_raw", {
-          printerName,
-          bytes: rawBytes,
-        });
-      }
-      console.log(`[Printer] Printed via Tauri → ${printerName} (${rawBytes.length} bytes)`);
-      return { ok: true, printerName, bytes: rawBytes.length, method: "tauri" };
-    } catch (err: any) {
-      const errorMsg = err?.message || String(err);
-      const isNetwork = netMatch !== null;
-      const errorType = isNetwork ? "network" : "usb";
-      console.error(`[Printer] Tauri ${errorType} print failed → ${printerName}:`, errorMsg);
-      tauriError = isNetwork
-        ? `Network printer connection failed (${printerName}): ${errorMsg}`
-        : `USB/local printer error (${printerName}): ${errorMsg}`;
+  // ── Print service: isolated Rust process on :3103 (Phase 4) ──────────────
+  if (isPrintServiceReady()) {
+    const result = await sendToPrintService(printerName, new Uint8Array(rawBytes));
+    if (result.ok) {
+      console.log(`[Printer] Printed via print service → ${printerName} (${rawBytes.length} bytes)`);
+      return { ok: true, printerName, bytes: rawBytes.length, method: "print_service" };
     }
-  }
-
-  // ── HTTP fallback: send to the edge server's /print endpoint (port 3101) ──
-  // The edge server relays via WebSocket to the Tauri frontend for physical printing.
-  // NOTE: printToPrinter/printGrouped are currently unused — orderService.ts uses
-  // printWithLanFallback() directly. This fallback is kept for future standalone use.
-  const printAgentUrl = (
-    process.env.PRINT_BRIDGE_URL ||
-    getConfig("print_bridge_url") ||
-    getConfig("print_agent_http_url") ||
-    "http://127.0.0.1:3101"
-  ).replace(/\/+$/, "");
-  if (printAgentUrl) {
-    try {
-      const res = await cloudFetch(`${printAgentUrl}/print`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jobType: "KOT",
-          printerName,
-          bytes: rawBytes,
-        }),
-        timeout: 10_000, // local print bridge — 10s is plenty
-      });
-      const result = await res.json().catch(() => ({}));
-      if (result.ok) {
-        console.log(`[Printer] Printed via internal bridge → ${printerName} (${rawBytes.length} bytes)`);
-        return { ok: true, printerName, bytes: rawBytes.length, method: "http" };
-      }
-      return { ok: false, printerName, bytes: rawBytes.length, error: result.error || "HTTP print failed", method: "http" };
-    } catch (err: any) {
-      console.error(`[Printer] HTTP fallback failed → ${printerName}:`, err?.message || err);
-    }
+    lastError = result.error || "Print service failed";
+    console.warn(`[Printer] Print service failed → ${printerName}: ${lastError}`);
+  } else {
+    lastError = "Print service is not ready";
   }
 
   // ── No printer available — log and return error ───────────────────────────
@@ -125,7 +61,7 @@ export async function printToPrinter(
     ok: false,
     printerName,
     bytes: rawBytes.length,
-    error: tauriError || "No printer available (Tauri not found, HTTP fallback unavailable)",
+    error: lastError,
     method: "noop",
   };
 }
@@ -133,16 +69,18 @@ export async function printToPrinter(
 // ── Print to multiple printers (for grouped KOT routing) ─────────────────────
 
 export async function printGrouped(
-  groups: Array<{ printerName: string; escposData: { type: string; format: string; data: string }[] }>
+  groups: Array<{ printerName: string; escposData: { type: string; format: string; data: string }[]; type?: string }>,
+  requestId?: string,
 ): Promise<PrintResult[]> {
   const results: PrintResult[] = [];
 
   // Print all groups in parallel — different printers can print simultaneously
-  const promises = groups.map(async (g) => {
+  const promises = groups.map(async (g, i) => {
     if (!g.printerName || g.escposData.length === 0) {
       return { ok: false, printerName: g.printerName || "unknown", bytes: 0, error: "No printer or data", method: "noop" } as PrintResult;
     }
-    return printToPrinter(g.printerName, g.escposData);
+    const eventId = `${g.type || "KOT"}-${requestId || Date.now()}-${i}`;
+    return printToPrinter(g.printerName, g.escposData, eventId, g.type);
   });
 
   const settled = await Promise.allSettled(promises);

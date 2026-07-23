@@ -612,9 +612,8 @@ if (stored) {
   showSetup();
 }
 
-// ── Start edge server WebSocket for LAN print fallback ──────────────────────
-// This runs on every startup — the edge server is local (same machine) and
-// may broadcast print jobs that it couldn't print directly. The Tauri frontend
-// is the only process with window.__TAURI__ access to the physical printers.
-connectEdgeWebSocket();
-startEdgePing();
+// ── Edge server WebSocket print path removed ─────────────────────────────────
+// Print jobs are now dispatched via HTTP POST to the print bridge (port 3102)
+// inside the cashier-desktop Tauri app, not via WebSocket broadcast. The
+// print-agent's own HTTP server (http_server.rs) can also receive print jobs
+// via POST /print. Cloud relay is the emergency fallback if the bridge is down.

@@ -25,7 +25,9 @@
 import { io, type Socket } from "socket.io-client";
 import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid } from "./auth.ts";
 import { applyChangesBatch, downloadFullConfig } from "./config.ts";
-import { getDb, setSyncState, updatePrintJobStatus } from "./db.ts";
+import { getDb, setSyncState, updatePrintJobStatus, createPrintJob, claimPrintJob } from "./db.ts";
+import { printToPrinter } from "./printer.ts";
+import { printerLog } from "./contract/logger.ts";
 
 let socket: Socket | null = null;
 let connectionAttempts = 0;
@@ -68,11 +70,14 @@ export function startSocketSync(): void {
     connectionAttempts = 0;
     fallbackToPolling = false;
 
-    // Register as edge server
+    // Register as edge server with print capability (Phase 4)
+    // The cloud can now route print_job events directly to this edge server
+    // instead of relaying through the standalone Print Agent.
     socket!.emit("edge:register", {
       restaurantId,
       sessionToken: token,
-      edgeVersion: "22.7.0",
+      edgeVersion: "22.8.0",
+      capabilities: ["print"],
     });
   });
 
@@ -98,7 +103,8 @@ export function startSocketSync(): void {
     socket!.emit("edge:register", {
       restaurantId,
       sessionToken: token,
-      edgeVersion: "22.7.0",
+      edgeVersion: "22.8.0",
+      capabilities: ["print"],
     });
   });
 
@@ -143,25 +149,34 @@ export function startSocketSync(): void {
       const db = getDb();
       const t = data.table || data;
       if (t && t.id) {
-        // Build dynamic SET clause — only update fields present in the payload
+        // Edge server is authoritative for live table business state.
+        // Reject cloud-direct writes to business fields — these must flow
+        // through edge command routes (createOrder, settleOrder, etc.) which
+        // handle idempotency, revision increments, and KOT integrity.
+        const businessFields = ["status", "workflowStatus", "currentBill", "captainId", "guests", "kotHistory", "sessionStartedAt", "discount"];
+        const hasBusinessField = businessFields.some(f => t[f] !== undefined);
+        if (hasBusinessField) {
+          console.warn(`[SocketSync] Rejected cloud-direct table_update for ${t.id} — business state is edge-authoritative`);
+          return;
+        }
+
+        // Only config-level fields (number, capacity, sectionId) are accepted
         const sets: string[] = ["updated_at = unixepoch()"];
         const params: any[] = [];
 
-        if (t.status !== undefined) { sets.push("status = ?"); params.push(t.status); }
-        if (t.workflowStatus !== undefined) { sets.push("workflow_status = ?"); params.push(t.workflowStatus); }
-        if (t.currentBill !== undefined) { sets.push("current_bill = ?"); params.push(Number(t.currentBill)); }
-        if (t.captainId !== undefined) { sets.push("captain_id = ?"); params.push(t.captainId || null); }
-        if (t.guests !== undefined) { sets.push("guests = ?"); params.push(Number(t.guests)); }
-        if (t.kotHistory !== undefined) { sets.push("kot_history = ?"); params.push(typeof t.kotHistory === "string" ? t.kotHistory : JSON.stringify(t.kotHistory)); }
-        if (t.discount !== undefined) { sets.push("discount = ?"); params.push(t.discount ? Number(t.discount) : null); }
-        if (t.sessionStartedAt !== undefined) { sets.push("session_started_at = ?"); params.push(typeof t.sessionStartedAt === "number" ? t.sessionStartedAt : new Date(t.sessionStartedAt).getTime()); }
+        if (t.number !== undefined) { sets.push("number = ?"); params.push(Number(t.number)); }
+        if (t.capacity !== undefined) { sets.push("capacity = ?"); params.push(Number(t.capacity)); }
+        if (t.sectionId !== undefined) { sets.push("section_id = ?"); params.push(t.sectionId); }
 
         if (sets.length === 1) return; // Only updated_at — nothing to update
 
+        // Increment revision for any accepted config update
+        sets.push("revision = (SELECT revision FROM \"table\" WHERE id = ?) + 1");
+        params.push(t.id);
         params.push(t.id);
         db.query(`UPDATE "table" SET ${sets.join(", ")} WHERE id = ?`).run(...params);
         setSyncState("last_socket_sync", new Date().toISOString());
-        console.log(`[SocketSync] Table ${t.id} updated (${sets.length - 1} fields)`);
+        console.log(`[SocketSync] Table ${t.id} config updated (${sets.length - 2} fields)`);
       }
     } catch (err) {
       console.error("[SocketSync] Failed to apply table_update:", err);
@@ -177,13 +192,30 @@ export function startSocketSync(): void {
       if (!data?.eventId) return;
       updatePrintJobStatus(
         data.eventId,
-        data.ok ? "printed" : "needs_retry",
+        data.ok ? "printed" : "retrying",
         data.ok ? null : (data.error || "Cloud print failed"),
         "cloud_relay",
       );
-      console.log(`[SocketSync] Cloud print_ack for ${data.eventId}: ${data.ok ? "printed" : "needs_retry"}`);
+      console.log(`[SocketSync] Cloud print_ack for ${data.eventId}: ${data.ok ? "printed" : "retrying"}`);
     } catch (err) {
       console.error("[SocketSync] Failed to process edge:print_ack:", err);
+    }
+  });
+
+  // ── Direct cloud print_job handler (Phase 4: Fold Print Agent) ─────────────
+  // The cloud can now send print_job events directly to this edge server.
+  // Previously, the standalone Print Agent received these and printed via
+  // Tauri. Now the Runtime prints them via the isolated print service on
+  // :3103 and sends print:ack back to the cloud.
+  socket.on("print_job", async (envelope: any) => {
+    try {
+      await handleCloudPrintJob(envelope);
+    } catch (err) {
+      console.error(`[SocketSync] Failed to handle cloud print_job:`, err);
+      // Best-effort ack even on unexpected error
+      if (envelope?.eventId) {
+        sendPrintAck(envelope.eventId, false, String(err instanceof Error ? err.message : err), envelope?.data?.requestId);
+      }
     }
   });
 
@@ -208,7 +240,116 @@ export function sendHeartbeat(): void {
   });
 }
 
+// ─── Send print ack to cloud ──────────────────────────────────────────────────
+
+export function sendPrintAck(eventId: string, ok: boolean, error?: string | null, requestId?: string | null): void {
+  if (!socket || !socket.connected) return;
+  const restaurantId = getRestaurantId();
+  if (!restaurantId) return;
+
+  socket.emit("print:ack", {
+    restaurantId,
+    eventId,
+    requestId: requestId || undefined,
+    status: ok ? "success" : "failed",
+    error: error || undefined,
+  });
+}
+
+// ─── Handle cloud print_job event (Phase 4: Fold Print Agent) ─────────────────
+// Receives a print_job envelope from the cloud, creates a durable print_job
+// row in SQLite, dispatches it to the print service, and sends print:ack.
+// This replaces the standalone Print Agent's socket → Tauri print path.
+
+async function handleCloudPrintJob(envelope: any): Promise<void> {
+  const { type, data, eventId } = envelope;
+  if (!eventId) {
+    console.warn("[SocketSync] Cloud print_job missing eventId — cannot track");
+    sendPrintAck("", false, "Missing eventId in print_job", data?.requestId);
+    return;
+  }
+
+  const restaurantId = getRestaurantId();
+  if (!restaurantId) {
+    console.warn("[SocketSync] Cannot handle cloud print_job — no restaurantId");
+    sendPrintAck(eventId, false, "Edge server not authenticated", data?.requestId);
+    return;
+  }
+
+  // Resolve target printer from job type + data
+  let targetPrinter: string | null = data?.printerName || null;
+  if (!targetPrinter) {
+    // Try printer mapping from edge config
+    try {
+      const db = getDb();
+      const mapping = JSON.parse(db.query("SELECT value FROM edge_config WHERE key = 'printer_mapping'").get() as any)?.value || "{}";
+      if (type === "KOT" || type === "CANCEL_KOT") targetPrinter = mapping.kitchen || null;
+      else if (type === "BAR_KOT") targetPrinter = mapping.bar || null;
+      else if (type === "BILL" || type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "EXPENDITURE") targetPrinter = mapping.bill || null;
+      else if (type === "TABLE_SWAP") targetPrinter = mapping.kitchen || null;
+    } catch { /* ignore */ }
+  }
+
+  if (!targetPrinter) {
+    console.warn(`[SocketSync] No printer resolved for cloud print_job ${type} (${eventId})`);
+    sendPrintAck(eventId, false, `No printer resolved for ${type}`, data?.requestId);
+    return;
+  }
+
+  const escposData = data?.escposData;
+  if (!escposData || (Array.isArray(escposData) && escposData.length === 0)) {
+    console.warn(`[SocketSync] No ESC/POS data in cloud print_job ${type} (${eventId})`);
+    sendPrintAck(eventId, false, `No ESC/POS data for ${type}`, data?.requestId);
+    return;
+  }
+
+  // Create a durable print_job row (idempotent via ON CONFLICT DO NOTHING)
+  createPrintJob({
+    eventId,
+    restaurantId,
+    orderId: data?.orderId || null,
+    kotId: data?.kotId || null,
+    kotNumber: data?.kotNumber || null,
+    tableId: data?.tableId || null,
+    printerName: targetPrinter,
+    jobType: type,
+    escposData,
+    itemSummary: data?.itemSummary || [],
+    captainName: data?.captainName || null,
+  });
+
+  // Claim the job for printing
+  if (!claimPrintJob(eventId)) {
+    console.log(`[SocketSync] Cloud print_job ${eventId} already being processed`);
+    return;
+  }
+
+  printerLog.info(`Cloud print_job received: ${type} → ${targetPrinter} (eventId=${eventId})`);
+
+  // Dispatch to the print service
+  try {
+    const result = await printToPrinter(targetPrinter, escposData, eventId, type);
+    if (result.ok) {
+      updatePrintJobStatus(eventId, "printed", null, "cloud_direct");
+      sendPrintAck(eventId, true, null, data?.requestId);
+      printerLog.info(`Cloud print_job printed: ${type} → ${targetPrinter} (${result.bytes} bytes via ${result.method}, eventId=${eventId})`);
+    } else {
+      updatePrintJobStatus(eventId, "retrying", result.error || "Print failed", "cloud_direct");
+      sendPrintAck(eventId, false, result.error || "Print failed", data?.requestId);
+      printerLog.warn(`Cloud print_job failed: ${type} → ${targetPrinter}: ${result.error} (eventId=${eventId})`);
+    }
+  } catch (err: any) {
+    updatePrintJobStatus(eventId, "retrying", err?.message || String(err), "cloud_direct");
+    sendPrintAck(eventId, false, err?.message || String(err), data?.requestId);
+    printerLog.error(`Cloud print_job dispatch error: ${type} → ${targetPrinter}: ${err instanceof Error ? err.message : err} (eventId=${eventId})`);
+  }
+}
+
 // ─── Relay print job via cloud socket (fallback when no LAN clients) ──────────
+// Phase 4: The Runtime can now print directly via the print service. The cloud
+// relay path is kept as a fallback for when the print service is unavailable
+// and no LAN clients are connected. The cloud can route the job to another
+// edge server or the standalone Print Agent (if still deployed).
 
 export function relayPrintViaCloud(printJob: {
   type: string;
