@@ -54,7 +54,7 @@ import { downloadFullConfig, pullIncrementalChanges } from "./config.ts";
 import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders } from "./reads.ts";
 import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
-import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode, relayPrintViaCloud } from "./socketSync.ts";
+import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode } from "./socketSync.ts";
 import { acquireInstanceLock, startHeartbeatLoop, stopHeartbeatLoop, releaseInstanceLock, forceReleaseLock, getLockStatus } from "./instanceLock.ts";
 import { cloudFetch } from "./cloudFetch.ts";
 import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount, getPrintingClientCount, setClientCapability, lanBroadcast } from "./lanBroadcast.ts";
@@ -350,17 +350,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       console.warn(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} print service failed: ${result.error} — trying cloud relay`);
     }
 
-    // Fallback: relay via cloud WebSocket socket
-    const relayed = relayPrintViaCloud({
-      type: effectiveType,
-      data: { printerName: targetPrinter, escposData: normalizedEscpos, requestId: data?.requestId || null },
-      eventId: printEventId,
-    });
-    if (relayed) {
-      console.log(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} via cloud fallback`);
-      return jsonResponse({ ok: true, queued: false, method: "cloud_relay", eventId: printEventId });
-    }
-    return jsonResponse({ ok: false, error: "Print service unavailable and cloud socket not available", queued: false }, 503);
+    // R5: Cloud relay removed — print service is the sole transport.
+    return jsonResponse({ ok: false, error: "Print service unavailable", queued: false }, 503);
   }
 
   // ── GET /api/edge/status ────────────────────────────────────────────────────

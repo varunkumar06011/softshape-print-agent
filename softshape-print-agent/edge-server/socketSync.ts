@@ -183,24 +183,8 @@ export function startSocketSync(): void {
     }
   });
 
-  // ── Cloud print ack relay ──────────────────────────────────────────────────
-  // When a print job relayed via cloud is acknowledged by the Print Agent,
-  // the cloud emits edge:print_ack back to us. Update the durable print_job
-  // table so the background dispatch loop doesn't re-dispatch.
-  socket.on("edge:print_ack", (data: any) => {
-    try {
-      if (!data?.eventId) return;
-      updatePrintJobStatus(
-        data.eventId,
-        data.ok ? "printed" : "retrying",
-        data.ok ? null : (data.error || "Cloud print failed"),
-        "cloud_relay",
-      );
-      console.log(`[SocketSync] Cloud print_ack for ${data.eventId}: ${data.ok ? "printed" : "retrying"}`);
-    } catch (err) {
-      console.error("[SocketSync] Failed to process edge:print_ack:", err);
-    }
-  });
+  // R5: edge:print_ack listener removed — cloud no longer relays print jobs.
+  // The runtime SQLite queue is the sole retry owner (ADR-001).
 
   // ── Direct cloud print_job handler (Phase 4: Fold Print Agent) ─────────────
   // The cloud can now send print_job events directly to this edge server.
@@ -345,30 +329,8 @@ async function handleCloudPrintJob(envelope: any): Promise<void> {
   }
 }
 
-// ─── Relay print job via cloud socket (fallback when no LAN clients) ──────────
-// Phase 4: The Runtime can now print directly via the print service. The cloud
-// relay path is kept as a fallback for when the print service is unavailable
-// and no LAN clients are connected. The cloud can route the job to another
-// edge server or the standalone Print Agent (if still deployed).
-
-export function relayPrintViaCloud(printJob: {
-  type: string;
-  data: { printerName: string | null; escposData: any[]; requestId?: string | null };
-  eventId: string;
-}): boolean {
-  if (!socket?.connected) {
-    console.warn("[SocketSync] Cannot relay print — cloud socket not connected");
-    return false;
-  }
-  const restaurantId = getRestaurantId();
-  if (!restaurantId) {
-    console.warn("[SocketSync] Cannot relay print — no restaurantId in session");
-    return false;
-  }
-  socket.emit("edge:relay_print", { ...printJob, restaurantId });
-  console.log(`[SocketSync] Relayed print job ${printJob.eventId} via cloud (${printJob.type})`);
-  return true;
-}
+// R5: relayPrintViaCloud removed — cloud relay path eliminated.
+// The runtime SQLite queue is the sole retry owner (ADR-001).
 
 export function isCloudSocketConnected(): boolean {
   return socket?.connected || false;
