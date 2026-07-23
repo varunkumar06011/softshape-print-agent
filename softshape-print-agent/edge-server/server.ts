@@ -1580,6 +1580,20 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse({ success: true, ...result });
   }
 
+  // ── POST /api/output/intent — generic output intent endpoint (R2) ──────────
+  if (url.pathname === "/api/output/intent" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const body = await req.json().catch(() => ({}));
+    if (!body || body.type !== "OUTPUT" || !body.intent) {
+      return errorResponse("Invalid output intent", 400);
+    }
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const { processOutputIntent } = await import("./outputOrchestrator.ts");
+    const result = await processOutputIntent(body, restaurantId);
+    return jsonResponse(result);
+  }
+
   // ── POST /api/edge/print-jobs/cancel — cancel a pending or retryable print job ──
   if (url.pathname === "/api/edge/print-jobs/cancel" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
