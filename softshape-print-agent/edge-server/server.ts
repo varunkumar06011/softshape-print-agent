@@ -48,18 +48,17 @@
 
 import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enqueueSync, getRecoveryStatus, updatePrintJobStatus, getPendingPrintJobs, getOrderSyncStatus, getPrintJobByEventId, cancelPrintJob, reprintPrintJob, getPrintJobsByOrder, insertSyncAudit, getSyncAuditRecords } from "./db.ts";
 import os from "os";
-import { runDailyMaintenance, runPeriodicBackup } from "./backup.ts";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getSessionToken, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
-import { downloadFullConfig, pullIncrementalChanges } from "./config.ts";
+import { pullIncrementalChanges } from "./config.ts";
 import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders } from "./reads.ts";
-import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
-import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode } from "./socketSync.ts";
-import { acquireInstanceLock, startHeartbeatLoop, stopHeartbeatLoop, releaseInstanceLock, forceReleaseLock, getLockStatus } from "./instanceLock.ts";
+import { startSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
+import { startSocketSync, getSocketStatus, startHeartbeat } from "./socketSync.ts";
+import { acquireInstanceLock, startHeartbeatLoop, forceReleaseLock, getLockStatus } from "./instanceLock.ts";
 import { cloudFetch } from "./cloudFetch.ts";
 import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount, setClientRegistered, lanBroadcast } from "./lanBroadcast.ts";
 import { printToPrinter } from "./printer.ts";
-import { startPrintService, stopPrintService, isPrintServiceReady, getPrintServiceStatus, sendToPrintService, listPrintersViaService } from "./printServiceManager.ts";
+import { isPrintServiceReady, getPrintServiceStatus, sendToPrintService, listPrintersViaService } from "./printServiceManager.ts";
 import { deviceManager } from "./drivers/manager.ts";
 import { PrinterDriver } from "./drivers/printer/index.ts";
 import { PaymentDriver } from "./drivers/payment/index.ts";
@@ -72,6 +71,7 @@ import { registerEventClient, handleEventMessage, unregisterEventClient, emitEve
 import { EVENT_NAMES } from "./contract/events.ts";
 import { runtimeLog } from "./contract/logger.ts";
 import { hashSync, compareSync } from "bcryptjs";
+import { runtimeManager } from "./runtimeManager.ts";
 
 const PORT = parseInt(process.env.EDGE_PORT || "3101", 10);
 
@@ -215,9 +215,6 @@ function validateFields(body: any, schema: Record<string, FieldSchema>): string 
   }
   return null;
 }
-
-let startupState: "starting" | "ready" | "error" = "starting";
-let startupError = "";
 
 // ── Per-IP rate limiting (SC5) ───────────────────────────────────────────────
 // Simple in-memory token bucket: 120 requests per minute per IP.
@@ -376,13 +373,18 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
 
   // ── GET /health ─────────────────────────────────────────────────────────────
   if (url.pathname === "/health" && req.method === "GET") {
-    if (startupState !== "ready") {
+    const rmHealth = runtimeManager.getHealth();
+    if (!rmHealth.isOperational) {
       return jsonResponse({
-        status: startupState === "error" ? "error" : "initializing",
+        status: rmHealth.status,
         service: "softshape-edge-server",
         version: "22.8.0",
         uptime: process.uptime(),
-        error: startupError || null,
+        runtimeState: rmHealth.runtimeState,
+        configSyncState: rmHealth.configSyncState,
+        connectionState: rmHealth.connectionState,
+        isOperational: false,
+        error: rmHealth.startupError,
       });
     }
     const session = loadSession();
@@ -433,13 +435,17 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
       onboarded: isLocalReady(),
+      isOperational: true,
+      runtimeState: rmHealth.runtimeState,
+      configSyncState: rmHealth.configSyncState,
+      connectionState: rmHealth.connectionState,
       setupNonce: isLocalReady() ? null : getSetupNonce(),
       uptime: process.uptime(),
       databaseRecovered: recovery.recovered,
       recoveryMessage: recovery.message || null,
       lanIp,
       edgePort: PORT,
-      maintenanceError: startupError || null,
+      maintenanceError: rmHealth.startupError,
       sync: syncMetrics ? {
         workerRunning: syncMetrics.workerRunning,
         pendingCount: syncMetrics.pendingCount,
@@ -457,30 +463,40 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   if (url.pathname === "/runtime/status" && req.method === "GET") {
     const printStatus = getPrintServiceStatus();
     const syncStatus = getSocketStatus();
+    const rmStatus = runtimeManager.getStatus();
     return jsonResponse({
       running: true,
-      ready: startupState === "ready",
-      state: startupState === "ready" ? "READY" : startupState === "error" ? "CRASH_LOOP" : "STARTING",
+      ready: rmStatus.isOperational,
+      state: rmStatus.runtimeState,
+      configSyncState: rmStatus.configSyncState,
+      connectionState: rmStatus.connectionState,
+      isOperational: rmStatus.isOperational,
       services: {
         printService: { pid: printStatus.pid, state: printStatus.state },
         sync: { state: syncStatus.connected ? "CONNECTED" : "DISCONNECTED" },
       },
-      lastError: startupError || null,
+      lastError: rmStatus.startupError,
     });
   }
 
   // ── POST /runtime/restart — Restart the Runtime (§1.1, admin-only) ──────────
   if (url.pathname === "/runtime/restart" && req.method === "POST") {
-    // Graceful shutdown — the Host will respawn the Runtime
     runtimeLog.info("Runtime restart requested via API");
-    setTimeout(() => {
-      try { stopSocketSync(); } catch {}
-      try { stopSyncWorker(); } catch {}
-      try { stopHeartbeat(); } catch {}
-      try { stopHeartbeatLoop(); } catch {}
-      try { releaseInstanceLock(); } catch {}
+    runtimeManager.restart();
+    return jsonResponse({ ok: true });
+  }
+
+  // ── POST /runtime/shutdown — Shutdown all Runtime services ──────────────────
+  // Called by the Cashier tray "Shutdown Runtime" action.
+  // Stops print service, sync workers, socket sync, releases lock, then exits.
+  // The Runtime Host will NOT respawn (it detects graceful shutdown).
+  if (url.pathname === "/runtime/shutdown" && req.method === "POST") {
+    runtimeLog.info("Runtime shutdown requested via API");
+    runtimeManager.shutdown().then(() => {
+      try { closeDb(); } catch {}
+      try { server.stop(); } catch {}
       process.exit(0);
-    }, 500);
+    });
     return jsonResponse({ ok: true });
   }
 
@@ -684,7 +700,6 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
           startSyncWorker();
           startSocketSync();
           startHeartbeat();
-          startIncrementalPolling();
           console.log("[register] Background sync services started");
         } else {
           console.warn(`[register] Could not start sync services — instance lock held by ${lockResult.holder?.instanceId}`);
@@ -693,10 +708,12 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         console.warn("[register] Failed to start background sync services:", syncStartErr.message);
       }
 
-      // Don't start a background config download — the frontend will call
-      // /api/edge/config/sync immediately after receiving this response.
-      // That call invokes downloadFullConfig() directly, so any errors are
-      // properly surfaced to the user instead of swallowed by a void promise.
+      // Trigger config sync through RuntimeManager (respects sync mutex)
+      // The frontend will also call /api/edge/config/sync, but we kick it
+      // off here so the download starts immediately after registration.
+      runtimeManager.runConfigSync().catch((err: any) => {
+        console.warn("[register] Initial config sync failed:", err?.message);
+      });
 
       return jsonResponse({
         success: true,
@@ -719,9 +736,9 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       return errorResponse("No valid session — register first", 401);
     }
 
-    console.log("[config/sync] Starting downloadFullConfig()...");
-    const result = await downloadFullConfig();
-    console.log(`[config/sync] downloadFullConfig() returned: success=${result.success}, tablesLoaded=${result.tablesLoaded || 0}, error=${result.error || 'none'}`);
+    console.log("[config/sync] Starting runtimeManager.runConfigSync()...");
+    const result = await runtimeManager.runConfigSync();
+    console.log(`[config/sync] runConfigSync() returned: success=${result.success}, tablesLoaded=${result.tablesLoaded || 0}, error=${result.error || 'none'}`);
     if (!result.success) {
       return errorResponse(result.error || "Config sync failed", 500);
     }
@@ -2571,13 +2588,6 @@ console.log(`[EdgeServer] WebSocket: ws://0.0.0.0:${server.port}/ws`);
 // Initialize LAN broadcast layer
 initLanBroadcast();
 
-// ── Start the isolated print service (Phase 2) ───────────────────────────────
-// The print service is a headless Rust process on :3103 that handles all
-// physical printing. The Runtime supervises it via supervisor.ts.
-// If the executable is not found (e.g. during development), printing falls
-// back to the legacy Tauri/HTTP bridge path.
-startPrintService();
-
 // ── Register built-in drivers with the Device Manager (Phase 6) ──────────────
 // The printer driver delegates to the print service on :3103.
 // Other drivers are stubs that return OFFLINE until real implementations exist.
@@ -2642,137 +2652,43 @@ setInterval(() => {
   }
 }, 10_000);
 
-// ── Startup maintenance: backup + prune ──────────────────────────────────────
-setTimeout(() => {
-  try {
-    runDailyMaintenance(getDb());
-  } catch (err: any) {
-    startupError = err?.message || String(err);
-    console.error("[EdgeServer] Startup maintenance failed (non-fatal):", err);
-  }
+// ── Startup: delegated to RuntimeManager ──────────────────────────────────────
+// RuntimeManager owns the entire lifecycle: maintenance, session check,
+// background services, config sync, state transitions, timers.
+// This replaces the scattered setTimeout(0) + conditional startSyncWorker()
+// blocks that were previously here.
 
-  const recovery = getRecoveryStatus();
-  if (recovery.recovered) {
-    console.warn("[EdgeServer] Database was recovered from corruption — attempting full config re-download...");
-    const session = loadSession();
-    if (session?.backendUrl && session?.sessionToken) {
-      downloadFullConfig()
-        .then(() => console.log("[EdgeServer] Config re-download complete"))
-        .catch(err => console.warn("[EdgeServer] Config re-download failed (will retry on next sync):", err));
-    } else {
-      console.warn("[EdgeServer] No session — config will download after registration");
-    }
-  }
+// Generate runtime token on first boot (must happen before any request
+// validation can work, so we do it synchronously before startup).
+const _token = getOrCreateRuntimeToken();
+console.log(`[EdgeServer] Runtime token: ${_token.substring(0, 8)}... (use Authorization: Bearer <token>)`);
 
-  // Generate runtime token on first boot (§5 of platform contract)
-  const token = getOrCreateRuntimeToken();
-  console.log(`[EdgeServer] Runtime token: ${token.substring(0, 8)}... (use Authorization: Bearer <token>)`);
-
-  startupState = "ready";
-}, 0);
-
-// Run maintenance every 24 hours
-setInterval(() => {
-  try { runDailyMaintenance(getDb()); } catch (err) { console.warn("[EdgeServer] Scheduled maintenance failed:", err); }
-}, 24 * 60 * 60 * 1000);
-
-// Run periodic backup every 30 minutes (reduces data loss window)
-setInterval(() => {
-  try { runPeriodicBackup(getDb()); } catch (err) { console.warn("[EdgeServer] Periodic backup failed:", err); }
-}, 30 * 60 * 1000);
+// Kick off the startup sequence.
+// RuntimeManager.startup() is async but we don't await it — the HTTP server
+// is already listening (Bun.serve above), so /health returns "initializing"
+// until startup completes and runtimeState transitions to READY.
+runtimeManager.startup().catch((err: any) => {
+  runtimeLog.error("RuntimeManager startup failed", { error: err?.stack || err });
+});
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
+// Delegated to RuntimeManager — the single owner of all service lifecycle.
 
 process.on("SIGINT", () => {
-  console.log("[EdgeServer] Shutting down...");
-  stopPrintService();
-  stopHeartbeat();
-  stopSocketSync();
-  stopSyncWorker();
-  releaseInstanceLock();
-  closeDb();
-  server.stop();
-  process.exit(0);
+  console.log("[EdgeServer] SIGINT received — shutting down via RuntimeManager...");
+  runtimeManager.shutdown().then(() => {
+    try { closeDb(); } catch {}
+    try { server.stop(); } catch {}
+    process.exit(0);
+  });
 });
 
 process.on("SIGTERM", () => {
-  console.log("[EdgeServer] SIGTERM received, shutting down...");
-  stopPrintService();
-  stopHeartbeat();
-  stopSocketSync();
-  stopSyncWorker();
-  releaseInstanceLock();
-  closeDb();
-  server.stop();
-  process.exit(0);
+  console.log("[EdgeServer] SIGTERM received — shutting down via RuntimeManager...");
+  runtimeManager.shutdown().then(() => {
+    try { closeDb(); } catch {}
+    try { server.stop(); } catch {}
+    process.exit(0);
+  });
 });
 
-// ── Auto-start incremental sync loop (every 60 seconds) ───────────────────────
-
-let _pollIntervalId: ReturnType<typeof setInterval> | null = null;
-let _pollStarted = false;
-
-function startIncrementalPolling(): void {
-  if (_pollStarted) return;
-  _pollStarted = true;
-
-  function schedulePoll() {
-    if (_pollIntervalId) clearInterval(_pollIntervalId);
-    const intervalMs = isInFallbackMode() ? 15_000 : 60_000;
-    _pollIntervalId = setInterval(async () => {
-      if (!isSessionValid()) return;
-      try {
-        const result = await pullIncrementalChanges();
-        if (result.success && result.changesApplied && result.changesApplied > 0) {
-          console.log(`[EdgeServer] Incremental sync: ${result.changesApplied} changes applied`);
-        }
-      } catch (err) {
-        console.warn('[EdgeServer] Incremental sync failed:', err);
-      }
-      // Re-evaluate interval after each poll in case fallback mode changed
-      const currentMs = isInFallbackMode() ? 15_000 : 60_000;
-      if (currentMs !== intervalMs) {
-        schedulePoll();
-      }
-    }, intervalMs);
-  }
-  schedulePoll();
-
-  // Initial incremental pull on startup
-  setTimeout(async () => {
-    try {
-      const result = await pullIncrementalChanges();
-      if (result.success) {
-        console.log(`[EdgeServer] Initial sync: ${result.changesApplied || 0} changes applied`);
-      }
-    } catch {
-      // Will retry in the interval
-    }
-  }, 3_000);
-}
-
-if (isSessionValid()) {
-  console.log("[EdgeServer] Session valid — starting background sync loop");
-
-  // Acquire instance lock — ensures only one edge server instance is active
-  const lockResult = acquireInstanceLock();
-  if (!lockResult.acquired) {
-    console.warn(`[EdgeServer] Another instance is active (${lockResult.holder?.instanceId}). Sync worker disabled.`);
-    console.warn("[EdgeServer] Use POST /api/edge/instance/force-release to take over.");
-  } else {
-    startHeartbeatLoop();
-
-    // Start edge → cloud push worker
-    startSyncWorker();
-
-    // Start cloud → edge socket sync (real-time config changes)
-    startSocketSync();
-    startHeartbeat();
-  }
-
-  if (lockResult.acquired) {
-    startIncrementalPolling();
-  }
-} else {
-  console.log("[EdgeServer] No valid session — waiting for registration via POST /api/edge/register");
-}

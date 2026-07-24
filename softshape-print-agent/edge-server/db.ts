@@ -1011,7 +1011,7 @@ export function createPrintJob(job: {
   const now = Date.now();
   try {
     db.query(`INSERT INTO print_job
-      (event_id, restaurant_id, order_id, kot_id, kot_number, table_id, printer_name, job_type, escpos_data, item_summary, captain_name, status, created_at, updated_at)
+      (event_id, restaurant_id, order_id, kot_id, kot_number, table_id, printer_name, job_type, escpos_data, item_summary, captain_name, status, created_at, updated_at, queued_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
       ON CONFLICT(event_id) DO NOTHING`)
       .run(
@@ -1060,7 +1060,7 @@ export function claimPrintJob(eventId: string): boolean {
   const leaseUntil = now + PRINT_JOB_LEASE_MS;
   const result = db.query(
     `UPDATE print_job SET status = 'printing', printing_at = ?, updated_at = ?, lease_until = ? WHERE event_id = ? AND status IN ('queued', 'retrying') AND (next_attempt_at IS NULL OR next_attempt_at <= ?)`,
-  ).run(now, leaseUntil, eventId, now);
+  ).run(now, now, leaseUntil, eventId, now);
   return result.changes > 0;
 }
 

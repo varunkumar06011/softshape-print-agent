@@ -218,6 +218,71 @@ fn update_connection_status(app: tauri::AppHandle, status: String) -> Result<(),
     Ok(())
 }
 
+fn check_edge_health() -> bool {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let mut stream = match TcpStream::connect_timeout(
+        &"127.0.0.1:3101".parse().unwrap(),
+        Duration::from_secs(2),
+    ) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let request = "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = String::new();
+    if stream.read_to_string(&mut response).is_err() {
+        return false;
+    }
+    response.starts_with("HTTP/1.1 200")
+}
+
+fn spawn_runtime_host_if_needed(app: &tauri::AppHandle) {
+    if check_edge_health() {
+        eprintln!("[PrintAgent] Edge server already running on :3101 — skipping host spawn");
+        return;
+    }
+    let resource_dir = match app.path().resource_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("[PrintAgent] Failed to resolve resource dir: {}", e);
+            return;
+        }
+    };
+    let host_exe = resource_dir.join("softshape-host.exe");
+    if !host_exe.exists() {
+        eprintln!("[PrintAgent] softshape-host.exe not found in resources: {}", host_exe.display());
+        return;
+    }
+    let mut cmd = std::process::Command::new(&host_exe);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    match cmd.spawn()
+    {
+        Ok(child) => {
+            eprintln!("[PrintAgent] Spawned softshape-host.exe pid={}", child.id());
+            std::mem::forget(child);
+        }
+        Err(e) => eprintln!("[PrintAgent] Failed to spawn softshape-host.exe: {}", e),
+    }
+}
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 fn main() {
     // System tray: Show Window + Quit
     let show_item = CustomMenuItem::new("show".to_string(), "Show Window");
@@ -293,6 +358,12 @@ fn main() {
             std::thread::spawn(move || {
                 http_server::start(&addr);
             });
+
+            // Spawn the Runtime Host (softshape-host.exe) which supervises
+            // edge-server.exe and print-service.exe. The host registers itself
+            // for Windows autostart on first run.
+            spawn_runtime_host_if_needed(app.handle());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

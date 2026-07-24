@@ -11,6 +11,14 @@
 // BOOTING → STARTING → READY → DEGRADED → STOPPING → STOPPED
 //                      ↘
 //                       → CRASH_LOOP
+//
+// Phase: Production Hardening — RuntimeState now reflects lifecycle readiness,
+// NOT sync or connection status. Those are tracked separately by
+// ConfigSyncState and ConnectionState. This separation avoids impossible
+// combinations like "ONLINE but SYNC_FAILED" or "OFFLINE but READY".
+//
+// isOperational = (RuntimeState === READY) — the single source of truth
+// the UI checks. The runtime tells the UI "ready" or "not ready".
 
 export type RuntimeState =
   | "BOOTING"
@@ -29,6 +37,66 @@ export const RUNTIME_STATE_TRANSITIONS: Record<RuntimeState, RuntimeState[]> = {
   CRASH_LOOP: ["STARTING", "STOPPING"],
   STOPPING: ["STOPPED"],
   STOPPED: [],
+};
+
+// ── Config sync states ───────────────────────────────────────────────────────
+//
+// Tracks the config download/validate/commit/verify pipeline.
+// Independent from RuntimeState — the runtime can be READY (serving local
+// data) while a config re-sync is DOWNLOADING.
+//
+// IDLE → DOWNLOADING → VALIDATING → COMMITTING → VERIFYING → READY
+//                         ↘              ↘            ↘
+//                          → FAILED      → FAILED     → FAILED → IDLE (retry)
+//
+// IDLE:      No sync in progress (initial state or after completion)
+// DOWNLOADING: Fetching config payload from cloud
+// VALIDATING: Schema + business validation of downloaded data
+// COMMITTING: Writing to SQLite in a single transaction
+// VERIFYING:  Comparing SQLite contents against cloud (checksum/counts)
+// READY:      Sync complete and verified — data is authoritative
+// FAILED:     Sync failed at some stage — will retry with backoff
+
+export type ConfigSyncState =
+  | "IDLE"
+  | "DOWNLOADING"
+  | "VALIDATING"
+  | "COMMITTING"
+  | "VERIFYING"
+  | "READY"
+  | "FAILED";
+
+export const CONFIG_SYNC_STATE_TRANSITIONS: Record<ConfigSyncState, ConfigSyncState[]> = {
+  IDLE: ["DOWNLOADING"],
+  DOWNLOADING: ["VALIDATING", "FAILED"],
+  VALIDATING: ["COMMITTING", "FAILED"],
+  COMMITTING: ["VERIFYING", "FAILED"],
+  VERIFYING: ["READY", "FAILED"],
+  READY: ["IDLE", "DOWNLOADING"],
+  FAILED: ["IDLE", "DOWNLOADING"],
+};
+
+// ── Connection states ────────────────────────────────────────────────────────
+//
+// Tracks cloud connectivity. Independent from RuntimeState.
+// A local-first POS is READY with ConnectionState OFFLINE — it serves
+// cached data and queues sync pushes for when connectivity returns.
+//
+// OFFLINE → CONNECTING → ONLINE → OFFLINE
+//                          ↘
+//                           → DEGRADED → ONLINE → OFFLINE
+
+export type ConnectionState =
+  | "OFFLINE"
+  | "CONNECTING"
+  | "ONLINE"
+  | "DEGRADED";
+
+export const CONNECTION_STATE_TRANSITIONS: Record<ConnectionState, ConnectionState[]> = {
+  OFFLINE: ["CONNECTING"],
+  CONNECTING: ["ONLINE", "OFFLINE"],
+  ONLINE: ["DEGRADED", "OFFLINE"],
+  DEGRADED: ["ONLINE", "OFFLINE"],
 };
 
 // ── Sync states ──────────────────────────────────────────────────────────────
@@ -108,8 +176,8 @@ export const PRINT_JOB_STATE_TRANSITIONS: Record<PrintJobState, PrintJobState[]>
 
 export interface StateTransition {
   service: string;
-  oldState: RuntimeState | SyncState | DriverState | PrintJobState;
-  newState: RuntimeState | SyncState | DriverState | PrintJobState;
+  oldState: RuntimeState | SyncState | DriverState | PrintJobState | ConfigSyncState | ConnectionState;
+  newState: RuntimeState | SyncState | DriverState | PrintJobState | ConfigSyncState | ConnectionState;
   reason: string;
   timestamp: number;
 }

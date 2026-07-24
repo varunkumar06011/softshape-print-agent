@@ -10,7 +10,7 @@
 // Auth:      { "type": "auth", "token": "<runtime-token>" } on connect
 // ─────────────────────────────────────────────────────────────────────────────
 
-import type { SyncState, DriverState } from "./states.ts";
+import type { SyncState, DriverState, RuntimeState, ConfigSyncState, ConnectionState } from "./states.ts";
 
 // ── Event names ──────────────────────────────────────────────────────────────
 
@@ -22,6 +22,10 @@ export const EVENT_NAMES = {
   PRINT_FAILED: "print.failed",
   SYNC_STATUS: "sync.status",
   DEVICE_STATE_CHANGED: "device.state_changed",
+  RUNTIME_STATE_CHANGED: "runtime.state_changed",
+  CONFIG_SYNC_STATE_CHANGED: "config_sync.state_changed",
+  CONNECTION_STATE_CHANGED: "connection.state_changed",
+  CONFIG_SYNC_PROGRESS: "config_sync.progress",
 } as const;
 
 export type EventName = (typeof EVENT_NAMES)[keyof typeof EVENT_NAMES];
@@ -71,6 +75,35 @@ export interface DeviceStateChangedEvent {
   reason: string;
 }
 
+export interface RuntimeStateChangedEvent {
+  oldState: RuntimeState;
+  newState: RuntimeState;
+  isOperational: boolean;
+  reason: string;
+}
+
+export interface ConfigSyncStateChangedEvent {
+  oldState: ConfigSyncState;
+  newState: ConfigSyncState;
+  reason: string;
+  attempt?: number;
+  error?: string;
+}
+
+export interface ConnectionStateChangedEvent {
+  oldState: ConnectionState;
+  newState: ConnectionState;
+  reason: string;
+}
+
+export interface ConfigSyncProgressEvent {
+  stage: string;
+  entity: string;
+  current: number;
+  total: number;
+  percent: number;
+}
+
 // ── Event union type ─────────────────────────────────────────────────────────
 
 export type RuntimeEvent =
@@ -80,7 +113,11 @@ export type RuntimeEvent =
   | { event: typeof EVENT_NAMES.PRINT_COMPLETED; data: PrintCompletedEvent }
   | { event: typeof EVENT_NAMES.PRINT_FAILED; data: PrintFailedEvent }
   | { event: typeof EVENT_NAMES.SYNC_STATUS; data: SyncStatusEvent }
-  | { event: typeof EVENT_NAMES.DEVICE_STATE_CHANGED; data: DeviceStateChangedEvent };
+  | { event: typeof EVENT_NAMES.DEVICE_STATE_CHANGED; data: DeviceStateChangedEvent }
+  | { event: typeof EVENT_NAMES.RUNTIME_STATE_CHANGED; data: RuntimeStateChangedEvent }
+  | { event: typeof EVENT_NAMES.CONFIG_SYNC_STATE_CHANGED; data: ConfigSyncStateChangedEvent }
+  | { event: typeof EVENT_NAMES.CONNECTION_STATE_CHANGED; data: ConnectionStateChangedEvent }
+  | { event: typeof EVENT_NAMES.CONFIG_SYNC_PROGRESS; data: ConfigSyncProgressEvent };
 
 // ── WebSocket auth message ───────────────────────────────────────────────────
 

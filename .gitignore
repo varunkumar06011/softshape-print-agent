@@ -8,6 +8,11 @@ src-tauri/target/
 # Tauri build artifacts
 src-tauri/gen/
 
+# Runtime binaries (built by CI, bundled as Tauri resources)
+src-tauri/edge-server.exe
+src-tauri/print-service.exe
+src-tauri/softshape-host.exe
+
 # Environment
 .env
 

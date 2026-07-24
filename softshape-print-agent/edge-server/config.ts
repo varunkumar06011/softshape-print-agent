@@ -14,31 +14,233 @@
 import { getDb, setSyncState, getSyncState } from "./db.ts";
 import { getBackendUrl, getSessionToken, getRestaurantId } from "./auth.ts";
 import { cloudFetch } from "./cloudFetch.ts";
+import { runtimeLog } from "./contract/logger.ts";
+import { getDeviceId } from "./auth.ts";
+import { invalidateReadCache, warmReadCache } from "./reads.ts";
 
 interface ConfigResponse {
   outlet: any;
   organizationId?: string;
-  taxProfiles: any[];
-  priceProfiles: any[];
-  priceProfileItems: any[];
-  venues: any[];
-  floors: any[];
-  sections: any[];
-  tables: any[];
-  categories: any[];
-  menuItems: any[];
-  menuVariants: any[];
-  menuAddons: any[];
-  venuePrices: any[];
-  venueAvailability: any[];
-  users: any[];
+  configVersion?: number;
+  configChecksum?: string;
+  taxProfiles?: any[];
+  priceProfiles?: any[];
+  priceProfileItems?: any[];
+  venues?: any[];
+  floors?: any[];
+  sections?: any[];
+  tables?: any[];
+  categories?: any[];
+  menuItems?: any[];
+  menuVariants?: any[];
+  menuAddons?: any[];
+  venuePrices?: any[];
+  venueAvailability?: any[];
+  users?: any[];
+  counts?: Record<string, number>;
 }
 
 let _downloadInProgress: Promise<{ success: boolean; error?: string; tablesLoaded?: number }> | null = null;
 
-export async function downloadFullConfig(): Promise<{ success: boolean; error?: string; tablesLoaded?: number }> {
+// ── Local config checksum ────────────────────────────────────────────────────
+// Computes a deterministic checksum from row counts of all config tables.
+// This is NOT a cryptographic hash of row contents — it's a lightweight
+// integrity check that catches missing tables, partial writes, or corruption.
+// The cloud can provide a matching checksum (computed the same way) so we
+// can verify that our SQLite data matches what the cloud sent.
+
+function computeLocalConfigChecksum(db: ReturnType<typeof getDb>, restaurantId: string): string {
+  const tables = [
+    { name: "outlet", quoted: false },
+    { name: "tax_profile", quoted: false },
+    { name: "price_profile", quoted: false },
+    { name: "price_profile_item", quoted: false },
+    { name: "venue", quoted: false },
+    { name: "floor", quoted: false },
+    { name: "section", quoted: false },
+    { name: "table", quoted: true },
+    { name: "category", quoted: false },
+    { name: "menu_item", quoted: false },
+    { name: "menu_item_variant", quoted: false },
+    { name: "menu_item_addon", quoted: false },
+    { name: "venue_price", quoted: false },
+    { name: "venue_menu_item_availability", quoted: false },
+    { name: "users", quoted: false },
+  ];
+
+  const counts: string[] = [];
+  for (const { name: table, quoted } of tables) {
+    try {
+      const tableRef = quoted ? `"${table}"` : table;
+      if (table === "outlet") {
+        const row = db.query(`SELECT COUNT(*) as c FROM ${tableRef} WHERE id = ?`).get(restaurantId) as { c: number } | undefined;
+        counts.push(`${table}:${row?.c ?? 0}`);
+      } else if (table === "users") {
+        const row = db.query(`SELECT COUNT(*) as c FROM ${tableRef} WHERE outlet_id = ?`).get(restaurantId) as { c: number } | undefined;
+        counts.push(`${table}:${row?.c ?? 0}`);
+      } else {
+        const row = db.query(`SELECT COUNT(*) as c FROM ${tableRef} WHERE restaurant_id = ?`).get(restaurantId) as { c: number } | undefined;
+        counts.push(`${table}:${row?.c ?? 0}`);
+      }
+    } catch {
+      counts.push(`${table}:err`);
+    }
+  }
+
+  // Simple hash: join counts and compute a short hex digest
+  const joined = counts.join("|");
+  let hash = 0;
+  for (let i = 0; i < joined.length; i++) {
+    const ch = joined.charCodeAt(i);
+    hash = ((hash << 5) - hash) + ch;
+    hash = hash & hash; // Convert to 32-bit integer
+  }
+  return `v1:${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+// ── Referential integrity validation ─────────────────────────────────────────
+// After the config transaction commits, verify that foreign key relationships
+// are intact. This catches cloud bugs where a child row references a parent
+// that doesn't exist (e.g. a menu_item with a category_id that's not in the
+// category table). We log warnings but don't fail — the UI can still operate
+// with orphaned rows, but the operator should be alerted.
+
+interface IntegrityViolation {
+  table: string;
+  column: string;
+  orphanedCount: number;
+  sampleIds: string[];
+}
+
+function validateReferentialIntegrity(db: ReturnType<typeof getDb>, restaurantId: string): IntegrityViolation[] {
+  const checks: Array<{ table: string; column: string; refTable: string; refColumn: string; quoted?: boolean }> = [
+    { table: "menu_item", column: "category_id", refTable: "category", refColumn: "id" },
+    { table: "menu_item_variant", column: "menu_item_id", refTable: "menu_item", refColumn: "id" },
+    { table: "menu_item_addon", column: "menu_item_id", refTable: "menu_item", refColumn: "id" },
+    { table: "venue_price", column: "menu_item_id", refTable: "menu_item", refColumn: "id" },
+    { table: "venue_price", column: "venue_id", refTable: "venue", refColumn: "id" },
+    { table: "venue_menu_item_availability", column: "menu_item_id", refTable: "menu_item", refColumn: "id" },
+    { table: "venue_menu_item_availability", column: "venue_id", refTable: "venue", refColumn: "id" },
+    { table: "section", column: "floor_id", refTable: "floor", refColumn: "id" },
+    { table: "section", column: "venue_id", refTable: "venue", refColumn: "id" },
+    { table: "floor", column: "venue_id", refTable: "venue", refColumn: "id" },
+    { table: "price_profile_item", column: "price_profile_id", refTable: "price_profile", refColumn: "id" },
+    { table: "price_profile_item", column: "menu_item_id", refTable: "menu_item", refColumn: "id" },
+  ];
+
+  const violations: IntegrityViolation[] = [];
+
+  for (const check of checks) {
+    try {
+      const rows = db.query(
+        `SELECT COUNT(*) as c, GROUP_CONCAT(a.${check.column}, ',') as ids
+         FROM ${check.table} a
+         LEFT JOIN ${check.refTable} b ON a.${check.column} = b.${check.refColumn}
+         WHERE a.${check.column} IS NOT NULL AND b.${check.refColumn} IS NULL
+         AND a.restaurant_id = ?`
+      ).get(restaurantId) as { c: number; ids: string | null } | undefined;
+
+      if (rows && rows.c > 0) {
+        const sampleIds = (rows.ids || "").split(",").filter(Boolean).slice(0, 5);
+        violations.push({
+          table: check.table,
+          column: check.column,
+          orphanedCount: rows.c,
+          sampleIds,
+        });
+      }
+    } catch {
+      // Table might not exist or column might be named differently — skip
+    }
+  }
+
+  return violations;
+}
+
+// ── End-to-end count verification ────────────────────────────────────────────
+// Compares cloud-provided counts against actual SQLite row counts after the
+// config transaction commits. If any table's count doesn't match, the sync
+// is considered failed — the UI is never told it's ready.
+//
+// The cloud sends counts in the config response (added to /api/edge/config).
+// If counts are absent (older backend), verification is skipped (backward compat).
+
+interface CountMismatch {
+  table: string;
+  cloud: number;
+  local: number;
+}
+
+interface VerificationResult {
+  match: boolean;
+  mismatches: CountMismatch[];
+  cloudCounts: Record<string, number>;
+  localCounts: Record<string, number>;
+}
+
+function verifyCounts(
+  db: ReturnType<typeof getDb>,
+  restaurantId: string,
+  cloudCounts: Record<string, number> | undefined
+): VerificationResult {
+  const localCounts: Record<string, number> = {};
+  const mismatches: CountMismatch[] = [];
+
+  if (!cloudCounts) {
+    return { match: true, mismatches: [], cloudCounts: {}, localCounts: {} };
+  }
+
+  const tableMap: Array<{ cloudKey: string; table: string; quoted?: boolean; scopeColumn?: string }> = [
+    { cloudKey: "taxProfiles", table: "tax_profile", scopeColumn: "restaurant_id" },
+    { cloudKey: "priceProfiles", table: "price_profile", scopeColumn: "restaurant_id" },
+    { cloudKey: "priceProfileItems", table: "price_profile_item", scopeColumn: "restaurant_id" },
+    { cloudKey: "venues", table: "venue", scopeColumn: "restaurant_id" },
+    { cloudKey: "floors", table: "floor", scopeColumn: "restaurant_id" },
+    { cloudKey: "sections", table: "section", scopeColumn: "restaurant_id" },
+    { cloudKey: "tables", table: "table", quoted: true, scopeColumn: "restaurant_id" },
+    { cloudKey: "categories", table: "category", scopeColumn: "restaurant_id" },
+    { cloudKey: "menuItems", table: "menu_item", scopeColumn: "restaurant_id" },
+    { cloudKey: "menuVariants", table: "menu_item_variant", scopeColumn: "restaurant_id" },
+    { cloudKey: "menuAddons", table: "menu_item_addon", scopeColumn: "restaurant_id" },
+    { cloudKey: "venuePrices", table: "venue_price", scopeColumn: "restaurant_id" },
+    { cloudKey: "venueAvailability", table: "venue_menu_item_availability", scopeColumn: "restaurant_id" },
+    { cloudKey: "users", table: "users", scopeColumn: "outlet_id" },
+  ];
+
+  for (const { cloudKey, table, quoted, scopeColumn } of tableMap) {
+    const cloudCount = cloudCounts[cloudKey];
+    if (cloudCount === undefined) continue;
+
+    const tableRef = quoted ? `"${table}"` : table;
+    try {
+      const row = db.query(
+        `SELECT COUNT(*) as c FROM ${tableRef} WHERE ${scopeColumn} = ?`
+      ).get(restaurantId) as { c: number } | undefined;
+      const localCount = row?.c ?? 0;
+      localCounts[cloudKey] = localCount;
+
+      if (localCount !== cloudCount) {
+        mismatches.push({ table: cloudKey, cloud: cloudCount, local: localCount });
+      }
+    } catch {
+      localCounts[cloudKey] = -1;
+      mismatches.push({ table: cloudKey, cloud: cloudCount, local: -1 });
+    }
+  }
+
+  return {
+    match: mismatches.length === 0,
+    mismatches,
+    cloudCounts,
+    localCounts,
+  };
+}
+
+export type SyncStageCallback = (stage: "validating" | "committing" | "verifying") => void;
+
+export async function downloadFullConfig(onStage?: SyncStageCallback): Promise<{ success: boolean; error?: string; tablesLoaded?: number }> {
   if (_downloadInProgress) return _downloadInProgress;
-  _downloadInProgress = _downloadFullConfigImpl();
+  _downloadInProgress = _downloadFullConfigImpl(onStage);
   try {
     return await _downloadInProgress;
   } finally {
@@ -46,7 +248,7 @@ export async function downloadFullConfig(): Promise<{ success: boolean; error?: 
   }
 }
 
-async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: string; tablesLoaded?: number }> {
+async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<{ success: boolean; error?: string; tablesLoaded?: number }> {
   const backendUrl = getBackendUrl();
   const token = getSessionToken();
   const restaurantId = getRestaurantId();
@@ -56,21 +258,28 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
   }
 
   try {
-    console.log(`[config] Fetching ${backendUrl}/api/edge/config with token (restaurantId=${restaurantId})`);
+    runtimeLog.info(`[config] Fetching config from cloud`, { url: `${backendUrl}/api/edge/config`, restaurantId, deviceId: getDeviceId() });
     const res = await cloudFetch(`${backendUrl}/api/edge/config`, {
       method: "GET",
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
       },
-      timeout: 60_000,
+      connectTimeout: 15_000,
+      bodyTimeout: 60_000,
+      retries: 2,
     });
 
-    console.log(`[config] Cloud response: status=${res.status}, ok=${res.ok}`);
+    runtimeLog.info(`[config] Cloud response`, { status: res.status, ok: res.ok, restaurantId, deviceId: getDeviceId() });
 
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
-      console.warn(`[config] Cloud returned error: ${JSON.stringify(body)}`);
+      runtimeLog.warn("[config] Cloud returned error", {
+        status: res.status,
+        body,
+        restaurantId,
+        deviceId: getDeviceId(),
+      });
       return { success: false, error: body.error || `HTTP ${res.status}` };
     }
 
@@ -78,16 +287,49 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
     const db = getDb();
 
     if (!config.outlet) {
-      console.warn("[config] Cloud config response missing outlet — aborting");
+      runtimeLog.warn("[config] Cloud config response missing outlet — aborting", {
+        restaurantId,
+        deviceId: getDeviceId(),
+      });
       return { success: false, error: "Outlet not found in cloud config" };
     }
 
-    console.log(`[config] Config received: outlet=${config.outlet.id}, ` +
-      `taxProfiles=${config.taxProfiles?.length || 0}, ` +
-      `menuItems=${config.menuItems?.length || 0}, ` +
-      `tables=${config.tables?.length || 0}, ` +
-      `users=${config.users?.length || 0}, ` +
-      `organizationId=${config.organizationId || 'none'}`);
+    // ── Schema validation: ensure all expected fields are arrays (or absent) ──
+    // The cloud may omit empty arrays or send null. We normalize to [] here
+    // so the iteration code below never throws TypeError.
+    const arrayFields: (keyof ConfigResponse)[] = [
+      "taxProfiles", "priceProfiles", "priceProfileItems",
+      "venues", "floors", "sections", "tables",
+      "categories", "menuItems", "menuVariants", "menuAddons",
+      "venuePrices", "venueAvailability", "users",
+    ];
+    for (const field of arrayFields) {
+      const val = config[field];
+      if (val != null && !Array.isArray(val)) {
+        const error = `Config field '${String(field)}' is not an array (got ${typeof val})`;
+        runtimeLog.error(`[config] Schema validation failed: ${error}`, {
+          restaurantId,
+          deviceId: getDeviceId(),
+        });
+        return { success: false, error };
+      }
+    }
+
+    runtimeLog.info(`[config] Config received`, {
+      outlet: config.outlet.id,
+      taxProfiles: config.taxProfiles?.length ?? 0,
+      menuItems: config.menuItems?.length ?? 0,
+      tables: config.tables?.length ?? 0,
+      users: config.users?.length ?? 0,
+      organizationId: config.organizationId || "none",
+      configVersion: config.configVersion,
+      restaurantId,
+      deviceId: getDeviceId(),
+    });
+
+    // ── Stage: VALIDATING ─────────────────────────────────────────────────────
+    // Schema validation passed, cloud response is well-formed.
+    onStage?.("validating");
 
     let totalRows = 0;
 
@@ -105,12 +347,12 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
       // Get all restaurant IDs in the organization from the config data
       const allRestaurantIds = new Set([
         rid,
-        ...config.venues.map((v: any) => v.restaurantId),
-        ...config.tables.map((t: any) => t.restaurantId),
-        ...config.menuItems.map((m: any) => m.restaurantId),
-        ...config.categories.map((c: any) => c.restaurantId),
-        ...config.taxProfiles.map((tp: any) => tp.restaurantId),
-        ...config.priceProfiles.map((pp: any) => pp.restaurantId),
+        ...(config.venues ?? []).map((v: any) => v.restaurantId),
+        ...(config.tables ?? []).map((t: any) => t.restaurantId),
+        ...(config.menuItems ?? []).map((m: any) => m.restaurantId),
+        ...(config.categories ?? []).map((c: any) => c.restaurantId),
+        ...(config.taxProfiles ?? []).map((tp: any) => tp.restaurantId),
+        ...(config.priceProfiles ?? []).map((pp: any) => pp.restaurantId),
       ]);
       
       for (const restaurantId of allRestaurantIds) {
@@ -151,7 +393,7 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
       db.query(`DELETE FROM users WHERE outlet_id = ?`).run(rid);
     }
 
-    console.log("[config] Purge complete — starting upserts");
+    runtimeLog.info("[config] Purge complete — starting upserts", { restaurantId, deviceId: getDeviceId() });
 
     // ── Outlet ──────────────────────────────────────────────────────────────
     db.query(`INSERT INTO outlet (
@@ -195,7 +437,7 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
     totalRows++;
 
     // ── Tax Profiles ─────────────────────────────────────────────────────────
-    for (const tp of config.taxProfiles) {
+    for (const tp of config.taxProfiles ?? []) {
       db.query(`INSERT INTO tax_profile (id, restaurant_id, name, gst_category, gst_rate, gst_registered, service_charge_percent, is_default, synced_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET name=excluded.name, gst_category=excluded.gst_category, gst_rate=excluded.gst_rate,
@@ -205,7 +447,7 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
     }
 
     // ── Price Profiles ──────────────────────────────────────────────────────
-    for (const pp of config.priceProfiles) {
+    for (const pp of config.priceProfiles ?? []) {
       db.query(`INSERT INTO price_profile (id, restaurant_id, name, is_default, synced_at)
         VALUES (?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET name=excluded.name, is_default=excluded.is_default, synced_at=unixepoch()
@@ -214,7 +456,7 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
     }
 
     // ── Price Profile Items ──────────────────────────────────────────────────
-    for (const ppi of config.priceProfileItems) {
+    for (const ppi of config.priceProfileItems ?? []) {
       db.query(`INSERT INTO price_profile_item (id, price_profile_id, menu_item_id, price, restaurant_id)
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(price_profile_id, menu_item_id) DO UPDATE SET price=excluded.price
@@ -223,7 +465,7 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
     }
 
     // ── Venues ───────────────────────────────────────────────────────────────
-    for (const v of config.venues) {
+    for (const v of config.venues ?? []) {
       db.query(`INSERT INTO venue (id, restaurant_id, name, venue_type, sort_order, is_active, is_deleted, price_profile_id, tax_profile_id, kot_printer_name, bill_printer_name, kot_enabled, synced_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET name=excluded.name, venue_type=excluded.venue_type, sort_order=excluded.sort_order,
@@ -238,7 +480,7 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
     }
 
     // ── Floors ───────────────────────────────────────────────────────────────
-    for (const f of config.floors) {
+    for (const f of config.floors ?? []) {
       db.query(`INSERT INTO floor (id, venue_id, restaurant_id, name, sort_order, is_active, synced_at)
         VALUES (?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET name=excluded.name, sort_order=excluded.sort_order, is_active=excluded.is_active, synced_at=unixepoch()
@@ -247,7 +489,7 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
     }
 
     // ── Sections ─────────────────────────────────────────────────────────────
-    for (const s of config.sections) {
+    for (const s of config.sections ?? []) {
       db.query(`INSERT INTO section (id, name, restaurant_id, floor_id, venue_id, sort_order, synced_at)
         VALUES (?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET name=excluded.name, floor_id=excluded.floor_id, venue_id=excluded.venue_id, sort_order=excluded.sort_order, synced_at=unixepoch()
@@ -256,7 +498,7 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
     }
 
     // ── Tables ───────────────────────────────────────────────────────────────
-    for (const t of config.tables) {
+    for (const t of config.tables ?? []) {
       db.query(`INSERT INTO "table" (id, number, capacity, status, section_id, restaurant_id, workflow_status, captain_id, guests, session_started_at, current_bill, kot_history, discount, section_tag, last_waiter_call_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET number=excluded.number, capacity=excluded.capacity, status=excluded.status,
@@ -276,7 +518,7 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
     }
 
     // ── Categories ────────────────────────────────────────────────────────────
-    for (const c of config.categories) {
+    for (const c of config.categories ?? []) {
       db.query(`INSERT INTO category (id, name, sort_order, is_active, restaurant_id, printer_target, synced_at)
         VALUES (?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET name=excluded.name, sort_order=excluded.sort_order, is_active=excluded.is_active, printer_target=excluded.printer_target, synced_at=unixepoch()
@@ -285,7 +527,7 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
     }
 
     // ── Menu Items ────────────────────────────────────────────────────────────
-    for (const m of config.menuItems) {
+    for (const m of config.menuItems ?? []) {
       db.query(`INSERT INTO menu_item (id, name, description, image_url, is_veg, is_available, sort_order, category_id, restaurant_id, base_price, unit, is_deleted, deleted_at, printer_target, printer_name, menu_type, gst_enabled, is_special, special_channel, special_active, special_expires_at, synced_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, image_url=excluded.image_url,
@@ -309,7 +551,7 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
     }
 
     // ── Menu Item Variants ────────────────────────────────────────────────────
-    for (const v of config.menuVariants) {
+    for (const v of config.menuVariants ?? []) {
       db.query(`INSERT INTO menu_item_variant (id, name, price, is_default, menu_item_id, is_available, restaurant_id, synced_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET name=excluded.name, price=excluded.price, is_default=excluded.is_default, is_available=excluded.is_available, synced_at=unixepoch()
@@ -318,7 +560,7 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
     }
 
     // ── Menu Item Addons ──────────────────────────────────────────────────────
-    for (const a of config.menuAddons) {
+    for (const a of config.menuAddons ?? []) {
       db.query(`INSERT INTO menu_item_addon (id, name, price, is_available, menu_item_id, restaurant_id, synced_at)
         VALUES (?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET name=excluded.name, price=excluded.price, is_available=excluded.is_available, synced_at=unixepoch()
@@ -327,7 +569,7 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
     }
 
     // ── Venue Prices ─────────────────────────────────────────────────────────
-    for (const vp of config.venuePrices) {
+    for (const vp of config.venuePrices ?? []) {
       db.query(`INSERT INTO venue_price (id, venue_id, menu_item_id, price, is_active, restaurant_id)
         VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(venue_id, menu_item_id) DO UPDATE SET price=excluded.price, is_active=excluded.is_active
@@ -336,7 +578,7 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
     }
 
     // ── Venue Menu Item Availability ──────────────────────────────────────────
-    for (const va of config.venueAvailability) {
+    for (const va of config.venueAvailability ?? []) {
       db.query(`INSERT INTO venue_menu_item_availability (id, venue_id, menu_item_id, restaurant_id, is_available)
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(venue_id, menu_item_id) DO UPDATE SET is_available=excluded.is_available
@@ -345,7 +587,7 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
     }
 
     // ── Users (staff accounts for offline PIN verification) ────────────────
-    for (const u of config.users || []) {
+    for (const u of config.users ?? []) {
       db.query(`INSERT INTO users (id, name, pin, role, is_active, outlet_id, permissions, synced_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET name=excluded.name, pin=excluded.pin, role=excluded.role,
@@ -358,19 +600,182 @@ async function _downloadFullConfigImpl(): Promise<{ success: boolean; error?: st
       totalRows++;
     }
 
-    // ── Record sync timestamp ─────────────────────────────────────────────────
+    // ── Record sync timestamp + config version (NOT config_sync_completed) ──
+    // config_sync_completed is set AFTER verification passes, not inside the
+    // transaction. This prevents a corrupted/partial commit from being marked
+    // as ready. If this is a re-sync and the first sync already succeeded,
+    // config_sync_completed stays "true" from the first sync — old data keeps
+    // serving while the re-sync retries in the background.
     setSyncState("last_full_config_sync", new Date().toISOString());
-    setSyncState("config_sync_completed", "true");
+    if (config.configVersion !== undefined) {
+      setSyncState("config_version", String(config.configVersion));
+    }
+    if (config.configChecksum) {
+      setSyncState("config_checksum", config.configChecksum);
+    }
 
     return totalRows;
     });
 
+    // ── Stage: COMMITTING ─────────────────────────────────────────────────────
+    // About to run the transaction that purges + upserts all config tables.
+    onStage?.("committing");
+
     totalRows = applyConfig();
 
-    console.log(`[config] Download complete: ${totalRows} rows loaded, config_sync_completed=true`);
+    // ── Stage: VERIFYING ──────────────────────────────────────────────────────
+    // Transaction committed — now verifying checksum, integrity, and counts.
+    onStage?.("verifying");
+
+    // ── Post-commit verification ─────────────────────────────────────────────
+    // Three gates: checksum, referential integrity, row counts.
+    // If ANY gate fails, config_sync_verified is set to "false" and the sync
+    // returns { success: false }. However, config_sync_completed is only set
+    // to "false" if this is the FIRST sync (no prior valid data). On re-sync
+    // failure, config_sync_completed stays "true" from the prior sync so the
+    // UI keeps serving old data while the retry happens in the background.
+
+    const previousSyncCompleted = getSyncState("config_sync_completed") === "true";
+
+    // ── Gate 1: Checksum verification ────────────────────────────────────────
+    const localChecksum = computeLocalConfigChecksum(db, config.outlet.id);
+    setSyncState("config_local_checksum", localChecksum);
+
+    let checksumMatch = true;
+    if (config.configChecksum && config.configChecksum !== localChecksum) {
+      checksumMatch = false;
+      runtimeLog.warn("[config] Checksum mismatch — data may be incomplete", {
+        cloudChecksum: config.configChecksum,
+        localChecksum,
+        restaurantId,
+        deviceId: getDeviceId(),
+      });
+    } else {
+      runtimeLog.info("[config] Checksum verified", {
+        checksum: localChecksum,
+        restaurantId,
+        deviceId: getDeviceId(),
+      });
+    }
+
+    // ── Gate 2: Referential integrity validation ─────────────────────────────
+    const violations = validateReferentialIntegrity(db, config.outlet.id);
+    if (violations.length > 0) {
+      runtimeLog.warn("[config] Referential integrity violations detected", {
+        violations,
+        restaurantId,
+        deviceId: getDeviceId(),
+      });
+      setSyncState("config_integrity_violations", JSON.stringify(violations));
+    } else {
+      setSyncState("config_integrity_violations", "[]");
+      runtimeLog.info("[config] Referential integrity verified", {
+        restaurantId,
+        deviceId: getDeviceId(),
+      });
+    }
+
+    // ── Gate 3: End-to-end count verification ────────────────────────────────
+    const countResult = verifyCounts(db, config.outlet.id, config.counts);
+    setSyncState("config_count_mismatches", countResult.match ? "" : JSON.stringify(countResult.mismatches));
+
+    if (!countResult.match) {
+      runtimeLog.warn("[config] Count verification failed — sync incomplete", {
+        mismatches: countResult.mismatches,
+        restaurantId,
+        deviceId: getDeviceId(),
+      });
+    } else if (config.counts) {
+      runtimeLog.info("[config] Count verification passed", {
+        cloudCounts: countResult.cloudCounts,
+        localCounts: countResult.localCounts,
+        restaurantId,
+        deviceId: getDeviceId(),
+      });
+    }
+
+    // ── Determine verification result ────────────────────────────────────────
+    const allGatesPassed = checksumMatch && violations.length === 0 && countResult.match;
+
+    if (allGatesPassed) {
+      // All verification gates passed — mark sync as completed AND verified.
+      setSyncState("config_sync_completed", "true");
+      setSyncState("config_sync_verified", "true");
+    } else {
+      // Verification failed.
+      // config_sync_verified = "false" — the latest sync did not pass verification.
+      setSyncState("config_sync_verified", "false");
+
+      if (!previousSyncCompleted) {
+        // First sync failed verification — no prior data to fall back on.
+        // Mark as not completed so isLocalReady() returns false and the UI
+        // shows "Syncing..." instead of an empty menu.
+        setSyncState("config_sync_completed", "false");
+      } else {
+        // Re-sync failed verification — prior data is still valid.
+        // Keep config_sync_completed = "true" so the UI keeps serving old data.
+        // The retry will attempt to get fresh data.
+        runtimeLog.warn("[config] Re-sync verification failed — keeping prior data operational", {
+          restaurantId,
+          deviceId: getDeviceId(),
+          previousSyncCompleted,
+        });
+      }
+
+      // Invalidate cache regardless — the new data is committed even if
+      // verification failed, and the cache should reflect the current DB state.
+      // (On re-sync failure with prior data, the committed data IS the new
+      // data — it's just not verified. The UI will serve it, which is better
+      // than serving nothing.)
+      try {
+        invalidateReadCache();
+        warmReadCache();
+      } catch (cacheErr) {
+        runtimeLog.warn("[config] Cache invalidation/warming failed (non-fatal)", {
+          error: String(cacheErr),
+        });
+      }
+
+      const mismatchSummary = countResult.mismatches
+        .map((m) => `${m.table}: cloud=${m.cloud} local=${m.local}`)
+        .join(", ");
+
+      return {
+        success: false,
+        error: `Verification failed: ${mismatchSummary || "checksum/integrity mismatch"}`,
+        tablesLoaded: totalRows,
+      };
+    }
+
+    // ── Cache invalidation + warming (only on successful verification) ───────
+    // Invalidate the in-memory read cache (stale data from before the sync)
+    // and immediately warm it with fresh data so the first UI request is instant.
+    try {
+      invalidateReadCache();
+      warmReadCache();
+    } catch (cacheErr) {
+      runtimeLog.warn("[config] Cache invalidation/warming failed (non-fatal — data is committed)", {
+        error: String(cacheErr),
+      });
+    }
+
+    runtimeLog.info(`[config] Download complete — verified`, {
+      totalRows,
+      config_sync_completed: true,
+      config_sync_verified: true,
+      restaurantId,
+      deviceId: getDeviceId(),
+      configVersion: config.configVersion,
+      checksum: localChecksum,
+      countsMatch: countResult.match,
+    });
     return { success: true, tablesLoaded: totalRows };
   } catch (err: any) {
-    console.error(`[config] Download failed: ${err.message}`, err);
+    runtimeLog.error(`[config] Download failed`, {
+      error: err?.stack || err,
+      restaurantId,
+      deviceId: getDeviceId(),
+    });
     return { success: false, error: err.message || "Failed to download config" };
   }
 }
@@ -395,6 +800,9 @@ export async function pullIncrementalChanges(): Promise<{ success: boolean; chan
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
       },
+      connectTimeout: 10_000,
+      bodyTimeout: 30_000,
+      retries: 2,
     });
 
     if (!res.ok) {
@@ -422,6 +830,20 @@ export async function pullIncrementalChanges(): Promise<{ success: boolean; chan
     }
 
     setSyncState("last_incremental_sync", data.timestamp || new Date().toISOString());
+
+    // Invalidate the read cache if any changes were applied — the cached
+    // menu/sections/venues may be stale. Full warming is too expensive for
+    // small incremental pulls, but invalidation ensures the next read
+    // fetches fresh data from SQLite.
+    if (applied > 0) {
+      try {
+        invalidateReadCache();
+      } catch (cacheErr) {
+        runtimeLog.warn("[config] Cache invalidation after incremental sync failed (non-fatal)", {
+          error: String(cacheErr),
+        });
+      }
+    }
 
     return { success: true, changesApplied: applied };
   } catch (err: any) {
@@ -641,7 +1063,7 @@ function applyChange(db: any, change: any): boolean {
       return true;
 
     default:
-      console.warn(`[Config] Unknown table for incremental sync: ${table}`);
+      runtimeLog.warn("[Config] Unknown table for incremental sync", { table });
       return false;
   }
 }

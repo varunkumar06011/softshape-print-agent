@@ -24,7 +24,7 @@
 
 import { io, type Socket } from "socket.io-client";
 import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid } from "./auth.ts";
-import { applyChangesBatch, downloadFullConfig } from "./config.ts";
+import { applyChangesBatch } from "./config.ts";
 import { getDb, setSyncState, updatePrintJobStatus, createPrintJob, claimPrintJob } from "./db.ts";
 import { printToPrinter } from "./printer.ts";
 import { printerLog } from "./contract/logger.ts";
@@ -136,7 +136,8 @@ export function startSocketSync(): void {
   socket.on("edge:full_resync", async () => {
     console.log("[SocketSync] Full resync requested by cloud");
     try {
-      const result = await downloadFullConfig();
+      const { runtimeManager } = await import("./runtimeManager.ts");
+      const result = await runtimeManager.runConfigSync();
       console.log(`[SocketSync] Full resync complete: ${result.tablesLoaded || 0} rows loaded`);
     } catch (err) {
       console.error("[SocketSync] Full resync failed:", err);

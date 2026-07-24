@@ -17,8 +17,70 @@
 
 import { getDb } from "./db.ts";
 import { getRestaurantId } from "./auth.ts";
+import { runtimeLog } from "./contract/logger.ts";
 
 const ACTIVE_ORDER_STATUSES = ["PENDING", "CONFIRMED", "PREPARING", "READY", "BILLING_REQUESTED"];
+
+// ── In-memory cache for static config reads ──────────────────────────────────
+// These tables only change on config sync, so we cache the query results
+// and invalidate them when a config sync completes. This eliminates redundant
+// SQLite queries on every /api/edge/menu, /api/edge/sections, etc. call.
+
+interface CacheEntry {
+  data: any;
+  timestamp: number;
+}
+
+const _cache = new Map<string, CacheEntry>();
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes fallback TTL
+
+function getCached<T>(key: string): T | null {
+  const entry = _cache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.timestamp > CACHE_TTL_MS) {
+    _cache.delete(key);
+    return null;
+  }
+  return entry.data as T;
+}
+
+function setCached(key: string, data: any): void {
+  if (Array.isArray(data) && data.length === 0) return;
+  _cache.set(key, { data, timestamp: Date.now() });
+}
+
+// Invalidate all cached config data. Called after config sync completes.
+export function invalidateReadCache(): void {
+  const count = _cache.size;
+  _cache.clear();
+  if (count > 0) {
+    runtimeLog.info("[reads] Cache invalidated", { entries: count });
+  }
+}
+
+// Warm the cache by pre-fetching the most common reads. Called after config
+// sync commits so the first UI request gets an instant response.
+export function warmReadCache(): void {
+  try {
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return;
+
+    const start = Date.now();
+    getSections();
+    getMenu();
+    getMenuItems();
+    getVenues();
+    getOutletSettings();
+
+    runtimeLog.info("[reads] Cache warmed", {
+      entries: _cache.size,
+      durationMs: Date.now() - start,
+      restaurantId,
+    });
+  } catch (err) {
+    runtimeLog.warn("[reads] Cache warming failed (non-fatal)", { error: String(err) });
+  }
+}
 
 // ─── GET /api/edge/orders — active orders with items (for KDS) ────────────────
 
@@ -313,6 +375,10 @@ export function getSections(): any[] {
   const restaurantId = getRestaurantId();
   if (!restaurantId) return [];
 
+  const cacheKey = `sections:${restaurantId}`;
+  const cached = getCached<any[]>(cacheKey);
+  if (cached) return cached;
+
   const db = getDb();
 
   const sections = db.query(`
@@ -325,7 +391,7 @@ export function getSections(): any[] {
     ORDER BY s.sort_order ASC, s.name ASC
   `).all(restaurantId) as any[];
 
-  return sections.map((s) => {
+  const result = sections.map((s) => {
     const tables = db.query(`
       SELECT * FROM "table" WHERE section_id = ? AND restaurant_id = ?
       ORDER BY number ASC
@@ -378,6 +444,9 @@ export function getSections(): any[] {
       })),
     };
   });
+
+  setCached(cacheKey, result);
+  return result;
 }
 
 // ─── GET /api/edge/menu — full menu with categories, items, variants ─────────
@@ -385,6 +454,10 @@ export function getSections(): any[] {
 export function getMenu(venueId?: string): any[] {
   const restaurantId = getRestaurantId();
   if (!restaurantId) return [];
+
+  const cacheKey = `menu:${restaurantId}:${venueId || "all"}`;
+  const cached = getCached<any[]>(cacheKey);
+  if (cached) return cached;
 
   const db = getDb();
 
@@ -415,7 +488,7 @@ export function getMenu(venueId?: string): any[] {
     allVenuePricesByItem[vp.menu_item_id][vp.venue_id] = Number(vp.price);
   }
 
-  return categories.map((cat) => {
+  const result = categories.map((cat) => {
     const items = db.query(`
       SELECT * FROM menu_item
       WHERE category_id = ? AND restaurant_id = ? AND is_available = 1 AND is_deleted = 0
@@ -484,6 +557,9 @@ export function getMenu(venueId?: string): any[] {
       items: mappedItems,
     };
   });
+
+  setCached(cacheKey, result);
+  return result;
 }
 
 // ─── GET /api/edge/menu/items — lean flat list for POS ───────────────────────
@@ -491,6 +567,10 @@ export function getMenu(venueId?: string): any[] {
 export function getMenuItems(venueId?: string): any[] {
   const restaurantId = getRestaurantId();
   if (!restaurantId) return [];
+
+  const cacheKey = `menuItems:${restaurantId}:${venueId || "all"}`;
+  const cached = getCached<any[]>(cacheKey);
+  if (cached) return cached;
 
   const db = getDb();
 
@@ -532,7 +612,7 @@ export function getMenuItems(venueId?: string): any[] {
 
   const now = Date.now();
 
-  return items
+  const result = items
     .filter((m) => {
       if (!m.is_special) return true;
       if (!m.special_active) return false;
@@ -577,6 +657,9 @@ export function getMenuItems(venueId?: string): any[] {
         venueAvailabilities: venueAvailByItem[m.id] ?? {},
       };
     });
+
+  setCached(cacheKey, result);
+  return result;
 }
 
 // ─── GET /api/edge/venues — venues with floors and sections ──────────────────
@@ -584,6 +667,10 @@ export function getMenuItems(venueId?: string): any[] {
 export function getVenues(): any[] {
   const restaurantId = getRestaurantId();
   if (!restaurantId) return [];
+
+  const cacheKey = `venues:${restaurantId}`;
+  const cached = getCached<any[]>(cacheKey);
+  if (cached) return cached;
 
   const db = getDb();
 
@@ -593,7 +680,7 @@ export function getVenues(): any[] {
     ORDER BY sort_order ASC, name ASC
   `).all(restaurantId) as any[];
 
-  return venues.map((v) => {
+  const result = venues.map((v) => {
     const floors = db.query(`
       SELECT * FROM floor
       WHERE venue_id = ? AND is_active = 1
@@ -636,6 +723,9 @@ export function getVenues(): any[] {
       })),
     };
   });
+
+  setCached(cacheKey, result);
+  return result;
 }
 
 // ─── GET /api/edge/outlet — outlet settings ──────────────────────────────────
@@ -644,12 +734,16 @@ export function getOutletSettings(): any | null {
   const restaurantId = getRestaurantId();
   if (!restaurantId) return null;
 
+  const cacheKey = `outlet:${restaurantId}`;
+  const cached = getCached<any>(cacheKey);
+  if (cached) return cached;
+
   const db = getDb();
 
   const outlet = db.query("SELECT * FROM outlet WHERE id = ?").get(restaurantId) as any;
   if (!outlet) return null;
 
-  return {
+  const result = {
     id: outlet.id,
     name: outlet.name,
     slug: outlet.slug,
@@ -678,4 +772,7 @@ export function getOutletSettings(): any | null {
     organizationId: outlet.organization_id,
     isActive: !!outlet.is_active,
   };
+
+  setCached(cacheKey, result);
+  return result;
 }
