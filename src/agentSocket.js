@@ -249,7 +249,7 @@ export function setPrinterStatus(status) {
 function getPrinterStatusForType(type) {
   if (type === "KOT" || type === "TABLE_SWAP") return printerStatus.kitchen || "unknown";
   if (type === "BAR_KOT") return printerStatus.bar || "unknown";
-  if (type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "BILL" || type === "VOUCHER" || type === "EXPENDITURE") return printerStatus.bill || "unknown";
+  if (type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "BILL" || type === "VOUCHER" || type === "EXPENDITURE" || type === "X_REPORT" || type === "RECEIPT") return printerStatus.bill || "unknown";
   if (type === "CANCEL_KOT" || type === "CANCEL_ORDER") {
     // Cancel routing depends on item type — check both
     return printerStatus.kitchen || printerStatus.bar || "unknown";
@@ -532,7 +532,7 @@ export async function handlePrintJob(envelope) {
   if (!targetPrinter) {
     if (type === "KOT") targetPrinter = printerMapping.kitchen;
     else if (type === "BAR_KOT") targetPrinter = printerMapping.bar;
-    else if (type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "BILL" || type === "VOUCHER" || type === "EXPENDITURE") targetPrinter = printerMapping.bill || printerMapping.kitchen;
+    else if (type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "BILL" || type === "VOUCHER" || type === "EXPENDITURE" || type === "X_REPORT" || type === "RECEIPT") targetPrinter = printerMapping.bill || printerMapping.kitchen;
     else if (type === "CANCEL_KOT" || type === "CANCEL_ORDER") {
       // Route cancel slips to the correct printer based on the cancelled item's type
       const cancelItem = data?.item || data?.items?.[0];
@@ -547,7 +547,7 @@ export async function handlePrintJob(envelope) {
     targetPrinter = data.printerName;
   }
 
-  if (!targetPrinter && type !== "KOT" && type !== "BAR_KOT" && type !== "FINAL_BILL" && type !== "CANCELLED_BILL" && type !== "BILL" && type !== "VOUCHER" && type !== "EXPENDITURE" && type !== "CANCEL_KOT" && type !== "CANCEL_ORDER" && type !== "TABLE_SWAP") {
+  if (!targetPrinter && type !== "KOT" && type !== "BAR_KOT" && type !== "FINAL_BILL" && type !== "CANCELLED_BILL" && type !== "BILL" && type !== "VOUCHER" && type !== "EXPENDITURE" && type !== "X_REPORT" && type !== "RECEIPT" && type !== "CANCEL_KOT" && type !== "CANCEL_ORDER" && type !== "TABLE_SWAP") {
     console.warn(`[Agent] Unknown job type: ${type}`);
     socket?.emit("print:ack", {
       restaurantId,
