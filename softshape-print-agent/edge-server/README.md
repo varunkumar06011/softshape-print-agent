@@ -164,11 +164,9 @@ edge-server/
 - **Part 6**: Captain app edge detection + routing ✅
 - **Part 7**: Cloud backend sync receiver + config endpoints ✅
 
-## Planned: Local Bill & Settlement Endpoints
+## Local Bill & Settlement Endpoints
 
-The following endpoints are **not yet implemented** on the edge server. They are scoped for a future milestone to enable full offline bill generation and settlement without cloud round-trips.
-
-### Planned Endpoints
+All three endpoints are **implemented** and enable full offline bill generation and settlement without cloud round-trips.
 
 | Method | Path | Description |
 |--------|------|-------------|

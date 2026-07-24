@@ -51,7 +51,7 @@ import os from "os";
 import { runDailyMaintenance, runPeriodicBackup } from "./backup.ts";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getSessionToken, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { downloadFullConfig, pullIncrementalChanges } from "./config.ts";
-import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
+import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, reprintBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders } from "./reads.ts";
 import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
 import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode } from "./socketSync.ts";
@@ -701,24 +701,31 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     }
 
     const results = [];
+    let batchError: string | null = null;
     for (const item of items) {
-      const result = await cancelKotItem({
-        orderId: body.orderId,
-        restaurantId,
-        orderItemId: item.orderItemId,
-        cancelQuantity: item.cancelQuantity || 1,
-        cancelledBy: body.cancelledBy || "Staff",
-        tableNumber: body.tableNumber,
-        requestId: body.requestId,
-        localPrinted: body.localPrinted || false,
-        deviceId: body.deviceId,
-        expectedRevision: body.expectedRevision,
-      });
-      results.push({ orderItemId: item.orderItemId, success: result.success, error: result.error });
+      try {
+        const result = await cancelKotItem({
+          orderId: body.orderId,
+          restaurantId,
+          orderItemId: item.orderItemId,
+          cancelQuantity: item.cancelQuantity || 1,
+          cancelledBy: body.cancelledBy || "Staff",
+          tableNumber: body.tableNumber,
+          requestId: body.requestId,
+          localPrinted: body.localPrinted || false,
+          deviceId: body.deviceId,
+          expectedRevision: body.expectedRevision,
+        });
+        results.push({ orderItemId: item.orderItemId, success: result.success, error: result.error });
+      } catch (err: any) {
+        results.push({ orderItemId: item.orderItemId, success: false, error: err.message || "Cancel failed" });
+        batchError = `Batch cancelled at item ${item.orderItemId}: ${err.message || "Unknown error"}`;
+        break;
+      }
     }
 
     const allSuccess = results.every(r => r.success);
-    return jsonResponse({ success: allSuccess, results });
+    return jsonResponse({ success: allSuccess, results, batchError });
   }
 
   // ── POST /api/edge/kot/reprint — reprint KOT for an order ──────────────────
@@ -788,6 +795,25 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       expectedRevision: body.expectedRevision,
     });
     if (!result.success) return errorResponse(result.error || "Print bill failed", 400);
+    return jsonResponse(result);
+  }
+
+  // ── POST /api/edge/order/reprint-bill — reprint existing bill from local DB ──
+  if (url.pathname === "/api/edge/order/reprint-bill" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("No valid session", 401);
+    const body = await req.json().catch(() => ({}));
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const result = await reprintBillEdge({
+      orderId: body.orderId,
+      restaurantId,
+      discountPercent: body.discountPercent,
+      billEventId: body.billEventId,
+      requestId: body.requestId,
+      deviceId: body.deviceId,
+      expectedRevision: body.expectedRevision,
+    });
+    if (!result.success) return errorResponse(result.error || "Reprint bill failed", 400);
     return jsonResponse(result);
   }
 

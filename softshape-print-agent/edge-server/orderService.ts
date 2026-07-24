@@ -1759,6 +1759,146 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
   }
 }
 
+// ─── Reprint Bill (reprint existing bill with current discount) ───────────────
+
+export interface ReprintBillInput {
+  orderId: string;
+  restaurantId: string;
+  discountPercent?: number;
+  billEventId?: string;
+  requestId?: string;
+  deviceId?: string;
+  expectedRevision?: number;
+}
+
+export async function reprintBillEdge(input: ReprintBillInput): Promise<{ success: boolean; error?: string; billNumber?: string; printResults?: any[]; printPending?: boolean }> {
+  const db = getDb();
+  const { orderId, restaurantId, discountPercent } = input;
+
+  const idem = checkCommandIdempotency<{ success: boolean; error?: string; billNumber?: string; printResults?: any[]; printPending?: boolean }>(restaurantId, input, "reprintBill", orderId);
+  if (idem.replay && idem.result) {
+    return idem.result;
+  }
+
+  const order = db.query("SELECT * FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
+  if (!order) {
+    const rejectResult = { success: false, error: "Order not found" };
+    recordCommandResult(restaurantId, input, "reprintBill", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
+  }
+
+  if (!order.bill_number) {
+    const rejectResult = { success: false, error: "No bill has been generated for this order yet" };
+    recordCommandResult(restaurantId, input, "reprintBill", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
+  }
+
+  const billNumber = order.bill_number;
+
+  const table = getTableWithSection(order.table_id);
+  const outlet = getOutlet(restaurantId);
+  if (!table || !outlet) {
+    const failResult = { success: false, error: "Table or outlet not found — cannot reprint bill" };
+    recordCommandResult(restaurantId, input, "reprintBill", "order", orderId, "failed", failResult, null, failResult.error);
+    return failResult;
+  }
+
+  const orderItems = db.query(
+    `SELECT oi.*, mi.gst_enabled as menu_gst_enabled
+     FROM order_item oi
+     LEFT JOIN menu_item mi ON oi.menu_item_id = mi.id
+     WHERE oi.order_id = ?
+       AND (oi.cancelled_quantity IS NULL OR oi.cancelled_quantity < oi.quantity)
+       AND (oi.removed_from_bill IS NULL OR oi.removed_from_bill = 0)`
+  ).all(orderId) as any[];
+
+  const formattedTableNumber = formatTableNumber(table);
+  const sectionTag = table.section_tag;
+  const serviceChargePercent = outlet.service_charge_percent || 0;
+
+  const billItems = orderItems.map(oi => ({
+    name: oi.name,
+    quantity: oi.quantity - (oi.cancelled_quantity || 0),
+    price: Number(oi.price),
+    menuType: oi.menu_type === "LIQUOR" ? "LIQUOR" as const : "FOOD" as const,
+    gstEnabled: oi.menu_gst_enabled !== 0,
+  }));
+
+  const escposData = buildBill({
+    tableNumber: formattedTableNumber,
+    items: billItems,
+    totalAmount: 0,
+    restaurant: {
+      name: outlet.name,
+      receiptHeader: outlet.receipt_header,
+      receiptSubHeader: outlet.receipt_sub_header,
+      address: outlet.address,
+      phone: outlet.phone,
+      gstin: outlet.gstin,
+    },
+    sectionTag,
+    gstCategory: outlet.gst_category,
+    gstRate: outlet.gst_rate,
+    gstRegistered: outlet.gst_registered,
+    pricesIncludeGst: outlet.prices_include_gst,
+    discountPercent: discountPercent || 0,
+    serviceChargePercent,
+    billNumber,
+  });
+
+  const printerConfig = outlet.printerConfig || {};
+  const billPrinterName = table.bill_printer_name || resolvePrinterName(null, "BILL_PRINTER", null, printerConfig);
+
+  const billGroup: PrintGroup = { printerName: billPrinterName || null, escposData, type: "BILL" };
+  const eventId = input.billEventId || `REPRINT-BILL-${orderId}-${Date.now()}`;
+
+  const printResults: any[] = [];
+  if (escposData.length === 0) {
+    printResults.push({ ok: false, printerName: billPrinterName || "unknown", bytes: 0, error: "No print data", method: "noop" });
+  } else {
+    createPrintJob({
+      eventId,
+      restaurantId,
+      orderId,
+      kotId: null,
+      kotNumber: null,
+      tableId: order.table_id,
+      printerName: billPrinterName,
+      jobType: "BILL",
+      escposData,
+      itemSummary: [],
+      captainName: null,
+    });
+    await dispatchSinglePrintJob(eventId, billGroup, undefined);
+    const job = getPrintJobByEventId(eventId);
+    if (job?.status === "printed") {
+      printResults.push({ ok: true, printerName: billPrinterName, bytes: 0, method: job.acked_via || "print_service", eventId });
+    } else if (job?.status === "printing") {
+      printResults.push({ ok: null, printerName: billPrinterName, bytes: 0, method: "cloud_relay", eventId, pending: true });
+    } else {
+      printResults.push({ ok: false, printerName: billPrinterName || "unknown", bytes: 0, error: job?.last_error || "Print failed — will retry automatically", method: "durable_queued", eventId });
+    }
+  }
+
+  const allPrinted = printResults.length > 0 && printResults.every(r => r.ok === true);
+  const anyFailed = printResults.some(r => r.ok === false);
+  const anyPending = printResults.some(r => r.ok === null);
+
+  let result: { success: boolean; error?: string; billNumber?: string; printResults?: any[]; printPending?: boolean };
+  if (allPrinted) {
+    result = { success: true, billNumber, printResults };
+  } else if (anyFailed && !anyPending) {
+    result = { success: false, error: printResults.find(r => r.ok === false)?.error || "Bill reprint failed", billNumber, printResults };
+  } else if (anyPending && !anyFailed) {
+    result = { success: true, billNumber, printResults, printPending: true };
+  } else {
+    result = { success: true, billNumber, printResults, printPending: true };
+  }
+
+  recordCommandResult(restaurantId, input, "reprintBill", "order", orderId, "applied", result, null);
+  return result;
+}
+
 // ─── Settle Order (mark as settled, free the table) ───────────────────────────
 
 export interface SettleOrderInput {
