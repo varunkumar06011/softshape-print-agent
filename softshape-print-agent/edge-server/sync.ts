@@ -22,8 +22,10 @@
 import { getDb, insertSyncAudit } from "./db.ts";
 import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid, getDeviceId, saveSession, loadSession } from "./auth.ts";
 import { cloudFetch } from "./cloudFetch.ts";
+import { pullIncrementalChanges } from "./config.ts";
 
 const SYNC_INTERVAL_MS = parseInt(process.env.EDGE_SYNC_INTERVAL_MS || "10000", 10);
+const CONFIG_PULL_INTERVAL_MS = parseInt(process.env.EDGE_CONFIG_PULL_INTERVAL_MS || "60000", 10);
 const MAX_BATCH_SIZE = 50;
 const MAX_ATTEMPTS = 5;
 const BACKOFF_BASE_MS = 10_000;   // 10 seconds
@@ -32,6 +34,7 @@ const SYNC_SCHEMA_VERSION = 2;
 
 let syncRunning = false;
 let lastSyncAt = 0;
+let lastConfigPullAt = 0;
 let consecutiveFailures = 0;
 let lastSyncResult: { ok: boolean; pushed: number; accepted: number; rejected: number; error?: string } | null = null;
 
@@ -625,6 +628,21 @@ async function runSyncCycle(): Promise<void> {
     } else {
       consecutiveFailures++;
       console.warn(`[Sync] Push failed (${consecutiveFailures} consecutive) — backing off for ${getBackoffDelay()}ms`);
+    }
+
+    // Periodically pull config changes from cloud (printer config, menu updates, etc.)
+    // This is a safety net in case socket events are missed.
+    const now = Date.now();
+    if (now - lastConfigPullAt >= CONFIG_PULL_INTERVAL_MS) {
+      lastConfigPullAt = now;
+      try {
+        const pullResult = await pullIncrementalChanges();
+        if (pullResult.success && pullResult.changesApplied && pullResult.changesApplied > 0) {
+          console.log(`[Sync] Config pull applied ${pullResult.changesApplied} changes from cloud`);
+        }
+      } catch (pullErr) {
+        console.warn("[Sync] Config pull failed:", (pullErr as Error)?.message || pullErr);
+      }
     }
   } catch (err) {
     consecutiveFailures++;

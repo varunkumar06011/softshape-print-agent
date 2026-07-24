@@ -71,11 +71,181 @@ import { getOrCreateRuntimeToken, validateRuntimeToken, rotateRuntimeToken, PUBL
 import { registerEventClient, handleEventMessage, unregisterEventClient, emitEvent, getEventClientCount, getAuthenticatedClientCount } from "./eventBus.ts";
 import { EVENT_NAMES } from "./contract/events.ts";
 import { runtimeLog } from "./contract/logger.ts";
-import { hashSync } from "bcryptjs";
+import { hashSync, compareSync } from "bcryptjs";
 
 const PORT = parseInt(process.env.EDGE_PORT || "3101", 10);
+
+// ── Edge role verification (S4 offline) ──────────────────────────────────────
+// Verifies that the caller's userId + pin match a local user with an allowed role.
+// Returns null on success, or an error response on failure.
+// Financial endpoints (settle, print-bill, swap-table, transfer-items, edit-bill,
+// confirm-payment) must call this to enforce role-based access control offline.
+const ROLE_HIERARCHY: Record<string, number> = {
+  CAPTAIN: 1,
+  CASHIER: 2,
+  MANAGER: 3,
+  ADMIN: 4,
+  OWNER: 5,
+};
+
+// ── PIN brute-force protection (H2) ──────────────────────────────────────────
+// Tracks failed PIN attempts per userId. After MAX_PIN_ATTEMPTS failures within
+// the LOCKOUT_WINDOW, the account is locked for LOCKOUT_DURATION seconds.
+const MAX_PIN_ATTEMPTS = 5;
+const LOCKOUT_WINDOW_MS = 60_000;   // 60s rolling window for counting attempts
+const LOCKOUT_DURATION_MS = 60_000; // 60s lockout after exceeding max attempts
+
+const pinFailures = new Map<string, number[]>();
+
+function recordPinFailure(userId: string): void {
+  const now = Date.now();
+  const cutoff = now - LOCKOUT_WINDOW_MS;
+  const attempts = (pinFailures.get(userId) || []).filter(t => t > cutoff);
+  attempts.push(now);
+  pinFailures.set(userId, attempts);
+}
+
+function isPinLocked(userId: string): boolean {
+  const attempts = pinFailures.get(userId);
+  if (!attempts || attempts.length < MAX_PIN_ATTEMPTS) return false;
+  const now = Date.now();
+  const cutoff = now - LOCKOUT_WINDOW_MS;
+  const recent = attempts.filter(t => t > cutoff);
+  if (recent.length >= MAX_PIN_ATTEMPTS) {
+    const oldestRelevant = recent[0];
+    if (now - oldestRelevant < LOCKOUT_DURATION_MS) return true;
+    // Lockout expired — reset
+    pinFailures.delete(userId);
+  }
+  return false;
+}
+
+function clearPinFailures(userId: string): void {
+  pinFailures.delete(userId);
+}
+
+async function verifyEdgeRole(
+  body: any,
+  allowedRoles: string[],
+): Promise<Response | null> {
+  const userId = body?.userId || body?.cashierId;
+  const pin = body?.pin || body?.cashierPin;
+  if (!userId || !pin) {
+    return errorResponse("userId and pin are required for this operation", 401);
+  }
+
+  // Check brute-force lockout before hitting the database
+  if (isPinLocked(userId)) {
+    return errorResponse("Too many failed attempts. Please try again later.", 429);
+  }
+
+  const db = getDb();
+  const restaurantId = getRestaurantId();
+  if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+  const user = db.query(
+    "SELECT id, name, pin, role, is_active FROM users WHERE id = ? AND outlet_id = ?"
+  ).get(userId, restaurantId) as { id: string; name: string; pin: string | null; role: string; is_active: number } | null;
+
+  if (!user) return errorResponse("Invalid credentials", 401);
+  if (!user.is_active) return errorResponse("Account is inactive", 403);
+  if (!user.pin) return errorResponse("No PIN set for this account", 401);
+
+  const isValid = compareSync(String(pin), user.pin);
+  if (!isValid) {
+    recordPinFailure(userId);
+    return errorResponse("Invalid credentials", 401);
+  }
+
+  // Successful auth — clear any prior failure history
+  clearPinFailures(userId);
+
+  const userRoleLevel = ROLE_HIERARCHY[(user.role || "").toUpperCase()] ?? 0;
+  const minRequiredLevel = Math.min(
+    ...allowedRoles.map(r => ROLE_HIERARCHY[r.toUpperCase()] ?? 0)
+  );
+
+  if (userRoleLevel < minRequiredLevel) {
+    return errorResponse(`Role '${user.role}' is not permitted for this operation`, 403);
+  }
+
+  return null;
+}
+
+// ── Input validation (S8) ────────────────────────────────────────────────────
+// Lightweight validation for edge server POST endpoints. Avoids adding zod
+// as a dependency to keep the edge server bundle minimal.
+// Schema entries can be a simple type string ("string" | "number" | "array" | "boolean")
+// or an object { type, maxLength?, allowEmpty? } for additional constraints.
+type FieldType = "string" | "number" | "array" | "boolean";
+type FieldSchema = FieldType | { type: FieldType; maxLength?: number; allowEmpty?: boolean };
+const MAX_STRING_LENGTH = 10_000;
+const MAX_ARRAY_LENGTH = 500;
+
+function validateFields(body: any, schema: Record<string, FieldSchema>): string | null {
+  for (const [field, spec] of Object.entries(schema)) {
+    const type: FieldType = typeof spec === "string" ? spec : spec.type;
+    const maxLength = typeof spec === "object" ? spec.maxLength : undefined;
+    const allowEmpty = typeof spec === "object" ? spec.allowEmpty : undefined;
+
+    const val = body?.[field];
+    if (val === undefined || val === null) {
+      return `${field} is required`;
+    }
+    switch (type) {
+      case "string": {
+        if (typeof val !== "string" || !val.trim()) return `${field} must be a non-empty string`;
+        const limit = maxLength ?? MAX_STRING_LENGTH;
+        if (val.length > limit) return `${field} exceeds maximum length of ${limit}`;
+        break;
+      }
+      case "number":
+        if (typeof val !== "number" || isNaN(val)) return `${field} must be a valid number`;
+        break;
+      case "array": {
+        if (!Array.isArray(val)) return `${field} must be an array`;
+        if (!allowEmpty && val.length === 0) return `${field} must not be empty`;
+        if (val.length > MAX_ARRAY_LENGTH) return `${field} exceeds maximum of ${MAX_ARRAY_LENGTH} items`;
+        break;
+      }
+      case "boolean":
+        if (typeof val !== "boolean") return `${field} must be a boolean`;
+        break;
+    }
+  }
+  return null;
+}
+
 let startupState: "starting" | "ready" | "error" = "starting";
 let startupError = "";
+
+// ── Per-IP rate limiting (SC5) ───────────────────────────────────────────────
+// Simple in-memory token bucket: 120 requests per minute per IP.
+// POS operations are bursty but low-volume; this prevents LAN abuse.
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX = 120;
+const ipRequestCounts = new Map<string, { count: number; windowStart: number }>();
+
+function checkRateLimit(clientIp: string): boolean {
+  const now = Date.now();
+  const entry = ipRequestCounts.get(clientIp);
+  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+    ipRequestCounts.set(clientIp, { count: 1, windowStart: now });
+    return true;
+  }
+  entry.count++;
+  return entry.count <= RATE_LIMIT_MAX;
+}
+
+// Clean up stale entries every 5 minutes to prevent memory growth
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of ipRequestCounts) {
+    if (now - entry.windowStart > RATE_LIMIT_WINDOW_MS * 2) {
+      ipRequestCounts.delete(ip);
+    }
+  }
+}, 5 * 60_000);
 
 // ── CORS headers for LAN access (captain/cashier apps on other devices) ──────
 
@@ -117,10 +287,29 @@ function invalidateSetupNonce(): void {
 
 // ── Route handlers ────────────────────────────────────────────────────────────
 
-async function handleRequest(req: Request, url: URL): Promise<Response> {
+async function handleRequest(req: Request, url: URL, server: any): Promise<Response> {
   // ── CORS preflight ──────────────────────────────────────────────────────────
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+
+  // ── Per-IP rate limiting (SC5) ──────────────────────────────────────────────
+  // Use the actual socket remote address from Bun instead of the spoofable
+  // X-Forwarded-For header. On a LAN there is no reverse proxy, so the socket
+  // address is the only trustworthy client identifier.
+  let clientIp = "unknown";
+  try {
+    const addr = server.requestIP(req);
+    if (addr && typeof addr === 'object' && 'address' in addr) {
+      clientIp = addr.address;
+    } else if (typeof addr === 'string') {
+      clientIp = addr;
+    }
+  } catch {
+    // requestIP may fail for some request types — fall back to unknown
+  }
+  if (!checkRateLimit(clientIp)) {
+    return errorResponse("Rate limit exceeded. Please slow down.", 429);
   }
 
   // ── LAN API key auth (staged rollout) ────────────────────────────────────────
@@ -149,9 +338,15 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       }
       // Before onboarding completes, allow without key (initial setup flow)
     } else if (url.pathname === "/print") {
-      // /print requires the edge key when one is configured
-      if (configuredKey && provided !== configuredKey) {
-        return errorResponse("Missing or invalid edge API key", 401);
+      // /print requires the edge API key unconditionally once onboarded.
+      // Before onboarding, allow without key (initial setup / test print).
+      if (isOnboarded) {
+        if (!configuredKey) {
+          return errorResponse("Edge API key not configured — run agent-register first", 401);
+        }
+        if (!provided || provided !== configuredKey) {
+          return errorResponse("Missing or invalid edge API key", 401);
+        }
       }
     } else {
       // All other routes: require key when configured.
@@ -773,6 +968,10 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   if (url.pathname === "/api/edge/order/print-bill" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("No valid session", 401);
     const body = await req.json().catch(() => ({}));
+    const roleError = await verifyEdgeRole(body, ["CASHIER", "MANAGER", "OWNER"]);
+    if (roleError) return roleError;
+    const validationError = validateFields(body, { orderId: "string" });
+    if (validationError) return errorResponse(validationError, 400);
     const restaurantId = getRestaurantId();
     if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
     const result = await printBillEdge({
@@ -795,6 +994,10 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   if (url.pathname === "/api/edge/order/settle" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("No valid session", 401);
     const body = await req.json().catch(() => ({}));
+    const roleError = await verifyEdgeRole(body, ["CASHIER", "MANAGER", "OWNER"]);
+    if (roleError) return roleError;
+    const validationError = validateFields(body, { orderId: "string", paymentMethod: "string" });
+    if (validationError) return errorResponse(validationError, 400);
     const restaurantId = getRestaurantId();
     if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
 
@@ -836,6 +1039,10 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   if (url.pathname === "/api/edge/order/swap-table" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("No valid session", 401);
     const body = await req.json().catch(() => ({}));
+    const roleError = await verifyEdgeRole(body, ["CASHIER", "MANAGER", "OWNER"]);
+    if (roleError) return roleError;
+    const validationError = validateFields(body, { sourceTableId: "string", targetTableId: "string" });
+    if (validationError) return errorResponse(validationError, 400);
     const restaurantId = getRestaurantId();
     if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
     const result = await swapTableEdge(restaurantId, body.sourceTableId, body.targetTableId, body.swappedBy || "Cashier", {
@@ -851,6 +1058,10 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   if (url.pathname === "/api/edge/order/transfer-items" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("No valid session", 401);
     const body = await req.json().catch(() => ({}));
+    const roleError = await verifyEdgeRole(body, ["CASHIER", "MANAGER", "OWNER"]);
+    if (roleError) return roleError;
+    const validationError = validateFields(body, { sourceTableId: "string", targetTableId: "string", orderItemIds: "array" });
+    if (validationError) return errorResponse(validationError, 400);
     const restaurantId = getRestaurantId();
     if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
     const result = await transferItemsEdge(restaurantId, body.sourceTableId, body.targetTableId, body.orderItemIds || [], body.transferredBy || "Cashier", {
@@ -866,6 +1077,10 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   if (url.pathname === "/api/edge/order/edit-bill" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("No valid session", 401);
     const body = await req.json().catch(() => ({}));
+    const roleError = await verifyEdgeRole(body, ["CASHIER", "MANAGER", "OWNER"]);
+    if (roleError) return roleError;
+    const validationError = validateFields(body, { orderId: "string" });
+    if (validationError) return errorResponse(validationError, 400);
     const restaurantId = getRestaurantId();
     if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
     const result = await editBillEdge(restaurantId, body.orderId, {
@@ -883,6 +1098,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
   if (url.pathname === "/api/edge/order/confirm-payment" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("No valid session", 401);
     const body = await req.json().catch(() => ({}));
+    const roleError = await verifyEdgeRole(body, ["CASHIER", "MANAGER", "OWNER"]);
+    if (roleError) return roleError;
     const restaurantId = getRestaurantId();
     if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
     const result = await confirmPaymentEdge(restaurantId, body.transactionId, {
@@ -1758,9 +1975,20 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
           .run(userId, owner.name, pinHash, restaurantId);
         enqueueSync('users', userId, 'create');
 
-        // 6. Save printer config
+        // 6. Save printer config — normalize QuickOnboarding's { kitchen, bill, bar }
+        //    into the { printers: [{ name, type }], availablePrinters: [...] } format
+        //    that resolvePrinterName() expects.
         if (printerMapping) {
-          setConfig('printer_config', JSON.stringify(printerMapping));
+          const printers: { name: string; type: string }[] = [];
+          const availablePrinters: string[] = [];
+          const roleToType: Record<string, string> = { kitchen: 'KITCHEN', bill: 'BILL', bar: 'BAR' };
+          for (const [role, name] of Object.entries(printerMapping)) {
+            if (name && typeof name === 'string') {
+              printers.push({ name, type: roleToType[role] || role.toUpperCase() });
+              if (!availablePrinters.includes(name)) availablePrinters.push(name);
+            }
+          }
+          setConfig('printer_config', JSON.stringify({ printers, availablePrinters }));
         }
 
         // 7. Save session so the edge server is "registered" locally
@@ -2203,6 +2431,48 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     return jsonResponse({ success: true, id: restaurantId });
   }
 
+  // ── POST /api/edge/admin/rotate-key — rotate the edge API key ───────────────
+  if (url.pathname === "/api/edge/admin/rotate-key" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const body = await req.json().catch(() => ({}));
+    const roleError = await verifyEdgeRole(body, ["OWNER"]);
+    if (roleError) return roleError;
+
+    const newKey = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
+    saveEdgeApiKey(newKey);
+    console.log("[EdgeServer] Edge API key rotated by user", body?.userId);
+
+    // ── Sync the new key to the cloud backend (H5) ───────────────────────────
+    // Best-effort: if the cloud is unreachable, the local key is still valid.
+    // The cloud backend uses this key to authenticate edge server polling.
+    const backendUrl = getBackendUrl();
+    const sessionToken = getSessionToken();
+    const restaurantId = getRestaurantId();
+    if (backendUrl && sessionToken && restaurantId) {
+      (async () => {
+        try {
+          const res = await fetch(`${backendUrl}/api/edge/update-key`, {
+            method: "PATCH",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${sessionToken}`,
+            },
+            body: JSON.stringify({ restaurantId, edgeApiKey: newKey }),
+          });
+          if (!res.ok) {
+            console.warn(`[EdgeServer] Cloud key sync failed: HTTP ${res.status}`);
+          } else {
+            console.log("[EdgeServer] Edge API key synced to cloud backend");
+          }
+        } catch (syncErr: any) {
+          console.warn(`[EdgeServer] Cloud key sync error: ${syncErr.message}`);
+        }
+      })();
+    }
+
+    return jsonResponse({ success: true, key: newKey });
+  }
+
   // ── 404 ─────────────────────────────────────────────────────────────────────
   return errorResponse("Not found", 404);
 }
@@ -2286,7 +2556,7 @@ const server = Bun.serve<{ eventBus?: boolean }>({
     }
 
     try {
-      return await handleRequest(req, url);
+      return await handleRequest(req, url, server);
     } catch (err: any) {
       console.error(`[EdgeServer] Unhandled error on ${req.method} ${url.pathname}:`, err);
       return errorResponse("Internal server error", 500);
