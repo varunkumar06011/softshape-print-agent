@@ -1,6 +1,13 @@
 /**
  * SoftShape Print Agent — Frontend entry point
  *
+ * @deprecated R5: The standalone Print Agent is deprecated. The edge server
+ * (port 3101) is now the sole print authority — it dispatches print jobs via
+ * the isolated print service on :3103 (ADR-001). This Tauri app's Socket.IO
+ * print_job handler and edge WS print fallback are no longer the primary
+ * print path. Retained only for backward compatibility with deployments
+ * that have not yet upgraded to the edge server runtime.
+ *
  * Handles the UI flow:
  *   1. Check for stored session → auto-connect if found
  *   2. If no session: show setup form (restaurant code + setup token)

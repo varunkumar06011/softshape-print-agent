@@ -54,10 +54,10 @@ import { downloadFullConfig, pullIncrementalChanges } from "./config.ts";
 import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders } from "./reads.ts";
 import { startSyncWorker, stopSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
-import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode, relayPrintViaCloud } from "./socketSync.ts";
+import { startSocketSync, stopSocketSync, getSocketStatus, startHeartbeat, stopHeartbeat, isInFallbackMode } from "./socketSync.ts";
 import { acquireInstanceLock, startHeartbeatLoop, stopHeartbeatLoop, releaseInstanceLock, forceReleaseLock, getLockStatus } from "./instanceLock.ts";
 import { cloudFetch } from "./cloudFetch.ts";
-import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount, getPrintingClientCount, setClientCapability, lanBroadcast } from "./lanBroadcast.ts";
+import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount, setClientRegistered, lanBroadcast } from "./lanBroadcast.ts";
 import { printToPrinter } from "./printer.ts";
 import { startPrintService, stopPrintService, isPrintServiceReady, getPrintServiceStatus, sendToPrintService, listPrintersViaService } from "./printServiceManager.ts";
 import { deviceManager } from "./drivers/manager.ts";
@@ -350,17 +350,8 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
       console.warn(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} print service failed: ${result.error} — trying cloud relay`);
     }
 
-    // Fallback: relay via cloud WebSocket socket
-    const relayed = relayPrintViaCloud({
-      type: effectiveType,
-      data: { printerName: targetPrinter, escposData: normalizedEscpos, requestId: data?.requestId || null },
-      eventId: printEventId,
-    });
-    if (relayed) {
-      console.log(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} via cloud fallback`);
-      return jsonResponse({ ok: true, queued: false, method: "cloud_relay", eventId: printEventId });
-    }
-    return jsonResponse({ ok: false, error: "Print service unavailable and cloud socket not available", queued: false }, 503);
+    // R5: Cloud relay removed — print service is the sole transport.
+    return jsonResponse({ ok: false, error: "Print service unavailable", queued: false }, 503);
   }
 
   // ── GET /api/edge/status ────────────────────────────────────────────────────
@@ -1538,7 +1529,7 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
 
   // ── GET /api/edge/lan/status — LAN WebSocket client count (Bug 2) ─────────
   if (url.pathname === "/api/edge/lan/status" && req.method === "GET") {
-    return jsonResponse({ connectedClients: getLanClientCount(), printingClients: getPrintingClientCount() });
+    return jsonResponse({ connectedClients: getLanClientCount() });
   }
 
   // ── GET /api/edge/print-jobs — print job queue status (diagnostics) ────────
@@ -1578,6 +1569,20 @@ async function handleRequest(req: Request, url: URL): Promise<Response> {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const result = await dispatchPendingPrintJobs();
     return jsonResponse({ success: true, ...result });
+  }
+
+  // ── POST /api/output/intent — generic output intent endpoint (R2) ──────────
+  if (url.pathname === "/api/output/intent" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const body = await req.json().catch(() => ({}));
+    if (!body || body.type !== "OUTPUT" || !body.intent) {
+      return errorResponse("Invalid output intent", 400);
+    }
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const { processOutputIntent } = await import("./outputOrchestrator.ts");
+    const result = await processOutputIntent(body, restaurantId);
+    return jsonResponse(result);
   }
 
   // ── POST /api/edge/print-jobs/cancel — cancel a pending or retryable print job ──
@@ -2241,7 +2246,7 @@ const server = Bun.serve<{ eventBus?: boolean }>({
         if (data.type === "ping") {
           ws.send(JSON.stringify({ type: "pong", ts: Date.now() }));
         } else if (data.type === "register") {
-          setClientCapability(ws, data.canPrint === true);
+          setClientRegistered(ws);
         }
       } catch {
         // Ignore non-JSON messages

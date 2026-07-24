@@ -1,0 +1,183 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// outputOrchestrator.test.ts — Tests for the Output Orchestrator (R2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { test, expect, mock, beforeEach } from "bun:test";
+import type { OutputIntent } from "@softshape/output";
+
+// ── Mocks ────────────────────────────────────────────────────────────────────
+
+const mockCreatePrintJob = mock(() => 1);
+const mockDispatchSinglePrintJob = mock(() => Promise.resolve());
+const mockEmitEvent = mock(() => {});
+const mockResolvePrinterName = mock(() => "KitchenPrinter");
+const mockGetDb = mock(() => ({
+  query: mock(() => ({ get: mock(() => ({ printer_config: "{}" })) })),
+}));
+
+mock.module("../db.ts", () => ({
+  getDb: mockGetDb,
+  createPrintJob: mockCreatePrintJob,
+}));
+
+mock.module("../orderService.ts", () => ({
+  dispatchSinglePrintJob: mockDispatchSinglePrintJob,
+}));
+
+mock.module("../eventBus.ts", () => ({
+  emitEvent: mockEmitEvent,
+}));
+
+mock.module("../contract/events.ts", () => ({
+  EVENT_NAMES: {
+    PRINT_COMPLETED: "print.completed",
+    PRINT_FAILED: "print.failed",
+  },
+}));
+
+mock.module("../printer.ts", () => ({
+  resolvePrinterName: mockResolvePrinterName,
+}));
+
+mock.module("../auth.ts", () => ({
+  getRestaurantId: () => "test-restaurant-id",
+}));
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+beforeEach(() => {
+  mockCreatePrintJob.mockClear();
+  mockDispatchSinglePrintJob.mockClear();
+  mockEmitEvent.mockClear();
+  mockResolvePrinterName.mockClear();
+  mockResolvePrinterName.mockImplementation(() => "KitchenPrinter");
+  mockCreatePrintJob.mockImplementation(() => 42);
+});
+
+test("processOutputIntent renders and queues a PRINT_KOT job", async () => {
+  const { processOutputIntent } = await import("../outputOrchestrator.ts");
+
+  const intent: OutputIntent = {
+    type: "OUTPUT",
+    intentId: "test-intent-001",
+    intent: "PRINT_KOT",
+    payload: {
+      tableNumber: "T5",
+      orderId: "ord-123",
+      items: [
+        { name: "Chicken Biryani", quantity: 2, price: 220, type: "food", notes: null },
+      ],
+      kotId: "1",
+      sectionName: "Main Hall",
+      captainName: "Captain Test",
+      requestId: "req-001",
+    },
+    priority: "CRITICAL",
+  };
+
+  const result = await processOutputIntent(intent, "test-restaurant-id", "ord-123");
+
+  expect(result.jobs).toHaveLength(1);
+  expect(result.jobs[0].ok).toBe(true);
+  expect(result.jobs[0].jobId).toBe(42);
+  expect(mockCreatePrintJob).toHaveBeenCalledTimes(1);
+  expect(mockDispatchSinglePrintJob).toHaveBeenCalledTimes(1);
+  expect(mockEmitEvent).toHaveBeenCalledTimes(1);
+});
+
+test("processOutputIntent returns empty results when items array is empty", async () => {
+  const { processOutputIntent } = await import("../outputOrchestrator.ts");
+
+  const intent: OutputIntent = {
+    type: "OUTPUT",
+    intentId: "test-intent-002",
+    intent: "PRINT_KOT",
+    payload: {
+      tableNumber: "T5",
+      orderId: "ord-456",
+      items: [],
+      kotId: "2",
+      sectionName: "Main Hall",
+      captainName: "Captain Test",
+      requestId: "req-002",
+    },
+    priority: "NORMAL",
+  };
+
+  const result = await processOutputIntent(intent, "test-restaurant-id");
+
+  // Planner returns 0 jobs for empty items array
+  expect(result.jobs).toHaveLength(0);
+  expect(mockCreatePrintJob).not.toHaveBeenCalled();
+  expect(mockDispatchSinglePrintJob).not.toHaveBeenCalled();
+});
+
+test("processOutputIntent handles PRINT_LIQUOR_KOT intent", async () => {
+  const { processOutputIntent } = await import("../outputOrchestrator.ts");
+
+  const intent: OutputIntent = {
+    type: "OUTPUT",
+    intentId: "test-intent-003",
+    intent: "PRINT_LIQUOR_KOT",
+    payload: {
+      tableNumber: "T5",
+      orderId: "ord-789",
+      items: [
+        { name: "Kingfisher Beer", quantity: 1, price: 180, menuType: "LIQUOR", notes: null },
+      ],
+      kotId: "3",
+      sectionName: "Bar",
+      captainName: "Captain Test",
+      requestId: "req-003",
+    },
+    priority: "CRITICAL",
+  };
+
+  const result = await processOutputIntent(intent, "test-restaurant-id");
+
+  // Planner resolves printer for the item, produces 1 job
+  expect(result.jobs).toHaveLength(1);
+  expect(result.jobs[0].ok).toBe(true);
+  expect(mockCreatePrintJob).toHaveBeenCalledTimes(1);
+  expect(mockDispatchSinglePrintJob).toHaveBeenCalledTimes(1);
+});
+
+test("processOutputIntent produces multiple jobs for mixed food+liquor KOT (R3)", async () => {
+  const { processOutputIntent } = await import("../outputOrchestrator.ts");
+
+  let callCount = 0;
+  mockResolvePrinterName.mockImplementation((_, target) => {
+    callCount++;
+    if (target === "BAR_PRINTER") return "BarPrinter";
+    return "KitchenPrinter";
+  });
+  mockCreatePrintJob.mockImplementation(() => 99);
+
+  const intent: OutputIntent = {
+    type: "OUTPUT",
+    intentId: "test-intent-multi-r3",
+    intent: "PRINT_KOT",
+    payload: {
+      tableNumber: "T10",
+      orderId: "ord-multi-r3",
+      items: [
+        { name: "Biryani", quantity: 2, price: 220, menuType: "FOOD", printerTarget: "KOT_PRINTER" },
+        { name: "Beer", quantity: 1, price: 180, menuType: "LIQUOR", printerTarget: "BAR_PRINTER" },
+      ],
+      kotId: "10",
+      sectionName: "Main Hall",
+      captainName: "Captain Multi",
+      requestId: "req-multi-r3",
+    },
+    priority: "CRITICAL",
+  };
+
+  const result = await processOutputIntent(intent, "test-restaurant-id", "ord-multi-r3");
+
+  // Should produce 2 jobs: kitchen + bar
+  expect(result.jobs.length).toBeGreaterThanOrEqual(2);
+  expect(result.jobs.every(j => j.ok)).toBe(true);
+  expect(mockCreatePrintJob).toHaveBeenCalledTimes(result.jobs.length);
+  expect(mockDispatchSinglePrintJob).toHaveBeenCalledTimes(result.jobs.length);
+  expect(mockEmitEvent).toHaveBeenCalledTimes(result.jobs.length);
+});

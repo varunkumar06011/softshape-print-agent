@@ -6,14 +6,10 @@
 // and maintain a set of connected clients. When orderService calls
 // lanBroadcast(), the event is pushed to all connected WebSocket clients.
 //
-// Clients register their capabilities on connect via a "register" message:
-//   { type: "register", canPrint: true }  — Tauri desktop with physical printers
-//   { type: "register", canPrint: false } — Captain web/APK (no local printers)
-// This allows the edge server to distinguish printing clients from non-printing
-// ones (used by the LAN status diagnostic endpoint).
-// Note: print jobs are NO LONGER dispatched via WebSocket — they are sent via
-// HTTP POST to the cashier-desktop print bridge (port 3102). The canPrint flag
-// is retained only for diagnostic visibility.
+// Clients register on connect via a "register" message.
+// Note: print jobs are NO LONGER dispatched via WebSocket — the edge server
+// print service on :3103 is the sole print transport (ADR-001).
+// The register message is accepted but no longer tracked for print capability.
 //
 // Event format (JSON): { type: "order:created", data: { ... }, ts: <epoch_ms> }
 //
@@ -28,7 +24,6 @@ type ClientWS = { readyState: number; send(data: string): void };
 
 interface ClientInfo {
   ws: ClientWS;
-  canPrint: boolean;
   registered: boolean;
 }
 
@@ -47,28 +42,24 @@ export function initLanBroadcast() {
 }
 
 // Register a new WebSocket client (called from server.ts websocket.open).
-// New clients default to canPrint=false until they send a "register" message
-// declaring their capabilities. This prevents non-Tauri clients (captain web/APK)
-// from being counted as printing clients.
 export function registerClient(ws: ClientWS) {
-  clients.set(ws, { ws, canPrint: false, registered: false });
-  console.log(`[LANBroadcast] Client connected (${clients.size} total, ${getPrintingClientCount()} printing)`);
+  clients.set(ws, { ws, registered: false });
+  console.log(`[LANBroadcast] Client connected (${clients.size} total)`);
 }
 
-// Update a client's capabilities after they send a "register" message.
-export function setClientCapability(ws: ClientWS, canPrint: boolean) {
+// Mark a client as registered after they send a "register" message.
+export function setClientRegistered(ws: ClientWS) {
   const info = clients.get(ws);
   if (info) {
-    info.canPrint = canPrint;
     info.registered = true;
-    console.log(`[LANBroadcast] Client registered (canPrint=${canPrint}, ${clients.size} total, ${getPrintingClientCount()} printing)`);
+    console.log(`[LANBroadcast] Client registered (${clients.size} total)`);
   }
 }
 
 // Remove a disconnected client (called from server.ts websocket.close)
 export function unregisterClient(ws: ClientWS) {
   clients.delete(ws);
-  console.log(`[LANBroadcast] Client disconnected (${clients.size} total, ${getPrintingClientCount()} printing)`);
+  console.log(`[LANBroadcast] Client disconnected (${clients.size} total)`);
 }
 
 // Broadcast an event to ALL connected LAN clients (order/table events).
@@ -97,14 +88,4 @@ export function lanBroadcast(type: string, data: any) {
 // Get the total number of connected clients (for status endpoint)
 export function getLanClientCount(): number {
   return clients.size;
-}
-
-// Get the number of printing-capable clients (Tauri desktops with printers).
-// Used by the LAN status diagnostic endpoint.
-export function getPrintingClientCount(): number {
-  let count = 0;
-  for (const info of clients.values()) {
-    if (info.canPrint) count++;
-  }
-  return count;
 }

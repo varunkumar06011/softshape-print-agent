@@ -15,7 +15,6 @@ import { getDb, getNextKotNumber, enqueueSync, getKolkataDateString, createPrint
 import { buildFoodKOT, buildLiquorKOT, buildCancelKOT, buildBill, type PrintItem, type OrderData } from "./escpos.ts";
 import { resolvePrinterName, printToPrinter } from "./printer.ts";
 import { lanBroadcast } from "./lanBroadcast.ts";
-import { relayPrintViaCloud } from "./socketSync.ts";
 
 // ─── Phase 1: Command metadata + durable idempotency ─────────────────────────
 // Every edge business command carries CommandMeta for idempotency and optimistic
@@ -123,18 +122,13 @@ async function printWithLanFallback(
       console.warn(`[Print] Print service failed for ${group.type} → ${group.printerName}: ${result.error} — trying cloud relay`);
     }
 
-    // Fallback: relay via cloud WebSocket socket
-    const relayed = relayPrintViaCloud({
-      type: group.type,
-      data: { printerName: group.printerName || null, escposData: group.escposData, requestId: requestId || null },
-      eventId,
-    });
+    // R5: Cloud relay removed — SQLite queue retry loop handles failures.
     results.push({
-      ok: relayed,
+      ok: false,
       printerName: group.printerName || null,
       bytes: 0,
-      error: relayed ? null : "Bridge unavailable and cloud socket not connected",
-      method: relayed ? "cloud_relay" : "noop",
+      error: "Print service unavailable",
+      method: "noop",
       eventId,
     });
   }
@@ -159,13 +153,8 @@ async function printSingleWithLanFallback(
     console.warn(`[Print] Print service failed for ${type} → ${printerName}: ${result.error} — trying cloud relay`);
   }
 
-  // Fallback: relay via cloud WebSocket socket
-  const relayed = relayPrintViaCloud({
-    type,
-    data: { printerName: printerName || null, escposData, requestId: requestId || null },
-    eventId,
-  });
-  return { ok: relayed, printerName, bytes: 0, error: relayed ? null : "Bridge unavailable and cloud socket not connected", method: relayed ? "cloud_relay" : "noop", eventId };
+  // R5: Cloud relay removed — SQLite queue retry loop handles failures.
+  return { ok: false, printerName, bytes: 0, error: "Print service unavailable", method: "noop", eventId };
 }
 
 // ─── Durable print queue integration ──────────────────────────────────────────
@@ -281,19 +270,8 @@ export async function dispatchSinglePrintJob(
       console.warn(`[Print] Job ${eventId} → ${group.printerName} print service failed: ${result.error} — trying cloud relay`);
     }
 
-    // Fallback: relay via cloud WebSocket socket
-    const relayed = relayPrintViaCloud({
-      type: group.type,
-      data: { printerName: group.printerName || null, escposData: group.escposData, requestId: requestId || null },
-      eventId,
-    });
-    if (relayed) {
-      // Cloud relay accepted — leave as 'printing' so the background loop
-      // doesn't re-dispatch. The cloud ack path or lease expiry will resolve it.
-      return;
-    }
-    // Bridge unavailable and cloud socket not connected — mark for retry
-    updatePrintJobStatus(eventId, "retrying", "Print service unavailable and cloud socket not connected");
+    // R5: Cloud relay removed — mark for retry by SQLite queue dispatch loop.
+    updatePrintJobStatus(eventId, "retrying", "Print service unavailable");
   } catch (err: any) {
     updatePrintJobStatus(eventId, "retrying", err?.message || String(err));
     console.error(`[Print] Job ${eventId} dispatch error:`, err);

@@ -1,12 +1,16 @@
 /**
  * softshape-print-agent — Socket.IO communication layer
  *
+ * @deprecated R5: The standalone Print Agent is deprecated. The edge server
+ * runtime is now the sole print authority (ADR-001). This Socket.IO layer
+ * is retained for backward compatibility only.
+ *
  * Connects to the SoftShape backend, authenticates via agent session token,
  * and routes print_job events to the Tauri Rust core for raw printing.
  *
  * Authentication flow:
  *   1. User enters restaurant code + setup token in UI
- *   2. Calls /api/print/agent-register → receives sessionToken + missedJobs
+ *   2. Calls /api/print/agent-register → receives sessionToken
  *   3. Stores sessionToken in localStorage
  *   4. On every start: connect socket → emit agent:join → receive print_job events
  */
