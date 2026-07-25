@@ -616,8 +616,9 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
 
     const lastFullSync = getSyncState("last_full_config_sync") || null;
     const lastIncrementalSync = getSyncState("last_incremental_sync") || null;
+    const configSyncCompleted = getSyncState("config_sync_completed") === "true";
 
-    // Count local rows for status (scoped to this restaurant only)
+    // Count local rows for this outlet only
     const db = getDb();
     const rid = session.restaurantId;
     const tableCount = (db.query("SELECT COUNT(*) as c FROM \"table\" WHERE restaurant_id = ?").get(rid) as any)?.c || 0;
@@ -634,6 +635,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       backendUrl: session.backendUrl,
       lastFullConfigSync: lastFullSync,
       lastIncrementalSync: lastIncrementalSync,
+      configSyncCompleted,
       localStats: {
         tables: tableCount,
         menuItems: menuItemCount,
@@ -700,7 +702,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         sessionToken: data.sessionToken,
         restaurantId: data.restaurantId,
         restaurantName: data.restaurantName || "",
-        restaurantCode: restaurantCode || "",
+        restaurantCode: data.restaurantCode || restaurantCode || "",
         backendUrl,
         expiresAt,
         edgeApiKey: edgeApiKey || undefined,

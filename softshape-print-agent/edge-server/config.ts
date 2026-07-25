@@ -281,7 +281,7 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
         "Content-Type": "application/json",
       },
       connectTimeout: 15_000,
-      bodyTimeout: 60_000,
+      bodyTimeout: 120_000,
       retries: 2,
     });
 
@@ -349,64 +349,28 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
     let totalRows = 0;
 
     const applyConfig = db.transaction(() => {
-    // ── Purge stale data for this restaurant or organization ────────────────────
+    // ── Purge stale data for this outlet ────────────────────────────────────────
     // On re-link, old rows from a previous onboarding would otherwise remain
     // forever (ON CONFLICT only updates existing IDs; it never removes rows
     // that are no longer in the cloud config). Delete everything scoped to
-    // this restaurant (or organization if multi-outlet) before inserting the fresh snapshot.
+    // this outlet before inserting the fresh snapshot.
+    // Guard: preserve tables that have active orders to avoid orphaning
+    // in-service operational state during config refresh.
     const rid = config.outlet.id;
-    
-    // If organizationId is present, we're fetching data for all outlets in the organization
-    // Purge all organization-scoped data, otherwise just purge for the current outlet
-    if (config.organizationId) {
-      // Get all restaurant IDs in the organization from the config data
-      const allRestaurantIds = new Set([
-        rid,
-        ...(config.venues ?? []).map((v: any) => v.restaurantId),
-        ...(config.tables ?? []).map((t: any) => t.restaurantId),
-        ...(config.menuItems ?? []).map((m: any) => m.restaurantId),
-        ...(config.categories ?? []).map((c: any) => c.restaurantId),
-        ...(config.taxProfiles ?? []).map((tp: any) => tp.restaurantId),
-        ...(config.priceProfiles ?? []).map((pp: any) => pp.restaurantId),
-      ]);
-      
-      for (const restaurantId of allRestaurantIds) {
-        db.query(`DELETE FROM venue_menu_item_availability WHERE restaurant_id = ?`).run(restaurantId);
-        db.query(`DELETE FROM venue_price WHERE restaurant_id = ?`).run(restaurantId);
-        db.query(`DELETE FROM menu_item_addon WHERE restaurant_id = ?`).run(restaurantId);
-        db.query(`DELETE FROM menu_item_variant WHERE restaurant_id = ?`).run(restaurantId);
-        db.query(`DELETE FROM menu_item WHERE restaurant_id = ?`).run(restaurantId);
-        db.query(`DELETE FROM category WHERE restaurant_id = ?`).run(restaurantId);
-        // Only delete tables that have no active orders
-        db.query(`DELETE FROM "table" WHERE restaurant_id = ? AND id NOT IN (SELECT table_id FROM order_record WHERE restaurant_id = ? AND status IN ('PREPARING','READY','BILLING_REQUESTED','SETTLED') AND is_deleted = 0)`).run(restaurantId, restaurantId);
-        db.query(`DELETE FROM section WHERE restaurant_id = ?`).run(restaurantId);
-        db.query(`DELETE FROM floor WHERE restaurant_id = ?`).run(restaurantId);
-        db.query(`DELETE FROM venue WHERE restaurant_id = ?`).run(restaurantId);
-        db.query(`DELETE FROM price_profile_item WHERE restaurant_id = ?`).run(restaurantId);
-        db.query(`DELETE FROM price_profile WHERE restaurant_id = ?`).run(restaurantId);
-        db.query(`DELETE FROM tax_profile WHERE restaurant_id = ?`).run(restaurantId);
-        db.query(`DELETE FROM users WHERE outlet_id = ?`).run(restaurantId);
-      }
-    } else {
-      // Single outlet mode - purge only for current restaurant
-      // Guard: preserve tables that have active orders to avoid orphaning
-      // in-service operational state during config refresh.
-      db.query(`DELETE FROM venue_menu_item_availability WHERE restaurant_id = ?`).run(rid);
-      db.query(`DELETE FROM venue_price WHERE restaurant_id = ?`).run(rid);
-      db.query(`DELETE FROM menu_item_addon WHERE restaurant_id = ?`).run(rid);
-      db.query(`DELETE FROM menu_item_variant WHERE restaurant_id = ?`).run(rid);
-      db.query(`DELETE FROM menu_item WHERE restaurant_id = ?`).run(rid);
-      db.query(`DELETE FROM category WHERE restaurant_id = ?`).run(rid);
-      // Only delete tables that have no active orders
-      db.query(`DELETE FROM "table" WHERE restaurant_id = ? AND id NOT IN (SELECT table_id FROM order_record WHERE restaurant_id = ? AND status IN ('PREPARING','READY','BILLING_REQUESTED','SETTLED') AND is_deleted = 0)`).run(rid, rid);
-      db.query(`DELETE FROM section WHERE restaurant_id = ?`).run(rid);
-      db.query(`DELETE FROM floor WHERE restaurant_id = ?`).run(rid);
-      db.query(`DELETE FROM venue WHERE restaurant_id = ?`).run(rid);
-      db.query(`DELETE FROM price_profile_item WHERE restaurant_id = ?`).run(rid);
-      db.query(`DELETE FROM price_profile WHERE restaurant_id = ?`).run(rid);
-      db.query(`DELETE FROM tax_profile WHERE restaurant_id = ?`).run(rid);
-      db.query(`DELETE FROM users WHERE outlet_id = ?`).run(rid);
-    }
+    db.query(`DELETE FROM venue_menu_item_availability WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM venue_price WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM menu_item_addon WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM menu_item_variant WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM menu_item WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM category WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM "table" WHERE restaurant_id = ? AND id NOT IN (SELECT table_id FROM order_record WHERE restaurant_id = ? AND status IN ('PREPARING','READY','BILLING_REQUESTED','SETTLED') AND is_deleted = 0)`).run(rid, rid);
+    db.query(`DELETE FROM section WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM floor WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM venue WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM price_profile_item WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM price_profile WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM tax_profile WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM users WHERE outlet_id = ?`).run(rid);
 
     runtimeLog.info("[config] Purge complete — starting upserts", { restaurantId, deviceId: getDeviceId() });
 
@@ -652,22 +616,8 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
 
     const previousSyncCompleted = getSyncState("config_sync_completed") === "true";
 
-    // ── Resolve all restaurant IDs for multi-outlet verification ─────────────
-    // The cloud returns data for all outlets in the organization, so we must
-    // count local rows across the same set of IDs. Using only config.outlet.id
-    // would always mismatch for multi-outlet orgs.
-    const allRestaurantIds = config.organizationId
-      ? [...new Set([
-          config.outlet.id,
-          ...(config.venues ?? []).map((v: any) => v.restaurantId),
-          ...(config.tables ?? []).map((t: any) => t.restaurantId),
-          ...(config.menuItems ?? []).map((m: any) => m.restaurantId),
-          ...(config.categories ?? []).map((c: any) => c.restaurantId),
-          ...(config.taxProfiles ?? []).map((tp: any) => tp.restaurantId),
-          ...(config.priceProfiles ?? []).map((pp: any) => pp.restaurantId),
-          ...(config.users ?? []).map((u: any) => u.outletId).filter(Boolean),
-        ])]
-      : [config.outlet.id];
+    // Verify only this outlet's data — the sync downloads outlet-only data.
+    const allRestaurantIds = [config.outlet.id];
 
     // ── Gate 1: Checksum verification ────────────────────────────────────────
     const localChecksum = computeLocalConfigChecksum(db, allRestaurantIds);
