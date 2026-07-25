@@ -58,10 +58,10 @@ export async function processOutputIntent(
 
     emitEvent({
       event: EVENT_NAMES.PRINT_COMPLETED,
-      data: { jobId: jobId || 0, printerName: job.destination.printerName || "unknown", ok: true },
+      data: { jobId: jobId || 0, printerName: job.destination.printerName || "unknown", ok: Boolean(job.destination.printerName) } as any,
     });
 
-    results.push({ jobId, ok: true });
+    results.push({ jobId, ok: !!job.destination.printerName, error: job.destination.printerName ? undefined : "No printer resolved" });
   }
 
   return { jobs: results };

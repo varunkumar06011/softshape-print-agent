@@ -126,19 +126,25 @@ export function resolvePrinterName(
     nameLower: String(p.name || "").toLowerCase(),
   }));
 
+  // Also check agentMapping (set by print agent registration: { kitchen, bar, bill })
+  const agentMapping: Record<string, string> = printerConfig?.agentMapping || {};
+
   const legacyTarget = target.toUpperCase();
   if (legacyTarget === "BAR_PRINTER") {
     return normalized.find((p) => p.type === "BAR")?.name
-      || normalized.find((p) => p.nameLower.includes("bar"))?.name;
+      || normalized.find((p) => p.nameLower.includes("bar"))?.name
+      || agentMapping.bar || undefined;
   }
   if (legacyTarget === "KOT_PRINTER") {
     return normalized.find((p) => p.type === "KITCHEN")?.name
       || normalized.find((p) => p.nameLower.includes("kitchen"))?.name
-      || normalized.find((p) => p.type === "KOT")?.name;
+      || normalized.find((p) => p.type === "KOT")?.name
+      || agentMapping.kitchen || undefined;
   }
   if (legacyTarget === "BILL_PRINTER") {
     return normalized.find((p) => p.type === "BILL")?.name
-      || normalized.find((p) => p.nameLower.includes("bill"))?.name;
+      || normalized.find((p) => p.nameLower.includes("bill"))?.name
+      || agentMapping.bill || undefined;
   }
 
   return undefined;
