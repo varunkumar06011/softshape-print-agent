@@ -40,7 +40,7 @@ interface ConfigResponse {
   counts?: Record<string, number>;
 }
 
-let _downloadInProgress: Promise<{ success: boolean; error?: string; tablesLoaded?: number }> | null = null;
+let _downloadInProgress: Promise<ConfigSyncResult> | null = null;
 
 // ── Local config checksum ────────────────────────────────────────────────────
 // Computes a deterministic checksum from row counts of all config tables.
@@ -49,7 +49,7 @@ let _downloadInProgress: Promise<{ success: boolean; error?: string; tablesLoade
 // The cloud can provide a matching checksum (computed the same way) so we
 // can verify that our SQLite data matches what the cloud sent.
 
-function computeLocalConfigChecksum(db: ReturnType<typeof getDb>, restaurantId: string): string {
+function computeLocalConfigChecksum(db: ReturnType<typeof getDb>, restaurantIds: string[]): string {
   const tables = [
     { name: "outlet", quoted: false },
     { name: "tax_profile", quoted: false },
@@ -68,18 +68,19 @@ function computeLocalConfigChecksum(db: ReturnType<typeof getDb>, restaurantId: 
     { name: "users", quoted: false },
   ];
 
+  const placeholders = restaurantIds.map(() => "?").join(",");
   const counts: string[] = [];
   for (const { name: table, quoted } of tables) {
     try {
       const tableRef = quoted ? `"${table}"` : table;
       if (table === "outlet") {
-        const row = db.query(`SELECT COUNT(*) as c FROM ${tableRef} WHERE id = ?`).get(restaurantId) as { c: number } | undefined;
+        const row = db.query(`SELECT COUNT(*) as c FROM ${tableRef} WHERE id IN (${placeholders})`).get(...restaurantIds) as { c: number } | undefined;
         counts.push(`${table}:${row?.c ?? 0}`);
       } else if (table === "users") {
-        const row = db.query(`SELECT COUNT(*) as c FROM ${tableRef} WHERE outlet_id = ?`).get(restaurantId) as { c: number } | undefined;
+        const row = db.query(`SELECT COUNT(*) as c FROM ${tableRef} WHERE outlet_id IN (${placeholders})`).get(...restaurantIds) as { c: number } | undefined;
         counts.push(`${table}:${row?.c ?? 0}`);
       } else {
-        const row = db.query(`SELECT COUNT(*) as c FROM ${tableRef} WHERE restaurant_id = ?`).get(restaurantId) as { c: number } | undefined;
+        const row = db.query(`SELECT COUNT(*) as c FROM ${tableRef} WHERE restaurant_id IN (${placeholders})`).get(...restaurantIds) as { c: number } | undefined;
         counts.push(`${table}:${row?.c ?? 0}`);
       }
     } catch {
@@ -112,7 +113,7 @@ interface IntegrityViolation {
   sampleIds: string[];
 }
 
-function validateReferentialIntegrity(db: ReturnType<typeof getDb>, restaurantId: string): IntegrityViolation[] {
+function validateReferentialIntegrity(db: ReturnType<typeof getDb>, restaurantIds: string[]): IntegrityViolation[] {
   const checks: Array<{ table: string; column: string; refTable: string; refColumn: string; quoted?: boolean }> = [
     { table: "menu_item", column: "category_id", refTable: "category", refColumn: "id" },
     { table: "menu_item_variant", column: "menu_item_id", refTable: "menu_item", refColumn: "id" },
@@ -128,6 +129,7 @@ function validateReferentialIntegrity(db: ReturnType<typeof getDb>, restaurantId
     { table: "price_profile_item", column: "menu_item_id", refTable: "menu_item", refColumn: "id" },
   ];
 
+  const placeholders = restaurantIds.map(() => "?").join(",");
   const violations: IntegrityViolation[] = [];
 
   for (const check of checks) {
@@ -137,8 +139,8 @@ function validateReferentialIntegrity(db: ReturnType<typeof getDb>, restaurantId
          FROM ${check.table} a
          LEFT JOIN ${check.refTable} b ON a.${check.column} = b.${check.refColumn}
          WHERE a.${check.column} IS NOT NULL AND b.${check.refColumn} IS NULL
-         AND a.restaurant_id = ?`
-      ).get(restaurantId) as { c: number; ids: string | null } | undefined;
+         AND a.restaurant_id IN (${placeholders})`
+      ).get(...restaurantIds) as { c: number; ids: string | null } | undefined;
 
       if (rows && rows.c > 0) {
         const sampleIds = (rows.ids || "").split(",").filter(Boolean).slice(0, 5);
@@ -180,7 +182,7 @@ interface VerificationResult {
 
 function verifyCounts(
   db: ReturnType<typeof getDb>,
-  restaurantId: string,
+  restaurantIds: string[],
   cloudCounts: Record<string, number> | undefined
 ): VerificationResult {
   const localCounts: Record<string, number> = {};
@@ -189,6 +191,8 @@ function verifyCounts(
   if (!cloudCounts) {
     return { match: true, mismatches: [], cloudCounts: {}, localCounts: {} };
   }
+
+  const placeholders = restaurantIds.map(() => "?").join(",");
 
   const tableMap: Array<{ cloudKey: string; table: string; quoted?: boolean; scopeColumn?: string }> = [
     { cloudKey: "taxProfiles", table: "tax_profile", scopeColumn: "restaurant_id" },
@@ -214,8 +218,8 @@ function verifyCounts(
     const tableRef = quoted ? `"${table}"` : table;
     try {
       const row = db.query(
-        `SELECT COUNT(*) as c FROM ${tableRef} WHERE ${scopeColumn} = ?`
-      ).get(restaurantId) as { c: number } | undefined;
+        `SELECT COUNT(*) as c FROM ${tableRef} WHERE ${scopeColumn} IN (${placeholders})`
+      ).get(...restaurantIds) as { c: number } | undefined;
       const localCount = row?.c ?? 0;
       localCounts[cloudKey] = localCount;
 
@@ -238,7 +242,18 @@ function verifyCounts(
 
 export type SyncStageCallback = (stage: "validating" | "committing" | "verifying") => void;
 
-export async function downloadFullConfig(onStage?: SyncStageCallback): Promise<{ success: boolean; error?: string; tablesLoaded?: number }> {
+export interface ConfigSyncResult {
+  success: boolean;
+  error?: string;
+  tablesLoaded?: number;
+  verified?: boolean;
+  warnings?: string[];
+  mismatches?: CountMismatch[];
+  localCounts?: Record<string, number>;
+  cloudCounts?: Record<string, number>;
+}
+
+export async function downloadFullConfig(onStage?: SyncStageCallback): Promise<ConfigSyncResult> {
   if (_downloadInProgress) return _downloadInProgress;
   _downloadInProgress = _downloadFullConfigImpl(onStage);
   try {
@@ -248,7 +263,7 @@ export async function downloadFullConfig(onStage?: SyncStageCallback): Promise<{
   }
 }
 
-async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<{ success: boolean; error?: string; tablesLoaded?: number }> {
+async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<ConfigSyncResult> {
   const backendUrl = getBackendUrl();
   const token = getSessionToken();
   const restaurantId = getRestaurantId();
@@ -637,8 +652,25 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<{ s
 
     const previousSyncCompleted = getSyncState("config_sync_completed") === "true";
 
+    // ── Resolve all restaurant IDs for multi-outlet verification ─────────────
+    // The cloud returns data for all outlets in the organization, so we must
+    // count local rows across the same set of IDs. Using only config.outlet.id
+    // would always mismatch for multi-outlet orgs.
+    const allRestaurantIds = config.organizationId
+      ? [...new Set([
+          config.outlet.id,
+          ...(config.venues ?? []).map((v: any) => v.restaurantId),
+          ...(config.tables ?? []).map((t: any) => t.restaurantId),
+          ...(config.menuItems ?? []).map((m: any) => m.restaurantId),
+          ...(config.categories ?? []).map((c: any) => c.restaurantId),
+          ...(config.taxProfiles ?? []).map((tp: any) => tp.restaurantId),
+          ...(config.priceProfiles ?? []).map((pp: any) => pp.restaurantId),
+          ...(config.users ?? []).map((u: any) => u.outletId).filter(Boolean),
+        ])]
+      : [config.outlet.id];
+
     // ── Gate 1: Checksum verification ────────────────────────────────────────
-    const localChecksum = computeLocalConfigChecksum(db, config.outlet.id);
+    const localChecksum = computeLocalConfigChecksum(db, allRestaurantIds);
     setSyncState("config_local_checksum", localChecksum);
 
     let checksumMatch = true;
@@ -659,7 +691,7 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<{ s
     }
 
     // ── Gate 2: Referential integrity validation ─────────────────────────────
-    const violations = validateReferentialIntegrity(db, config.outlet.id);
+    const violations = validateReferentialIntegrity(db, allRestaurantIds);
     if (violations.length > 0) {
       runtimeLog.warn("[config] Referential integrity violations detected", {
         violations,
@@ -676,7 +708,7 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<{ s
     }
 
     // ── Gate 3: End-to-end count verification ────────────────────────────────
-    const countResult = verifyCounts(db, config.outlet.id, config.counts);
+    const countResult = verifyCounts(db, allRestaurantIds, config.counts);
     setSyncState("config_count_mismatches", countResult.match ? "" : JSON.stringify(countResult.mismatches));
 
     if (!countResult.match) {
@@ -702,31 +734,26 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<{ s
       setSyncState("config_sync_completed", "true");
       setSyncState("config_sync_verified", "true");
     } else {
-      // Verification failed.
-      // config_sync_verified = "false" — the latest sync did not pass verification.
+      // Verification failed, but data IS committed to SQLite.
+      // Mark sync as completed so isLocalReady() returns true and the UI
+      // can serve the downloaded data. Keep config_sync_verified = "false"
+      // so the system knows the data wasn't fully verified.
+      // The UI will show a warning with the mismatch details and let the
+      // user decide whether to proceed — blocking onboarding over a few
+      // missing rows is worse than proceeding with slightly incomplete data.
       setSyncState("config_sync_verified", "false");
+      setSyncState("config_sync_completed", "true");
 
-      if (!previousSyncCompleted) {
-        // First sync failed verification — no prior data to fall back on.
-        // Mark as not completed so isLocalReady() returns false and the UI
-        // shows "Syncing..." instead of an empty menu.
-        setSyncState("config_sync_completed", "false");
-      } else {
-        // Re-sync failed verification — prior data is still valid.
-        // Keep config_sync_completed = "true" so the UI keeps serving old data.
-        // The retry will attempt to get fresh data.
-        runtimeLog.warn("[config] Re-sync verification failed — keeping prior data operational", {
-          restaurantId,
-          deviceId: getDeviceId(),
-          previousSyncCompleted,
-        });
-      }
+      runtimeLog.warn("[config] Verification failed — proceeding with committed data", {
+        mismatches: countResult.mismatches,
+        checksumMatch,
+        integrityViolations: violations.length,
+        restaurantId,
+        deviceId: getDeviceId(),
+        previousSyncCompleted,
+      });
 
-      // Invalidate cache regardless — the new data is committed even if
-      // verification failed, and the cache should reflect the current DB state.
-      // (On re-sync failure with prior data, the committed data IS the new
-      // data — it's just not verified. The UI will serve it, which is better
-      // than serving nothing.)
+      // Invalidate cache — the committed data should be served regardless.
       try {
         invalidateReadCache();
         warmReadCache();
@@ -741,8 +768,12 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<{ s
         .join(", ");
 
       return {
-        success: false,
-        error: `Verification failed: ${mismatchSummary || "checksum/integrity mismatch"}`,
+        success: true,
+        verified: false,
+        warnings: mismatchSummary ? [mismatchSummary] : ["checksum/integrity mismatch"],
+        mismatches: countResult.mismatches,
+        localCounts: countResult.localCounts,
+        cloudCounts: countResult.cloudCounts,
         tablesLoaded: totalRows,
       };
     }

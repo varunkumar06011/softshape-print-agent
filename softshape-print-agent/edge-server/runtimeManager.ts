@@ -31,7 +31,7 @@ import { emitEvent } from "./eventBus.ts";
 import { EVENT_NAMES } from "./contract/events.ts";
 import { getDeviceId, getRestaurantId, isSessionValid, isLocalReady, loadSession } from "./auth.ts";
 import { getDb, getSyncState, setSyncState } from "./db.ts";
-import { downloadFullConfig } from "./config.ts";
+import { downloadFullConfig, type ConfigSyncResult } from "./config.ts";
 import { startSyncWorker, stopSyncWorker, getSyncStatus } from "./sync.ts";
 import { startSocketSync, stopSocketSync, getSocketStatus, isInFallbackMode } from "./socketSync.ts";
 import { startHeartbeat, stopHeartbeat } from "./socketSync.ts";
@@ -335,7 +335,7 @@ class RuntimeManager {
   // The sync mutex ensures only one sync runs at a time — no concurrent
   // startup sync + manual sync + socket-triggered sync.
 
-  async runConfigSync(): Promise<{ success: boolean; error?: string; tablesLoaded?: number }> {
+  async runConfigSync(): Promise<ConfigSyncResult> {
     if (this._syncMutex) {
       runtimeLog.warn("Config sync already in progress — ignoring request", {
         syncId: this._syncId,

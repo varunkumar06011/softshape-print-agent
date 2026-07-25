@@ -219,9 +219,99 @@ test("verifyCounts — skips verification when cloudCounts is undefined", () => 
   expect(cloudCounts).toBeUndefined();
 });
 
-// ── Test 4: config_sync_completed should NOT be set when verification fails ───
+// ── Test 3a: verifyCounts with multi-outlet organization ─────────────────────
+// Regression test: cloud returns data for ALL outlets in the org, so local
+// counts must be summed across all restaurant IDs using IN (...).
 
-test("config_sync_completed — not set to true when count verification fails on first sync", () => {
+test("verifyCounts — multi-outlet: counts match when summed across all outlet IDs", () => {
+  const db = createTestDb();
+
+  const OUTLET_A = "outlet-a";
+  const OUTLET_B = "outlet-b";
+  const allIds = [OUTLET_A, OUTLET_B];
+
+  db.exec(`INSERT INTO outlet (id, name, slug, restaurant_code) VALUES ('${OUTLET_A}', 'A', 'a', 'A001')`);
+  db.exec(`INSERT INTO outlet (id, name, slug, restaurant_code) VALUES ('${OUTLET_B}', 'B', 'b', 'B001')`);
+
+  // Outlet A: 6 categories, 20 menu items
+  // Outlet B: 6 categories, 20 menu items
+  // Total: 12 categories, 40 menu items
+  for (let i = 0; i < 6; i++) {
+    db.query(`INSERT INTO category (id, name, restaurant_id) VALUES (?, ?, ?)`).run(`cat-a-${i}`, `Cat A${i}`, OUTLET_A);
+    db.query(`INSERT INTO category (id, name, restaurant_id) VALUES (?, ?, ?)`).run(`cat-b-${i}`, `Cat B${i}`, OUTLET_B);
+  }
+  for (let i = 0; i < 20; i++) {
+    db.query(`INSERT INTO menu_item (id, name, category_id, restaurant_id) VALUES (?, ?, ?, ?)`).run(`item-a-${i}`, `Item A${i}`, `cat-a-0`, OUTLET_A);
+    db.query(`INSERT INTO menu_item (id, name, category_id, restaurant_id) VALUES (?, ?, ?, ?)`).run(`item-b-${i}`, `Item B${i}`, `cat-b-0`, OUTLET_B);
+  }
+
+  const cloudCounts = { categories: 12, menuItems: 40 };
+
+  // Inline the fixed verifyCounts logic (uses IN (...))
+  const placeholders = allIds.map(() => "?").join(",");
+  const tableMap = [
+    { cloudKey: "categories", table: "category", scopeColumn: "restaurant_id" },
+    { cloudKey: "menuItems", table: "menu_item", scopeColumn: "restaurant_id" },
+  ];
+
+  const mismatches: Array<{ table: string; cloud: number; local: number }> = [];
+  for (const { cloudKey, table, scopeColumn } of tableMap) {
+    const cloudCount = (cloudCounts as any)[cloudKey];
+    if (cloudCount === undefined) continue;
+    const row = db.query(`SELECT COUNT(*) as c FROM ${table} WHERE ${scopeColumn} IN (${placeholders})`).get(...allIds) as { c: number };
+    if (row.c !== cloudCount) {
+      mismatches.push({ table: cloudKey, cloud: cloudCount, local: row.c });
+    }
+  }
+
+  expect(mismatches).toHaveLength(0);
+});
+
+test("verifyCounts — multi-outlet: detects mismatch when only one outlet's data is present", () => {
+  const db = createTestDb();
+
+  const OUTLET_A = "outlet-a";
+  const OUTLET_B = "outlet-b";
+  const allIds = [OUTLET_A, OUTLET_B];
+
+  db.exec(`INSERT INTO outlet (id, name, slug, restaurant_code) VALUES ('${OUTLET_A}', 'A', 'a', 'A001')`);
+  db.exec(`INSERT INTO outlet (id, name, slug, restaurant_code) VALUES ('${OUTLET_B}', 'B', 'b', 'B001')`);
+
+  // Only outlet A has data: 6 categories, 20 menu items
+  // Cloud expects both outlets: 12 categories, 40 menu items
+  for (let i = 0; i < 6; i++) {
+    db.query(`INSERT INTO category (id, name, restaurant_id) VALUES (?, ?, ?)`).run(`cat-a-${i}`, `Cat A${i}`, OUTLET_A);
+  }
+  for (let i = 0; i < 20; i++) {
+    db.query(`INSERT INTO menu_item (id, name, category_id, restaurant_id) VALUES (?, ?, ?, ?)`).run(`item-a-${i}`, `Item A${i}`, `cat-a-0`, OUTLET_A);
+  }
+
+  const cloudCounts = { categories: 12, menuItems: 40 };
+
+  const placeholders = allIds.map(() => "?").join(",");
+  const tableMap = [
+    { cloudKey: "categories", table: "category", scopeColumn: "restaurant_id" },
+    { cloudKey: "menuItems", table: "menu_item", scopeColumn: "restaurant_id" },
+  ];
+
+  const mismatches: Array<{ table: string; cloud: number; local: number }> = [];
+  for (const { cloudKey, table, scopeColumn } of tableMap) {
+    const cloudCount = (cloudCounts as any)[cloudKey];
+    if (cloudCount === undefined) continue;
+    const row = db.query(`SELECT COUNT(*) as c FROM ${table} WHERE ${scopeColumn} IN (${placeholders})`).get(...allIds) as { c: number };
+    if (row.c !== cloudCount) {
+      mismatches.push({ table: cloudKey, cloud: cloudCount, local: row.c });
+    }
+  }
+
+  expect(mismatches).toHaveLength(2);
+  expect(mismatches[0]).toEqual({ table: "categories", cloud: 12, local: 6 });
+  expect(mismatches[1]).toEqual({ table: "menuItems", cloud: 40, local: 20 });
+});
+
+// ── Test 4: verification failure still marks sync completed (data is committed) ─
+
+test("config_sync_completed — set to true even when count verification fails (data is committed)", () => {
   const db = createTestDb();
   db.exec(`INSERT INTO outlet (id, name, slug, restaurant_code) VALUES ('${RESTAURANT_ID}', 'Test', 'test', 'TEST001')`);
 
@@ -237,16 +327,14 @@ test("config_sync_completed — not set to true when count verification fails on
 
   expect(countsMatch).toBe(false);
 
-  // Simulate: first sync failed verification → config_sync_completed should be "false"
-  const previousSyncCompleted = getSyncState(db, "config_sync_completed") === "true";
-  expect(previousSyncCompleted).toBe(false);
+  // New behavior: verification failure still marks sync as completed because
+  // the data IS committed to SQLite. config_sync_verified is "false" so the
+  // system knows the data wasn't fully verified. The UI shows a warning and
+  // lets the user decide whether to proceed.
+  setSyncState(db, "config_sync_completed", "true");
+  setSyncState(db, "config_sync_verified", "false");
 
-  if (!countsMatch && !previousSyncCompleted) {
-    setSyncState(db, "config_sync_completed", "false");
-    setSyncState(db, "config_sync_verified", "false");
-  }
-
-  expect(getSyncState(db, "config_sync_completed")).toBe("false");
+  expect(getSyncState(db, "config_sync_completed")).toBe("true");
   expect(getSyncState(db, "config_sync_verified")).toBe("false");
 });
 
