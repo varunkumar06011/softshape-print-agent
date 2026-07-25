@@ -762,6 +762,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         configPending: true,
         tablesLoaded: 0,
         edgeApiKey,
+        runtimeToken: getOrCreateRuntimeToken(),
       });
     } catch (err: any) {
       return errorResponse(err.message || "Failed to connect to backend");
