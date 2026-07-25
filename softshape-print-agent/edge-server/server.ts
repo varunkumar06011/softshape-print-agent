@@ -747,12 +747,10 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         console.warn("[register] Failed to start background sync services:", syncStartErr.message);
       }
 
-      // Trigger config sync through RuntimeManager (respects sync mutex)
-      // The frontend will also call /api/edge/config/sync, but we kick it
-      // off here so the download starts immediately after registration.
-      runtimeManager.runConfigSync().catch((err: any) => {
-        console.warn("[register] Initial config sync failed:", err?.message);
-      });
+      // Config sync is triggered explicitly by the frontend via
+      // /api/edge/config/sync after registration succeeds. Do NOT kick it
+      // off here — that creates a race condition where the frontend's call
+      // hits the sync mutex and gets rejected.
 
       return jsonResponse({
         success: true,
@@ -786,6 +784,11 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       success: true,
       tablesLoaded: result.tablesLoaded,
       syncedAt: new Date().toISOString(),
+      verified: result.verified !== false,
+      ...(result.warnings?.length ? { warnings: result.warnings } : {}),
+      ...(result.mismatches?.length ? { mismatches: result.mismatches } : {}),
+      ...(result.localCounts ? { localCounts: result.localCounts } : {}),
+      ...(result.cloudCounts ? { cloudCounts: result.cloudCounts } : {}),
     });
   }
 
