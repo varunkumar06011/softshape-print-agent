@@ -5,7 +5,9 @@ node_modules/
 dist/
 src-tauri/target/
 print-service/target/
+runtime-host/target/
 softshape-print-agent/print-service/target/
+softshape-print-agent/runtime-host/target/
 
 # Tauri build artifacts
 src-tauri/gen/
