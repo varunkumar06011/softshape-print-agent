@@ -144,6 +144,13 @@ mod winspool {
             ));
         }
 
+        // KNOWN LIMITATION: Ok(()) means the Windows spooler accepted the job,
+        // not that paper exited the printer. If the printer is out of paper or
+        // jammed, the spooler still accepts the data and queues it internally —
+        // this function returns success. There is no GetPrinter status check
+        // (PRINTER_STATUS_PAPER_OUT, PRINTER_STATUS_PAPER_JAM) or ESC/POS
+        // real-time status query (DLE EOT n) here. The caller treats this as
+        // definitive, so a silent physical failure will be reported as printed.
         Ok(())
     }
 }
@@ -179,6 +186,12 @@ pub fn print_network(ip: &str, port: u16, bytes: &[u8]) -> Result<(), String> {
         .write_all(bytes)
         .map_err(|e| format!("Write failed to {}: {}", addr, e))?;
 
+    // KNOWN LIMITATION: Ok(()) means the TCP write succeeded (the printer's
+    // network buffer accepted the data), not that paper exited. Most ESC/POS
+    // printers accept data into their internal buffer even when out of paper —
+    // this function returns success in that case. No ESC/POS status response
+    // is read back (DLE EOT n for real-time status). The caller treats this as
+    // definitive, so a silent physical failure will be reported as printed.
     Ok(())
 }
 

@@ -21,11 +21,42 @@
 mod printing;
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 const DEFAULT_PORT: u16 = 3103;
+
+// ── Per-printer serialization ──────────────────────────────────────────────
+// Each printer name gets its own Mutex. This prevents concurrent print jobs
+// to the same printer from interleaving ESC/POS bytes (which would garble
+// the output), while allowing different printers to print in parallel.
+// The outer RwLock protects the HashMap itself; the inner Mutex serializes
+// access to a single printer.
+static PRINTER_LOCKS: RwLock<HashMap<String, Arc<Mutex<()>>>> = RwLock::new(HashMap::new());
+
+fn with_printer_lock<T, F: FnOnce() -> T>(printer_name: &str, f: F) -> T {
+    // Fast path: read lock to check if a mutex already exists for this printer
+    let mutex = {
+        let locks = PRINTER_LOCKS.read().unwrap();
+        locks.get(printer_name).cloned()
+    };
+    let mutex = match mutex {
+        Some(m) => m,
+        None => {
+            // Slow path: write lock to insert a new mutex for this printer
+            let mut locks = PRINTER_LOCKS.write().unwrap();
+            locks
+                .entry(printer_name.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        }
+    };
+    let _guard = mutex.lock().unwrap();
+    f()
+}
 
 #[derive(Debug, Deserialize)]
 struct PrintRequest {
@@ -137,11 +168,16 @@ fn handle_connection(mut stream: std::net::TcpStream) {
         let byte_count = print_req.bytes.len();
         let printer_name = &print_req.printer_name;
 
-        let result = if let Some((ip, port)) = printing::parse_network_printer(printer_name) {
-            printing::print_network(&ip, port, &print_req.bytes)
-        } else {
-            printing::raw_print(printer_name, &print_req.bytes)
-        };
+        // Acquire per-printer lock to prevent concurrent jobs to the same
+        // printer from interleaving ESC/POS bytes. Different printers are
+        // not blocked by each other — each has its own Mutex.
+        let result = with_printer_lock(printer_name, || {
+            if let Some((ip, port)) = printing::parse_network_printer(printer_name) {
+                printing::print_network(&ip, port, &print_req.bytes)
+            } else {
+                printing::raw_print(printer_name, &print_req.bytes)
+            }
+        });
 
         let resp = match result {
             Ok(()) => {

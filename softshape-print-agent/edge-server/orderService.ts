@@ -182,6 +182,21 @@ function preparePrintIntents(
   kotEventIds: string[] | null | undefined,
 ): PrintIntent[] {
   // Build a type→eventId lookup from captain-provided kotEventIds.
+  //
+  // WARNING: This suffix-matching logic (-food, -liquor, -bill, -cancel) only
+  // recognizes eventIds in the `${requestId}-food` / `${requestId}-liquor`
+  // format used by the local print fallback path (CaptainApp.jsx:3245-3249).
+  // When the R2 Output Intent path succeeds, kotEventIds contains UUID-format
+  // intent IDs from generateIntentId() that do NOT match any suffix here.
+  // This means alreadyPrintedLocally would be false for all groups, and the
+  // edge server would create duplicate print jobs.
+  //
+  // This bug is currently MASKED because localPrinted=true (set at
+  // CaptainApp.jsx:3226 when intents succeed) causes printIntents=[] at the
+  // call site (line 773/1094), so preparePrintIntents is never called with
+  // UUID-format IDs. DO NOT remove the localPrinted short-circuit without
+  // either (a) changing the intent ID format to include suffixes, or
+  // (b) passing the type→eventId mapping explicitly from the captain.
   const eventIdByType: Record<string, string> = {};
   const locallyPrintedEventIds = new Set<string>();
   if (kotEventIds && kotEventIds.length > 0) {
@@ -267,11 +282,18 @@ export async function dispatchSinglePrintJob(
         console.log(`[Print] Job ${eventId} → ${group.printerName} ✓`);
         return;
       }
-      console.warn(`[Print] Job ${eventId} → ${group.printerName} print service failed: ${result.error} — trying cloud relay`);
+      console.warn(`[Print] Job ${eventId} → ${group.printerName} print service failed: ${result.error}`);
+      updatePrintJobStatus(eventId, "retrying", result.error || "Print service call failed");
+      return;
     }
 
-    // R5: Cloud relay removed — mark for retry by SQLite queue dispatch loop.
-    updatePrintJobStatus(eventId, "retrying", "Print service unavailable");
+    // No printer mapped for this group — not a print-service outage.
+    // This means resolvePrinterName() returned undefined for the item's
+    // printer_target / category_printer_target. The fix is in printer config,
+    // not in restarting the print service.
+    const mappingError = `No printer mapped for ${group.type} group (printerName is null)`;
+    console.warn(`[Print] Job ${eventId} — ${mappingError}`);
+    updatePrintJobStatus(eventId, "retrying", mappingError);
   } catch (err: any) {
     updatePrintJobStatus(eventId, "retrying", err?.message || String(err));
     console.error(`[Print] Job ${eventId} dispatch error:`, err);
@@ -770,6 +792,10 @@ export async function createOrder(
     sectionTag: sectionTag || undefined,
   };
   const printGroups = buildKotPrintGroups(mappedItems, kotOrderData, table, printerConfig);
+  // CRITICAL: When localPrinted=true, printIntents is empty — no print jobs
+  // are created or dispatched. This short-circuit also masks a latent dedup
+  // bug in preparePrintIntents() (see comment there). Do not change this to
+  // conditionally create print jobs without fixing the eventId suffix matching.
   const printIntents = localPrinted ? [] : preparePrintIntents(printGroups, requestId, input.kotEventIds);
 
   // ── Transaction: create order + items + KOT + print intents + update table ──
@@ -1091,6 +1117,10 @@ export async function updateOrderItems(
     sectionTag: sectionTag || undefined,
   };
   const printGroups = buildKotPrintGroups(mappedItems, kotOrderData, table, printerConfig);
+  // CRITICAL: When localPrinted=true, printIntents is empty — no print jobs
+  // are created or dispatched. This short-circuit also masks a latent dedup
+  // bug in preparePrintIntents() (see comment there). Do not change this to
+  // conditionally create print jobs without fixing the eventId suffix matching.
   const printIntents = localPrinted ? [] : preparePrintIntents(printGroups, requestId, input.kotEventIds);
 
   // ── Transaction: insert new items + new KOT + print intents + update order ──

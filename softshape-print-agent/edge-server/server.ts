@@ -46,7 +46,7 @@
 //   WS   /events                — Runtime event bus (§3)
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enqueueSync, getRecoveryStatus, updatePrintJobStatus, getPendingPrintJobs, getOrderSyncStatus, getPrintJobByEventId, cancelPrintJob, reprintPrintJob, getPrintJobsByOrder, insertSyncAudit, getSyncAuditRecords } from "./db.ts";
+import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enqueueSync, getRecoveryStatus, updatePrintJobStatus, getPendingPrintJobs, getOrderSyncStatus, getPrintJobByEventId, cancelPrintJob, reprintPrintJob, getPrintJobsByOrder, insertSyncAudit, getSyncAuditRecords, createPrintJob, claimPrintJob } from "./db.ts";
 import os from "os";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getSessionToken, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { pullIncrementalChanges } from "./config.ts";
@@ -518,11 +518,17 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     return jsonResponse({ printers });
   }
 
-  // ── POST /print — relay print job to cashier-desktop print bridge ───────────
-  // This is the fast LAN print path for Captain apps on the same network.
-  // The Captain POSTs ESC/POS data to the edge server, which forwards it to
-  // the cashier-desktop print bridge (HTTP POST to port 3102) for physical
-  // printing. If the bridge is unreachable, falls back to cloud relay.
+  // ── POST /print — relay print job to print service with durable queue ──────
+  // This path is used by captain's local-print fallback (printLocal() →
+  // tryPrintAgentUrls()) and previously had no durable queue — if the print
+  // service was down, the job was lost with no SQLite row, no retry, no
+  // dead-letter. It now persists to print_job before printing (see below).
+  //
+  // Failure-path behavior differs from the primary order flow (createOrder →
+  // persistPrintIntentsInTx), which already has retry/dead-letter via SQLite.
+  // Both paths now converge on the same print_job table and dispatch loop, but
+  // the relay path uses orderId="relay" and has no KOT/order association.
+  //
   // No auth required — this is a LAN-only endpoint (edge server binds to 0.0.0.0
   // but is typically behind a firewall/router on the local network).
   if (url.pathname === "/print" && req.method === "POST") {
@@ -551,18 +557,51 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
 
     const printEventId = eventId || `${effectiveType}-${Date.now()}`;
 
-    // Try the print service first (isolated Rust process on :3103)
-    if (targetPrinter) {
+    // ── Durable queue: persist before attempting print ──────────────────────
+    // Without this, a print-service crash mid-request would silently lose the
+    // job — no SQLite row, no retry, no visibility. By persisting first, the
+    // background dispatch loop (every 5s) will retry any job that fails here.
+    const rid = getRestaurantId() || "relay";
+
+    // Dedup: if this eventId already printed, return success immediately
+    const existingJob = getPrintJobByEventId(printEventId);
+    if (existingJob?.status === "printed") {
+      return jsonResponse({ ok: true, queued: false, method: "dedup", eventId: printEventId });
+    }
+
+    // Persist (idempotent via ON CONFLICT(event_id) DO NOTHING).
+    // If this fails, we genuinely cannot recover — return 503 so the caller
+    // knows the job was not accepted. This is the ONLY 503 case; print-service
+    // failures are recoverable via the retry loop.
+    const jobId = createPrintJob({
+      eventId: printEventId,
+      restaurantId: rid,
+      orderId: data?.orderId || "relay",
+      printerName: targetPrinter,
+      jobType: effectiveType,
+      escposData: normalizedEscpos,
+      itemSummary: [],
+      captainName: data?.captainName || null,
+    });
+    if (jobId === null) {
+      return jsonResponse({ ok: false, error: "Failed to persist print job to queue", queued: false }, 503);
+    }
+
+    // Attempt immediate print for low latency. Claim first to prevent a race
+    // with the background dispatch loop (which also calls claimPrintJob).
+    if (targetPrinter && claimPrintJob(printEventId)) {
       const result = await printToPrinter(targetPrinter, normalizedEscpos, printEventId, effectiveType);
       if (result.ok) {
+        updatePrintJobStatus(printEventId, "printed", null, "local");
         console.log(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} ✓ (print service)`);
         return jsonResponse({ ok: true, queued: false, method: "print_service", eventId: printEventId });
       }
-      console.warn(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} print service failed: ${result.error} — trying cloud relay`);
+      console.warn(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} print service failed: ${result.error} — job queued for retry`);
+      updatePrintJobStatus(printEventId, "retrying", result.error || "Print service failed");
     }
 
-    // R5: Cloud relay removed — print service is the sole transport.
-    return jsonResponse({ ok: false, error: "Print service unavailable", queued: false }, 503);
+    // Job is durably queued — background dispatch loop will retry every 5s
+    return jsonResponse({ ok: true, queued: true, method: "durable_queued", eventId: printEventId });
   }
 
   // ── GET /api/edge/status ────────────────────────────────────────────────────
