@@ -11,7 +11,7 @@
 // All data is upserted into local SQLite, replacing stale rows.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, setSyncState, getSyncState } from "./db.ts";
+import { getDb, setSyncState, getSyncState, setConfig } from "./db.ts";
 import { getBackendUrl, getSessionToken, getRestaurantId } from "./auth.ts";
 import { cloudFetch } from "./cloudFetch.ts";
 import { runtimeLog } from "./contract/logger.ts";
@@ -414,6 +414,22 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
       config.outlet.organizationId || null, config.outlet.isActive !== false ? 1 : 0
     );
     totalRows++;
+
+    // ── Extract printer mapping from outlet printer_config → edge_config ──────
+    // This populates the printer_mapping key that handleCloudPrintJob reads
+    // for cloud fallback printer resolution (RC-5 fix).
+    {
+      const rawPc = config.outlet.printerConfig;
+      const pc: any = typeof rawPc === "string" ? JSON.parse(rawPc || "{}") : (rawPc || {});
+      const printers = pc.printers || [];
+      const agentMapping = pc.agentMapping || {};
+      const mapping = {
+        kitchen: agentMapping.kitchen || printers.find((p: any) => p.type?.toUpperCase() === "KITCHEN")?.name || printers.find((p: any) => p.name?.toLowerCase().includes("kitchen"))?.name || null,
+        bar: agentMapping.bar || printers.find((p: any) => p.type?.toUpperCase() === "BAR")?.name || printers.find((p: any) => p.name?.toLowerCase().includes("bar"))?.name || null,
+        bill: agentMapping.bill || printers.find((p: any) => p.type?.toUpperCase() === "BILL")?.name || printers.find((p: any) => p.name?.toLowerCase().includes("bill"))?.name || null,
+      };
+      try { setConfig("printer_mapping", JSON.stringify(mapping)); } catch (e) { console.warn("[Config] Failed to write printer_mapping:", e); }
+    }
 
     // ── Tax Profiles ─────────────────────────────────────────────────────────
     for (const tp of config.taxProfiles ?? []) {
@@ -887,6 +903,21 @@ function applyChange(db: any, change: any): boolean {
         JSON.stringify(row.enabledModules || {}), row.sharedKitchenOutletId || null,
         row.organizationId || null, row.isActive !== false ? 1 : 0
       );
+
+      // Extract printer mapping from outlet printer_config → edge_config (RC-5 fix)
+      {
+        const rawPc = row.printerConfig;
+        const pc: any = typeof rawPc === "string" ? JSON.parse(rawPc || "{}") : (rawPc || {});
+        const printers = pc.printers || [];
+        const agentMapping = pc.agentMapping || {};
+        const mapping = {
+          kitchen: agentMapping.kitchen || printers.find((p: any) => p.type?.toUpperCase() === "KITCHEN")?.name || printers.find((p: any) => p.name?.toLowerCase().includes("kitchen"))?.name || null,
+          bar: agentMapping.bar || printers.find((p: any) => p.type?.toUpperCase() === "BAR")?.name || printers.find((p: any) => p.name?.toLowerCase().includes("bar"))?.name || null,
+          bill: agentMapping.bill || printers.find((p: any) => p.type?.toUpperCase() === "BILL")?.name || printers.find((p: any) => p.name?.toLowerCase().includes("bill"))?.name || null,
+        };
+        try { setConfig("printer_mapping", JSON.stringify(mapping)); } catch (e) { console.warn("[Config] Failed to write printer_mapping (incremental):", e); }
+      }
+
       return true;
 
     // ── Tax Profile ─────────────────────────────────────────────────────────

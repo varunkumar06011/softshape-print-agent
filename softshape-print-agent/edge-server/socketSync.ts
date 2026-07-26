@@ -26,7 +26,7 @@ import { io, type Socket } from "socket.io-client";
 import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid } from "./auth.ts";
 import { applyChangesBatch } from "./config.ts";
 import { getDb, setSyncState, updatePrintJobStatus, createPrintJob, claimPrintJob } from "./db.ts";
-import { printToPrinter } from "./printer.ts";
+import { printToPrinter, resolvePrinterName } from "./printer.ts";
 import { printerLog } from "./contract/logger.ts";
 
 let socket: Socket | null = null;
@@ -270,6 +270,19 @@ async function handleCloudPrintJob(envelope: any): Promise<void> {
       else if (type === "BAR_KOT") targetPrinter = mapping.bar || null;
       else if (type === "BILL" || type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "EXPENDITURE") targetPrinter = mapping.bill || null;
       else if (type === "TABLE_SWAP") targetPrinter = mapping.kitchen || null;
+    } catch { /* ignore */ }
+  }
+
+  // Fallback: resolve from outlet printer_config if printer_mapping didn't have it (RC-5 fix)
+  if (!targetPrinter && restaurantId) {
+    try {
+      const db = getDb();
+      const row = db.query("SELECT printer_config FROM outlet WHERE id = ?").get(restaurantId) as { printer_config: string } | undefined;
+      const pc = row?.printer_config ? JSON.parse(row.printer_config) : {};
+      if (type === "KOT" || type === "CANCEL_KOT") targetPrinter = resolvePrinterName(null, "KOT_PRINTER", null, pc) || null;
+      else if (type === "BAR_KOT") targetPrinter = resolvePrinterName(null, "BAR_PRINTER", null, pc) || null;
+      else if (type === "BILL" || type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "EXPENDITURE") targetPrinter = resolvePrinterName(null, "BILL_PRINTER", null, pc) || null;
+      else if (type === "TABLE_SWAP") targetPrinter = resolvePrinterName(null, "KOT_PRINTER", null, pc) || null;
     } catch { /* ignore */ }
   }
 
