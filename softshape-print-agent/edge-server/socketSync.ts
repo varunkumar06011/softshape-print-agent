@@ -75,7 +75,7 @@ export function startSocketSync(): void {
     socket!.emit("edge:register", {
       restaurantId,
       sessionToken: token,
-      edgeVersion: "23.4.1",
+      edgeVersion: "23.4.2",
       capabilities: ["print"],
     });
   });
@@ -102,7 +102,7 @@ export function startSocketSync(): void {
     socket!.emit("edge:register", {
       restaurantId,
       sessionToken: token,
-      edgeVersion: "23.4.1",
+      edgeVersion: "23.4.2",
       capabilities: ["print"],
     });
   });
@@ -262,15 +262,14 @@ async function handleCloudPrintJob(envelope: any): Promise<void> {
   // Resolve target printer from job type + data
   let targetPrinter: string | null = data?.printerName || null;
   if (!targetPrinter) {
-    // Use resolvePrinterName with outlet's printer_config (same as edge-direct path)
+    // Try printer mapping from edge config
     try {
       const db = getDb();
-      const row = db.query("SELECT printer_config FROM outlet WHERE id = ?").get(restaurantId) as { printer_config: string } | null;
-      const printerConfig = row?.printer_config ? JSON.parse(row.printer_config) : {};
-      if (type === "KOT" || type === "CANCEL_KOT") targetPrinter = resolvePrinterName(null, "KOT_PRINTER", null, printerConfig);
-      else if (type === "BAR_KOT") targetPrinter = resolvePrinterName(null, "BAR_PRINTER", null, printerConfig);
-      else if (type === "BILL" || type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "EXPENDITURE") targetPrinter = resolvePrinterName(null, "BILL_PRINTER", null, printerConfig);
-      else if (type === "TABLE_SWAP") targetPrinter = resolvePrinterName(null, "KOT_PRINTER", null, printerConfig);
+      const mapping = JSON.parse(db.query("SELECT value FROM edge_config WHERE key = 'printer_mapping'").get() as any)?.value || "{}";
+      if (type === "KOT" || type === "CANCEL_KOT") targetPrinter = mapping.kitchen || null;
+      else if (type === "BAR_KOT") targetPrinter = mapping.bar || null;
+      else if (type === "BILL" || type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "EXPENDITURE") targetPrinter = mapping.bill || null;
+      else if (type === "TABLE_SWAP") targetPrinter = mapping.kitchen || null;
     } catch { /* ignore */ }
   }
 

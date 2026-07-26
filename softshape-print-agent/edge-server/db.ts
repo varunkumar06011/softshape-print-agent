@@ -668,6 +668,12 @@ function runMigrations(database: Database) {
     database.exec(`ALTER TABLE section ADD COLUMN is_active INTEGER DEFAULT 1`);
   }
 
+  // venue.kot_enabled — added for KOT printing gate. If missing, SELECT v.kot_enabled
+  // would throw "no such column" and crash createOrder/updateOrderItems.
+  if (!hasColumn("venue", "kot_enabled")) {
+    database.exec(`ALTER TABLE venue ADD COLUMN kot_enabled INTEGER DEFAULT 1`);
+  }
+
   // print_job: add durable queue columns for existing DBs
   if (!hasColumn("print_job", "next_attempt_at")) {
     database.exec(`ALTER TABLE print_job ADD COLUMN next_attempt_at INTEGER`);

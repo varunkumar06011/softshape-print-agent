@@ -1,6 +1,6 @@
 [package]
 name = "softshape-host"
-version = "23.4.1"
+version = "23.4.2"
 edition = "2021"
 rust-version = "1.70"
 

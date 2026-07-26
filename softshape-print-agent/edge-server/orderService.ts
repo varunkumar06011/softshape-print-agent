@@ -176,36 +176,39 @@ interface PrintIntent {
   alreadyPrintedLocally: boolean; // true if captain already printed this group
 }
 
+type KotEventIdEntry = string | { type: string; eventId: string };
+
 function preparePrintIntents(
   groups: PrintGroup[],
   requestId: string | undefined,
-  kotEventIds: string[] | null | undefined,
+  kotEventIds: KotEventIdEntry[] | null | undefined,
 ): PrintIntent[] {
   // Build a type→eventId lookup from captain-provided kotEventIds.
   //
-  // WARNING: This suffix-matching logic (-food, -liquor, -bill, -cancel) only
-  // recognizes eventIds in the `${requestId}-food` / `${requestId}-liquor`
-  // format used by the local print fallback path (CaptainApp.jsx:3245-3249).
-  // When the R2 Output Intent path succeeds, kotEventIds contains UUID-format
-  // intent IDs from generateIntentId() that do NOT match any suffix here.
-  // This means alreadyPrintedLocally would be false for all groups, and the
-  // edge server would create duplicate print jobs.
+  // Supports two formats:
+  // 1. Legacy: string[] with suffix-matching (-food, -liquor, -bill, -cancel)
+  // 2. Structured: { type: string, eventId: string }[] — explicit type mapping
   //
-  // This bug is currently MASKED because localPrinted=true (set at
-  // CaptainApp.jsx:3226 when intents succeed) causes printIntents=[] at the
-  // call site (line 773/1094), so preparePrintIntents is never called with
-  // UUID-format IDs. DO NOT remove the localPrinted short-circuit without
-  // either (a) changing the intent ID format to include suffixes, or
-  // (b) passing the type→eventId mapping explicitly from the captain.
+  // The structured format is preferred because it works with any eventId format
+  // (including UUIDs from generateIntentId()), fixing the latent dedup bug
+  // where UUID-format event IDs didn't match any suffix pattern.
   const eventIdByType: Record<string, string> = {};
   const locallyPrintedEventIds = new Set<string>();
   if (kotEventIds && kotEventIds.length > 0) {
-    for (const id of kotEventIds) {
-      locallyPrintedEventIds.add(id);
-      if (id.endsWith("-food")) eventIdByType["KOT"] = id;
-      else if (id.endsWith("-liquor")) eventIdByType["BAR_KOT"] = id;
-      else if (id.endsWith("-bill")) eventIdByType["BILL"] = id;
-      else if (id.endsWith("-cancel")) eventIdByType["CANCEL_KOT"] = id;
+    for (const entry of kotEventIds) {
+      if (typeof entry === "string") {
+        // Legacy format: suffix matching
+        const id = entry;
+        locallyPrintedEventIds.add(id);
+        if (id.endsWith("-food")) eventIdByType["KOT"] = id;
+        else if (id.endsWith("-liquor")) eventIdByType["BAR_KOT"] = id;
+        else if (id.endsWith("-bill")) eventIdByType["BILL"] = id;
+        else if (id.endsWith("-cancel")) eventIdByType["CANCEL_KOT"] = id;
+      } else if (entry && typeof entry === "object" && entry.type && entry.eventId) {
+        // Structured format: explicit type→eventId mapping
+        eventIdByType[entry.type] = entry.eventId;
+        locallyPrintedEventIds.add(entry.eventId);
+      }
     }
   }
 
@@ -552,7 +555,7 @@ export interface CreateOrderInput {
   orderByRole?: string;
   localPrinted?: boolean;
   preReservedKotNumber?: number | null;
-  kotEventIds?: string[] | null;
+  kotEventIds?: KotEventIdEntry[] | null;
   deviceId?: string;
   expectedRevision?: number;
 }
@@ -838,12 +841,20 @@ export async function createOrder(
     orderByRole: orderByRole || "CAPTAIN",
     sectionTag: sectionTag || undefined,
   };
-  const printGroups = buildKotPrintGroups(mappedItems, kotOrderData, table, printerConfig);
+  // Gate KOT printing on venue kot_enabled setting
+  // NULL or undefined kot_enabled means the venue has no KOT preference —
+  // default to ENABLED (same as pre-gating behavior).
+  const venueKotEnabled = table.kot_enabled !== 0;
+  if (!venueKotEnabled) {
+    console.warn(`[createOrder] KOT printing DISABLED for table ${tableId} — venue kot_enabled=${table.kot_enabled}, venue_id=${table.venue_id}`);
+  }
+  const printGroups = venueKotEnabled ? buildKotPrintGroups(mappedItems, kotOrderData, table, printerConfig) : [];
   // CRITICAL: When localPrinted=true, printIntents is empty — no print jobs
   // are created or dispatched. This short-circuit also masks a latent dedup
   // bug in preparePrintIntents() (see comment there). Do not change this to
   // conditionally create print jobs without fixing the eventId suffix matching.
   const printIntents = localPrinted ? [] : preparePrintIntents(printGroups, requestId, input.kotEventIds);
+  console.log(`[createOrder] Print dispatch: localPrinted=${localPrinted}, venueKotEnabled=${venueKotEnabled}, printGroups=${printGroups.length}, printIntents=${printIntents.length}`);
 
   // ── Transaction: create order + items + KOT + print intents + update table ──
   const tx = db.transaction(() => {
@@ -999,7 +1010,7 @@ export interface UpdateOrderItemsInput {
   orderByRole?: string;
   localPrinted?: boolean;
   preReservedKotNumber?: number | null;
-  kotEventIds?: string[] | null;
+  kotEventIds?: KotEventIdEntry[] | null;
   deviceId?: string;
   expectedRevision?: number;
 }
@@ -1163,12 +1174,20 @@ export async function updateOrderItems(
     orderByRole: orderByRole || "CASHIER",
     sectionTag: sectionTag || undefined,
   };
-  const printGroups = buildKotPrintGroups(mappedItems, kotOrderData, table, printerConfig);
+  // Gate KOT printing on venue kot_enabled setting
+  // NULL or undefined kot_enabled means the venue has no KOT preference —
+  // default to ENABLED (same as pre-gating behavior).
+  const venueKotEnabled = table.kot_enabled !== 0;
+  if (!venueKotEnabled) {
+    console.warn(`[updateOrderItems] KOT printing DISABLED for table ${tableId} — venue kot_enabled=${table.kot_enabled}, venue_id=${table.venue_id}`);
+  }
+  const printGroups = venueKotEnabled ? buildKotPrintGroups(mappedItems, kotOrderData, table, printerConfig) : [];
   // CRITICAL: When localPrinted=true, printIntents is empty — no print jobs
   // are created or dispatched. This short-circuit also masks a latent dedup
   // bug in preparePrintIntents() (see comment there). Do not change this to
   // conditionally create print jobs without fixing the eventId suffix matching.
   const printIntents = localPrinted ? [] : preparePrintIntents(printGroups, requestId, input.kotEventIds);
+  console.log(`[updateOrderItems] Print dispatch: localPrinted=${localPrinted}, venueKotEnabled=${venueKotEnabled}, printGroups=${printGroups.length}, printIntents=${printIntents.length}`);
 
   // ── Transaction: insert new items + new KOT + print intents + update order ──
   const tx = db.transaction(() => {
@@ -1578,7 +1597,42 @@ export async function reprintKot(input: ReprintKotInput): Promise<{ success: boo
     }
   }
 
-  const printResults = await printWithLanFallback(printGroups);
+  const printResults: any[] = [];
+  for (let i = 0; i < printGroups.length; i++) {
+    const group = printGroups[i];
+    if (group.escposData.length === 0) {
+      printResults.push({ ok: false, printerName: group.printerName || "unknown", bytes: 0, error: "No print data", method: "noop" });
+      continue;
+    }
+    const eventId = `REPRINT-${group.type}-${orderId}-${Date.now()}-${i}`;
+    createPrintJob({
+      eventId,
+      restaurantId,
+      orderId,
+      kotId: null,
+      kotNumber: kots[kots.length - 1]?.kot_number || null,
+      tableId: order.table_id,
+      printerName: group.printerName,
+      jobType: group.type,
+      escposData: group.escposData,
+      itemSummary: [],
+      captainName: null,
+    });
+    let result: any;
+    try {
+      result = await awaitDispatchBounded(eventId, group, undefined);
+    } catch (e: any) {
+      result = { ok: false, printerName: group.printerName || "unknown", bytes: 0, error: e?.message || "Dispatch threw", method: "durable_queued", eventId };
+    }
+    printResults.push({
+      ok: result.ok ?? false,
+      printerName: result.printerName || group.printerName || "unknown",
+      bytes: result.bytes || 0,
+      error: result.error,
+      method: result.method || "durable_queued",
+      eventId,
+    });
+  }
   return { success: true, printResults };
 }
 
@@ -1796,56 +1850,34 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
       itemSummary: [],
       captainName: null,
     });
-    // Await the dispatch so we get the real print result.
-    // dispatchSinglePrintJob POSTs to the print bridge (HTTP, up to 10s timeout)
-    // or falls back to cloud relay. This ensures the HTTP response reflects the
-    // actual print status, not a fire-and-forget "queued" placeholder.
+    // Use awaitDispatchBounded (same as KOT) — 3s timeout, returns actual status.
+    // If print service is ready, this is instant (HTTP POST to :3103).
+    // If it times out or fails, the job stays in SQLite queue and the background
+    // loop retries automatically. We still return success=true because the bill
+    // number is assigned and the print WILL happen.
+    let result: any;
     try {
-      await dispatchSinglePrintJob(eventId, billGroup, undefined);
+      result = await awaitDispatchBounded(eventId, billGroup, input.requestId);
     } catch (e: any) {
-      printResults.push({ ok: false, printerName: billPrinterName || "unknown", bytes: 0, error: e?.message || "Dispatch threw", method: "durable_queued", eventId });
-      // Still return success=true — bill number was assigned, print will retry in background
-      const result = { success: true, billNumber, printResults, revision: newOrderRev };
-      recordCommandResult(restaurantId, input, "printBill", "order", orderId, "applied", result, newOrderRev);
-      return result;
+      result = { ok: false, printerName: billPrinterName || "unknown", bytes: 0, error: e?.message || "Dispatch threw", method: "durable_queued", eventId };
     }
-    const job = getPrintJobByEventId(eventId);
-    if (job?.status === "printed") {
-      printResults.push({ ok: true, printerName: billPrinterName, bytes: 0, method: job.acked_via || "print_service", eventId });
-    } else if (job?.status === "printing") {
-      // Cloud relay accepted — print is pending, not yet confirmed
-      printResults.push({ ok: null, printerName: billPrinterName, bytes: 0, method: "cloud_relay", eventId, pending: true });
-    } else {
-      // retrying, failed, dead_letter, etc.
-      printResults.push({ ok: false, printerName: billPrinterName || "unknown", bytes: 0, error: job?.last_error || "Print failed — will retry automatically", method: "durable_queued", eventId });
-    }
+    printResults.push({
+      ok: result.ok ?? false,
+      printerName: result.printerName || billPrinterName || "unknown",
+      bytes: result.bytes || 0,
+      error: result.error,
+      method: result.method || "durable_queued",
+      eventId,
+      pending: result.pending,
+    });
   }
 
-  // Return truthful status based on actual print results
-  const allPrinted = printResults.length > 0 && printResults.every(r => r.ok === true);
-  const anyFailed = printResults.some(r => r.ok === false);
-  const anyPending = printResults.some(r => r.ok === null);
-
-  if (allPrinted) {
-    const result = { success: true, billNumber, printResults, revision: newOrderRev };
-    recordCommandResult(restaurantId, input, "printBill", "order", orderId, "applied", result, newOrderRev);
-    return result;
-  } else if (anyFailed && !anyPending) {
-    // All failed, none pending — bill number was assigned but print failed
-    const result = { success: false, error: printResults.find(r => r.ok === false)?.error || "Bill print failed", billNumber, printResults, revision: newOrderRev };
-    recordCommandResult(restaurantId, input, "printBill", "order", orderId, "applied", result, newOrderRev);
-    return result;
-  } else if (anyPending && !anyFailed) {
-    // Print pending (cloud relay) — bill number assigned, print in progress
-    const result = { success: true, billNumber, printResults, printPending: true, revision: newOrderRev };
-    recordCommandResult(restaurantId, input, "printBill", "order", orderId, "applied", result, newOrderRev);
-    return result;
-  } else {
-    // Mixed: some failed, some pending — partial failure
-    const result = { success: true, billNumber, printResults, printPending: true, revision: newOrderRev };
-    recordCommandResult(restaurantId, input, "printBill", "order", orderId, "applied", result, newOrderRev);
-    return result;
-  }
+  // Bill number is assigned + print job is persisted in SQLite queue.
+  // Always return success=true — the print will complete (either instantly
+  // or via background retry). Never block the cashier with a print error.
+  const result = { success: true, billNumber, printResults, revision: newOrderRev };
+  recordCommandResult(restaurantId, input, "printBill", "order", orderId, "applied", result, newOrderRev);
+  return result;
 }
 
 // ─── Settle Order (mark as settled, free the table) ───────────────────────────
@@ -1871,6 +1903,7 @@ export interface SettleOrderInput {
   requestId?: string;
   deviceId?: string;
   expectedRevision?: number;
+  isExtraTable?: boolean;
 }
 
 export async function settleOrderEdge(input: SettleOrderInput): Promise<{ success: boolean; error?: string; order?: any; table?: any; transaction?: any; statusCode?: number; revision?: number; tableRevision?: number }> {
@@ -1959,6 +1992,7 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
       localTxnId,
       requestId,
       settledAt: now,
+      isExtraTable: input.isExtraTable ?? false,
     });
     db.query("INSERT INTO edge_config (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?")
       .run(paymentKey, paymentData, now, paymentData, now);
@@ -2447,8 +2481,11 @@ export async function editBillEdge(
         sectionTag: table.section_tag || undefined,
       };
 
-      const printGroups = buildKotPrintGroups(mappedAddedItems, kotOrderData, table, printerConfig);
-      printResults = await printWithLanFallback(printGroups);
+      const venueKotEnabled = table.kot_enabled !== 0;
+      if (venueKotEnabled) {
+        const printGroups = buildKotPrintGroups(mappedAddedItems, kotOrderData, table, printerConfig);
+        printResults = await printWithLanFallback(printGroups);
+      }
     }
   }
 

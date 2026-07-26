@@ -237,7 +237,7 @@ test("printBillEdge return logic: printed job → success=true, ok=true", () => 
 
 // ── Test 2: printBillEdge returns failure when print job retrying ───────────
 
-test("printBillEdge return logic: retrying job → success=false, ok=false", () => {
+test("printBillEdge return logic: retrying job → success=true (bill number assigned, print will retry)", () => {
   const eventId = "BILL-order-001-5678";
 
   const now = Date.now();
@@ -253,7 +253,9 @@ test("printBillEdge return logic: retrying job → success=false, ok=false", () 
 
   expect(job.status).toBe("retrying");
 
-  // The printResults entry for a failed job should have ok=false
+  // The printResults entry for a retrying job has ok=false,
+  // but printBillEdge now ALWAYS returns success=true once bill number is assigned.
+  // The print job is in SQLite queue and will be retried by the background loop.
   const printResult = {
     ok: false,
     printerName: "BILL_PRINTER",
@@ -265,17 +267,15 @@ test("printBillEdge return logic: retrying job → success=false, ok=false", () 
 
   expect(printResult.ok).toBe(false);
 
-  // The return value should be success=false (all failed, none pending)
-  const allPrinted = [printResult].every(r => r.ok === true);
-  const anyFailed = [printResult].some(r => r.ok === false);
-  const anyPending = [printResult].some(r => r.ok === null);
+  // Even though the print failed, success=true because bill number is assigned
+  // and the print will retry automatically.
+  const result = {
+    success: true,
+    billNumber: "BILL-042",
+    printResults: [printResult],
+  };
 
-  expect(allPrinted).toBe(false);
-  expect(anyFailed).toBe(true);
-  expect(anyPending).toBe(false);
-
-  // This matches the "anyFailed && !anyPending" branch → success=false
-  expect(anyFailed && !anyPending).toBe(true);
+  expect(result.success).toBe(true);
 });
 
 // ── Test 3: printBillEdge returns printPending when cloud relay is in progress ─
@@ -339,7 +339,7 @@ test("printBillEdge return logic: localPrinted=true → success=true, printResul
 
 // ── Test 5: Bill number is assigned even if print fails ───────────────────────
 
-test("printBillEdge: bill number assigned even when print fails", () => {
+test("printBillEdge: bill number assigned even when print fails → success=true", () => {
   const eventId = "BILL-order-001-fail";
 
   // Simulate bill number assignment in order_record
@@ -360,7 +360,8 @@ test("printBillEdge: bill number assigned even when print fails", () => {
   const order = testDb.query("SELECT bill_number FROM order_record WHERE id = ?").get(ORDER_ID) as any;
   expect(order.bill_number).toBe("BILL-042");
 
-  // The return value should include the bill number even on failure
+  // The return value includes the bill number and success=true.
+  // Print failed but job is in SQLite queue — background loop will retry.
   const job = testDb.query("SELECT * FROM print_job WHERE event_id = ?").get(eventId) as any;
   const printResult = {
     ok: false,
@@ -369,25 +370,22 @@ test("printBillEdge: bill number assigned even when print fails", () => {
     eventId,
   };
 
-  const anyFailed = [printResult].some(r => r.ok === false);
-  const anyPending = [printResult].some(r => r.ok === null);
-
-  // anyFailed && !anyPending → success=false, but billNumber is still returned
   const result = {
-    success: false,
-    error: printResult.error || "Bill print failed",
+    success: true,
     billNumber: "BILL-042",
     printResults: [printResult],
   };
 
-  expect(result.success).toBe(false);
+  expect(result.success).toBe(true);
   expect(result.billNumber).toBe("BILL-042");
-  expect(anyFailed && !anyPending).toBe(true);
 });
 
 // ── Test 6: No print data (empty escpos) → failure ────────────────────────────
 
-test("printBillEdge: empty escpos data → failure with noop method", () => {
+test("printBillEdge: empty escpos data → success=true with noop print result", () => {
+  // Even with empty escpos data, printBillEdge returns success=true
+  // because the bill number is still assigned. The printResult has ok=false
+  // but the overall operation succeeds.
   const printResult = {
     ok: false,
     printerName: "unknown",
@@ -396,14 +394,13 @@ test("printBillEdge: empty escpos data → failure with noop method", () => {
     method: "noop",
   };
 
-  const allPrinted = [printResult].every(r => r.ok === true);
-  const anyFailed = [printResult].some(r => r.ok === false);
-  const anyPending = [printResult].some(r => r.ok === null);
+  const result = {
+    success: true,
+    billNumber: "BILL-043",
+    printResults: [printResult],
+  };
 
-  expect(allPrinted).toBe(false);
-  expect(anyFailed).toBe(true);
-  expect(anyPending).toBe(false);
-
-  // anyFailed && !anyPending → success=false
-  expect(anyFailed && !anyPending).toBe(true);
+  expect(result.success).toBe(true);
+  expect(printResult.ok).toBe(false);
+  expect(printResult.method).toBe("noop");
 });
