@@ -1594,8 +1594,7 @@ function getNextBillNumber(restaurantId: string): string {
   const row = db.query("UPDATE daily_counter SET bill_count = bill_count + 1 WHERE restaurant_id = ? AND counter_date = ? RETURNING bill_count")
     .get(restaurantId, today) as { bill_count: number };
 
-  const dateStr = today.replace(/-/g, "");
-  return `B${dateStr}${String(row.bill_count).padStart(4, "0")}`;
+  return String(row.bill_count);
 }
 
 // ─── Request Billing (mark order as billing requested) ────────────────────────
@@ -1719,6 +1718,11 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
     return failResult;
   }
 
+  // Resolve discount: prefer explicit input, fall back to table's stored discount
+  const effectiveDiscountPercent = discountPercent != null
+    ? discountPercent
+    : (table.discount != null ? Number(table.discount) : 0);
+
   // Get order items with gst_enabled from menu_item (excluding fully cancelled and removed from bill)
   const orderItems = db.query(
     `SELECT oi.*, mi.gst_enabled as menu_gst_enabled
@@ -1759,7 +1763,7 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
     gstRate: outlet.gst_rate,
     gstRegistered: outlet.gst_registered,
     pricesIncludeGst: outlet.prices_include_gst,
-    discountPercent: discountPercent || 0,
+    discountPercent: effectiveDiscountPercent,
     serviceChargePercent,
     billNumber,
   });
@@ -1991,6 +1995,10 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
   lanBroadcast("order:settled", { orderId, tableId: order.table_id, requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: requestId });
   lanBroadcast("table:updated", { table: { id: order.table_id, status: "AVAILABLE", workflowStatus: "Free", revision: newTableRev }, tableId: order.table_id, requestId, tableRevision: newTableRev, commandId: requestId });
 
+  // Fetch order items so the transaction object has complete data for the
+  // cashier UI (items list, itemCount) — matches listTransactionsEdge output.
+  const settleItems = db.query("SELECT name, quantity, price, menu_type FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0 AND (cancelled_quantity IS NULL OR cancelled_quantity < quantity)").all(orderId) as any[];
+
   // Build a local transaction object so the cashier UI can display it
   // immediately without synthesizing its own.
   const transaction = {
@@ -2012,6 +2020,10 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
     billNumber: updatedOrder.bill_number || null,
     paidAt: new Date(now).toISOString(),
     settledAt: now,
+    tableNumber: updatedTable.number ?? null,
+    sectionTag: updatedTable.section_tag || null,
+    itemCount: settleItems.length,
+    items: settleItems.map(i => ({ name: i.name, quantity: i.quantity, price: i.price })),
   };
 
   const result = {
@@ -2732,7 +2744,7 @@ export async function listTransactionsEdge(
     }
 
     // Get items for this order
-    const items = db.query("SELECT name, quantity, price, menu_type FROM order_item WHERE order_id = ?").all(order.id) as any[];
+    const items = db.query("SELECT name, quantity, price, menu_type FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0 AND (cancelled_quantity IS NULL OR cancelled_quantity < quantity)").all(order.id) as any[];
 
     txns.push({
       id: `edge-txn-${order.id}`,
@@ -2811,4 +2823,162 @@ export async function listTransactionsEdge(
 
   // Apply limit
   return txns.slice(0, limit);
+}
+
+// ─── List Items Sold (for edge-local Item Analytics) ─────────────────────────
+// Aggregates item-level sales from settled orders in local SQLite.
+// Mirrors the cloud /api/analytics/items-sold response shape so the frontend
+// ItemAnalytics component can use the same mapping logic.
+
+const EDGE_BAR_LIKE_VENUE_TYPES = ["BAR", "PDR", "CONFERENCE", "BANQUET", "ROOM_SERVICE", "BAR_LOUNGE", "BREWERY", "PUB", "LOUNGE", "NIGHTCLUB", "WINE_BAR", "COCKTAIL_BAR"];
+
+const EDGE_BEVERAGE_KEYWORDS = [
+  "water", "sprite", "thums up", "thumsup", "tin thums", "soda", "cola", "coke", "pepsi",
+  "limca", "fanta", "mirinda", "7up", "pulpy orange", "fresh lime", "mojitho", "mojito",
+  "moctail", "mocktail", "fruit punch", "lassi", "butter milk", "buttermilk", "milk shake",
+  "milkshake", "monster", "charged", "red bull", "coolberg", "juice",
+];
+
+function edgeNormalizeBeverageName(name: string): string {
+  let normalized = String(name || "").toLowerCase();
+  normalized = normalized
+    .replace(/\b(bottle|can|tin|glass|cup|ml|ltr|liter|litre)\b/g, " ")
+    .replace(/\s+\d+\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const aliases: Record<string, string> = {
+    "thumsup": "thums up",
+    "thums": "thums up",
+    "tin thums": "thums up",
+    "butter milk": "buttermilk",
+    "milk shake": "milkshake",
+    "moctail": "mocktail",
+    "mojitho": "mojito",
+  };
+  return aliases[normalized] || normalized;
+}
+
+function edgeGetAnalyticsType(item: any): "food" | "liquor" | "beverages" {
+  const rawType = String(item?.menuType || item?.menu_type || item?.type || "").toUpperCase();
+  if (rawType === "LIQUOR") return "liquor";
+  const normalizedName = edgeNormalizeBeverageName(String(item?.name || ""));
+  if (EDGE_BEVERAGE_KEYWORDS.some((k) => normalizedName.includes(k))) return "beverages";
+  return "food";
+}
+
+export async function listItemsSoldEdge(
+  restaurantId: string,
+  opts: { startDate?: string | null; endDate?: string | null; sectionName?: string | null; outletType?: string | null } = {},
+): Promise<{ items: any[]; summary: any; dateRange: any }> {
+  const db = getDb();
+  const today = getKolkataDateString();
+  const start = opts.startDate || today;
+  const end = opts.endDate || today;
+
+  // Resolve section filter to table IDs
+  let sectionTableIds: string[] = [];
+  let sectionIds: string[] = [];
+
+  if (opts.sectionName) {
+    const sections = db.query("SELECT id FROM section WHERE restaurant_id = ? AND LOWER(name) = LOWER(?)").all(restaurantId, opts.sectionName) as any[];
+    sectionIds = sections.map(s => s.id);
+    if (sectionIds.length > 0) {
+      const placeholders = sectionIds.map(() => "?").join(",");
+      const tables = db.query(`SELECT id FROM "table" WHERE section_id IN (${placeholders})`).all(...sectionIds) as any[];
+      sectionTableIds = tables.map(t => t.id);
+    }
+    if (sectionTableIds.length === 0) {
+      return { items: [], summary: { totalItems: 0, totalQuantity: 0, totalRevenue: 0 }, dateRange: { startDate: start, endDate: end } };
+    }
+  } else if (opts.outletType) {
+    const isBarOutlet = String(opts.outletType).toUpperCase() === "BAR";
+    const placeholders = EDGE_BAR_LIKE_VENUE_TYPES.map(() => "?").join(",");
+    const venueSections = isBarOutlet
+      ? db.query(`SELECT s.id FROM section s JOIN venue v ON s.venue_id = v.id WHERE s.restaurant_id = ? AND UPPER(v.venue_type) IN (${placeholders})`).all(restaurantId, ...EDGE_BAR_LIKE_VENUE_TYPES) as any[]
+      : db.query(`SELECT s.id FROM section s JOIN venue v ON s.venue_id = v.id WHERE s.restaurant_id = ? AND UPPER(v.venue_type) NOT IN (${placeholders})`).all(restaurantId, ...EDGE_BAR_LIKE_VENUE_TYPES) as any[];
+    sectionIds = venueSections.map(s => s.id);
+    if (sectionIds.length > 0) {
+      const placeholders2 = sectionIds.map(() => "?").join(",");
+      const tables = db.query(`SELECT id FROM "table" WHERE section_id IN (${placeholders2})`).all(...sectionIds) as any[];
+      sectionTableIds = tables.map(t => t.id);
+    }
+  }
+
+  // Build query for settled orders in date range
+  const dayStart = new Date(start + "T00:00:00+05:30").getTime();
+  const dayEnd = new Date(end + "T23:59:59+05:30").getTime();
+
+  let orderQuery = `SELECT o.id, o.paid_at, o.bill_number, t.number as table_number, t.section_id, t.section_tag
+    FROM order_record o
+    LEFT JOIN "table" t ON o.table_id = t.id
+    WHERE o.restaurant_id = ? AND o.status = 'SETTLED' AND o.paid_at >= ? AND o.paid_at <= ?`;
+  const orderParams: any[] = [restaurantId, dayStart, dayEnd];
+
+  if (sectionTableIds.length > 0) {
+    const placeholders = sectionTableIds.map(() => "?").join(",");
+    orderQuery += ` AND (t.section_id IN (${sectionIds.length ? sectionIds.map(() => "?").join(",") : "''"}) OR o.table_id IN (${placeholders}))`;
+    if (sectionIds.length > 0) orderParams.push(...sectionIds);
+    orderParams.push(...sectionTableIds);
+  }
+
+  const settledOrders = db.query(orderQuery).all(...orderParams) as any[];
+
+  // Fetch liquor menu item names for historical type correction
+  const liquorItems = db.query("SELECT LOWER(name) as name FROM menu_item WHERE restaurant_id = ? AND UPPER(menu_type) = 'LIQUOR'").all(restaurantId) as any[];
+  const liquorKeywords = liquorItems.map(m => m.name);
+
+  // Aggregate items
+  const itemMap = new Map<string, { name: string; quantity: number; revenue: number; type: string; orderCount: number }>();
+
+  for (const order of settledOrders) {
+    const items = db.query("SELECT name, quantity, cancelled_quantity, price, menu_type FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0 AND (cancelled_quantity IS NULL OR cancelled_quantity < quantity)").all(order.id) as any[];
+
+    for (const item of items) {
+      const name = String(item.name || "Unknown").trim();
+      const key = name.toLowerCase().replace(/\s+/g, " ").trim();
+      const quantity = Number(item.quantity || 0) - Number(item.cancelled_quantity || 0);
+      const price = Number(item.price || 0);
+      const revenue = Math.round(price * quantity * 100) / 100;
+
+      let type = edgeGetAnalyticsType(item);
+      if (type === "food" || type === "beverages") {
+        const lowerName = name.toLowerCase();
+        if (liquorKeywords.some(keyword => lowerName.startsWith(keyword))) {
+          type = "liquor";
+        }
+      }
+
+      if (itemMap.has(key)) {
+        const existing = itemMap.get(key)!;
+        existing.quantity += quantity;
+        existing.revenue += revenue;
+        existing.orderCount += 1;
+      } else {
+        itemMap.set(key, { name, quantity, revenue, type, orderCount: 1 });
+      }
+    }
+  }
+
+  const itemsData = Array.from(itemMap.entries())
+    .map(([_, data]) => ({
+      name: data.name,
+      quantity: data.quantity,
+      revenue: Math.round(data.revenue * 100) / 100,
+      type: data.type,
+      orderCount: data.orderCount,
+    }))
+    .sort((a, b) => b.revenue - a.revenue);
+
+  const totalQuantity = itemsData.reduce((sum, item) => sum + item.quantity, 0);
+  const totalRevenue = itemsData.reduce((sum, item) => sum + item.revenue, 0);
+
+  return {
+    items: itemsData,
+    summary: {
+      totalItems: itemsData.length,
+      totalQuantity,
+      totalRevenue: Math.round(totalRevenue * 100) / 100,
+    },
+    dateRange: { startDate: start, endDate: end },
+  };
 }

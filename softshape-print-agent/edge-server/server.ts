@@ -50,7 +50,7 @@ import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enque
 import os from "os";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getSessionToken, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { pullIncrementalChanges } from "./config.ts";
-import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
+import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, listItemsSoldEdge, dispatchPendingPrintJobs } from "./orderService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders } from "./reads.ts";
 import { startSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
 import { startSocketSync, getSocketStatus, startHeartbeat } from "./socketSync.ts";
@@ -378,7 +378,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       return jsonResponse({
         status: rmHealth.status,
         service: "softshape-edge-server",
-        version: "23.3.8",
+        version: "23.4.1",
         uptime: process.uptime(),
         runtimeState: rmHealth.runtimeState,
         configSyncState: rmHealth.configSyncState,
@@ -430,7 +430,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     return jsonResponse({
       status: "ok",
       service: "softshape-edge-server",
-      version: "23.3.8",
+      version: "23.4.1",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
@@ -1252,6 +1252,20 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     return jsonResponse(txns, 200, { "Cache-Control": "no-store" });
   }
 
+  // ── GET /api/edge/analytics/items-sold — item sales analytics from local SQLite ─
+  // Used by edge-local (PIN) auth to populate Item Analytics from settled orders.
+  if (url.pathname === "/api/edge/analytics/items-sold" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("No valid session", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const startDate = url.searchParams.get("startDate");
+    const endDate = url.searchParams.get("endDate");
+    const sectionName = url.searchParams.get("sectionName");
+    const outletType = url.searchParams.get("outletType");
+    const result = await listItemsSoldEdge(restaurantId, { startDate, endDate, sectionName, outletType });
+    return jsonResponse(result, 200, { "Cache-Control": "no-store" });
+  }
+
   // ── GET /api/edge/tables — sections with nested tables + active orders ────
   if (url.pathname === "/api/edge/tables" && req.method === "GET") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
@@ -1770,7 +1784,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   // returns the download URL if an update exists. The Host handles the
   // download, binary swap, and restart.
   if (url.pathname === "/api/edge/update-check" && req.method === "GET") {
-    const currentVersion = "23.3.8";
+    const currentVersion = "23.4.1";
     const backendUrl = getBackendUrl();
     const sessionToken = getSessionToken();
 

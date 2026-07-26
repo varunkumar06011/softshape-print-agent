@@ -27,7 +27,7 @@ import { pullIncrementalChanges } from "./config.ts";
 const SYNC_INTERVAL_MS = parseInt(process.env.EDGE_SYNC_INTERVAL_MS || "10000", 10);
 const CONFIG_PULL_INTERVAL_MS = parseInt(process.env.EDGE_CONFIG_PULL_INTERVAL_MS || "60000", 10);
 const MAX_BATCH_SIZE = 50;
-const MAX_ATTEMPTS = 5;
+const MAX_ATTEMPTS = 2;
 const BACKOFF_BASE_MS = 10_000;   // 10 seconds
 const BACKOFF_MAX_MS = 5 * 60_000; // 5 minutes cap
 const SYNC_SCHEMA_VERSION = 2;
@@ -66,25 +66,17 @@ interface SyncPayloadItem {
 
 function collectBatch(): SyncQueueRow[] {
   const db = getDb();
-  // Get pending records, prioritizing by entity dependency order first,
-  // then oldest first within each priority group.
+  // Simple FIFO — oldest first. Records that have failed (attempts >= MAX_ATTEMPTS)
+  // are pushed to the end of the queue so they don't block other records,
+  // but they stay in the queue and keep retrying.
   return db.query(`
     SELECT * FROM sync_queue
     WHERE synced = 0
     ORDER BY
-      CASE table_name
-        WHEN 'order' THEN 0
-        WHEN 'order_item' THEN 1
-        WHEN 'kot' THEN 1
-        WHEN 'kot_item' THEN 2
-        WHEN 'table' THEN 3
-        WHEN 'transaction' THEN 4
-        WHEN 'walkin_transaction' THEN 4
-        ELSE 10
-      END,
+      CASE WHEN attempts >= ? THEN 1 ELSE 0 END,
       created_at ASC, id ASC
     LIMIT ?
-  `).all(MAX_BATCH_SIZE) as SyncQueueRow[];
+  `).all(MAX_ATTEMPTS, MAX_BATCH_SIZE) as SyncQueueRow[];
 }
 
 // ─── Load the full record data for a sync queue entry ────────────────────────
@@ -484,6 +476,12 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
         operation: row.operation,
         data,
       });
+    } else if (row.table_name === "transaction" || row.table_name === "walkin_transaction") {
+      // Payment data missing from edge_config — do NOT silently drop.
+      // Increment attempts so it goes to the end of the queue and surfaces
+      // in the dead-letter recovery UI for manual investigation.
+      console.warn(`[Sync] ${row.table_name} ${row.record_id} has no data in edge_config — keeping in queue (queueId=${row.id})`);
+      incrementAttempts([row.id], "Payment data missing from edge_config");
     } else {
       // Record was deleted locally — mark as synced (nothing to push)
       markSynced([row.id]);
@@ -598,9 +596,15 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
 // ─── Sync worker loop (with exponential backoff) ─────────────────────────────
 
 let syncTimer: ReturnType<typeof setTimeout> | null = null;
+let _sessionInvalidLoggedAt = 0;
 
 async function runSyncCycle(): Promise<void> {
   if (!isSessionValid()) {
+    const now = Date.now();
+    if (now - _sessionInvalidLoggedAt > 60_000) {
+      _sessionInvalidLoggedAt = now;
+      console.warn("[Sync] Session invalid or expired — sync worker skipping. Re-register via POST /api/edge/register");
+    }
     scheduleNextCycle(SYNC_INTERVAL_MS);
     return;
   }
@@ -612,7 +616,6 @@ async function runSyncCycle(): Promise<void> {
   syncRunning = true;
   try {
     const result = await pushSyncBatch();
-    deadLetterExhausted();
 
     // Checkpoint WAL to keep the -wal file small and reads fast.
     // Without this, the WAL grows throughout a shift and every query
