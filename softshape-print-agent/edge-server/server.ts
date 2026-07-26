@@ -58,7 +58,7 @@ import { acquireInstanceLock, startHeartbeatLoop, forceReleaseLock, getLockStatu
 import { cloudFetch } from "./cloudFetch.ts";
 import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount, setClientRegistered, lanBroadcast } from "./lanBroadcast.ts";
 import { printToPrinter, resolvePrinterName } from "./printer.ts";
-import { isPrintServiceReady, getPrintServiceStatus, sendToPrintService, listPrintersViaService, startPrintService, stopPrintService } from "./printServiceManager.ts";
+import { isPrintServiceReady, getPrintServiceStatus, getPrintServiceExeDiagnostics, sendToPrintService, listPrintersViaService, startPrintService, stopPrintService } from "./printServiceManager.ts";
 import { deviceManager } from "./drivers/manager.ts";
 import { PrinterDriver } from "./drivers/printer/index.ts";
 import { PaymentDriver } from "./drivers/payment/index.ts";
@@ -495,7 +495,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     await new Promise(resolve => setTimeout(resolve, 500));
     const started = startPrintService();
     if (!started) {
-      return jsonResponse({ ok: false, error: "Print service executable not found — see logs for searched paths" }, 500);
+      return jsonResponse({ ok: false, error: "Print service executable not found", exe: getPrintServiceExeDiagnostics() }, 500);
     }
     return jsonResponse({ ok: true, status: getPrintServiceStatus() });
   }
@@ -1875,6 +1875,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       summary,
       printServiceReady: isPrintServiceReady(),
       printServiceStatus: getPrintServiceStatus(),
+      printServiceExe: getPrintServiceExeDiagnostics(),
       resolvedPrinters,
       printerConfig,
     }, 200, { "Cache-Control": "no-store" });
