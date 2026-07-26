@@ -35,7 +35,7 @@ const DEFAULT_PORT: u16 = 3103;
 // the output), while allowing different printers to print in parallel.
 // The outer RwLock protects the HashMap itself; the inner Mutex serializes
 // access to a single printer.
-static PRINTER_LOCKS: RwLock<HashMap<String, Arc<Mutex<()>>>> = RwLock::new(HashMap::new());
+static PRINTER_LOCKS: std::sync::LazyLock<RwLock<HashMap<String, Arc<Mutex<()>>>>> = std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
 fn with_printer_lock<T, F: FnOnce() -> T>(printer_name: &str, f: F) -> T {
     // Fast path: read lock to check if a mutex already exists for this printer

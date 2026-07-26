@@ -1096,7 +1096,16 @@ export function getPendingPrintJobs(limit = 50): any[] {
     `SELECT * FROM print_job
      WHERE status IN ('queued', 'retrying')
      AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-     ORDER BY id ASC LIMIT ?`
+     ORDER BY
+     CASE job_type
+       WHEN 'BILL' THEN 0
+       WHEN 'FINAL_BILL' THEN 0
+       WHEN 'KOT' THEN 1
+       WHEN 'BAR_KOT' THEN 1
+       WHEN 'CANCEL_KOT' THEN 2
+       ELSE 3
+     END,
+     id ASC LIMIT ?`
   ).all(now, limit) as any[];
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "softshape-print-service"
-version = "23.3.0"
+version = "23.3.7"
 edition = "2021"
 rust-version = "1.70"
 
@@ -18,4 +18,5 @@ windows = { version = "0.54", features = [
     "Win32_Graphics_Gdi",
     "Win32_Foundation",
     "Win32_System_IO",
+    "Win32_Security",
 ] }
