@@ -896,6 +896,8 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       kotEventIds: body.kotEventIds || null,
       deviceId: body.deviceId,
       expectedRevision: body.expectedRevision,
+      isExtraTable: body.isExtraTable,
+      tableNumber: body.tableNumber,
     });
 
     if (!result.success) {
@@ -936,6 +938,8 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       kotEventIds: body.kotEventIds || null,
       deviceId: body.deviceId,
       expectedRevision: body.expectedRevision,
+      isExtraTable: body.isExtraTable,
+      tableNumber: body.tableNumber,
     });
 
     if (!result.success) {
@@ -968,6 +972,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       localPrinted: body.localPrinted || false,
       deviceId: body.deviceId,
       expectedRevision: body.expectedRevision,
+      isExtraTable: body.isExtraTable,
     });
 
     if (!result.success) {
@@ -1019,6 +1024,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         localPrinted: body.localPrinted || false,
         deviceId: body.deviceId,
         expectedRevision: body.expectedRevision,
+        isExtraTable: body.isExtraTable,
       });
       results.push({ orderItemId: item.orderItemId, success: result.success, error: result.error });
     }
@@ -1070,6 +1076,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       requestId: body.requestId,
       deviceId: body.deviceId,
       expectedRevision: body.expectedRevision,
+      isExtraTable: body.isExtraTable,
     });
     if (!result.success) return errorResponse(result.error || "Request billing failed", 400);
     return jsonResponse(result);
@@ -1113,7 +1120,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       await editBillEdge(restaurantId, body.orderId, {
         removedItemIds: body.removedItemIds,
         editedBy: body.removedBy || "Cashier",
-        meta: { requestId: body.requestId, deviceId: body.deviceId, expectedRevision: body.expectedRevision },
+        meta: { requestId: body.requestId, deviceId: body.deviceId, expectedRevision: body.expectedRevision, isExtraTable: body.isExtraTable, tableNumber: body.tableNumber },
       });
     }
 
@@ -1190,7 +1197,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       editQuantities: body.editQuantities,
       addedItems: body.addedItems,
       editedBy: body.editedBy,
-      meta: { requestId: body.requestId, deviceId: body.deviceId, expectedRevision: body.expectedRevision },
+      meta: { requestId: body.requestId, deviceId: body.deviceId, expectedRevision: body.expectedRevision, isExtraTable: body.isExtraTable, tableNumber: body.tableNumber },
     });
     if (!result.success) return errorResponse(result.error || "Edit bill failed", 400);
     return jsonResponse(result);

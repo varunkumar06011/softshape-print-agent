@@ -26,6 +26,8 @@ export interface CommandMeta {
   requestId?: string;
   deviceId?: string;
   expectedRevision?: number;
+  isExtraTable?: boolean;
+  tableNumber?: string;
 }
 
 export interface RevisionResponse {
@@ -558,6 +560,8 @@ export interface CreateOrderInput {
   kotEventIds?: KotEventIdEntry[] | null;
   deviceId?: string;
   expectedRevision?: number;
+  isExtraTable?: boolean;
+  tableNumber?: string;
 }
 
 export interface CreateOrderResult {
@@ -731,20 +735,22 @@ export async function createOrder(
     }
   }
 
-  // ── Check for active order on table ────────────────────────────────────────
-  const activeOrder = db.query(
-    `SELECT * FROM order_record WHERE table_id = ? AND restaurant_id = ? AND status IN (${ACTIVE_ORDER_STATUSES.map(() => "?").join(",")}) AND is_deleted = 0`
-  ).get(tableId, restaurantId, ...ACTIVE_ORDER_STATUSES) as any;
+  // ── Check for active order on table (skip for extra tables) ───────────────
+  if (!input.isExtraTable) {
+    const activeOrder = db.query(
+      `SELECT * FROM order_record WHERE table_id = ? AND restaurant_id = ? AND status IN (${ACTIVE_ORDER_STATUSES.map(() => "?").join(",")}) AND is_deleted = 0`
+    ).get(tableId, restaurantId, ...ACTIVE_ORDER_STATUSES) as any;
 
-  if (activeOrder) {
-    const rejectResult = {
-      success: false,
-      error: "Table already has an active order — use update items instead",
-      statusCode: 409,
-      orderId: activeOrder.id,
-    };
-    recordCommandResult(restaurantId, input, "createOrder", "table", tableId, "rejected", rejectResult, null, rejectResult.error);
-    return rejectResult;
+    if (activeOrder) {
+      const rejectResult = {
+        success: false,
+        error: "Table already has an active order — use update items instead",
+        statusCode: 409,
+        orderId: activeOrder.id,
+      };
+      recordCommandResult(restaurantId, input, "createOrder", "table", tableId, "rejected", rejectResult, null, rejectResult.error);
+      return rejectResult;
+    }
   }
 
   // ── Get table + outlet info ────────────────────────────────────────────────
@@ -805,7 +811,9 @@ export async function createOrder(
 
   // ── Build print groups BEFORE transaction (pure computation) ───────────────
   // Print intents are persisted inside the transaction to guarantee atomicity.
-  const formattedTableNumber = formatTableNumber(table);
+  const formattedTableNumber = input.isExtraTable && input.tableNumber
+    ? input.tableNumber
+    : formatTableNumber(table);
   const restaurantName = outlet.receipt_header || outlet.name;
   const sectionName = table.section_name || "Main Hall";
   const sectionTag = table.section_tag;
@@ -861,9 +869,9 @@ export async function createOrder(
     const now = Date.now();
 
     // 1. Create order
-    db.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, captain_id, platform, created_by_user_id, last_request_id, created_at, updated_at, cloud_synced)
-      VALUES (?, ?, ?, 'PREPARING', ?, ?, ?, ?, ?, ?, ?, 0)
-    `).run(orderId, tableId, restaurantId, totalAmount, captainId || null, platform || "DINE_IN", createdByUserId || null, requestId || null, now, now);
+    db.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, captain_id, platform, created_by_user_id, last_request_id, created_at, updated_at, cloud_synced, is_extra_table)
+      VALUES (?, ?, ?, 'PREPARING', ?, ?, ?, ?, ?, ?, ?, 0, ?)
+    `).run(orderId, tableId, restaurantId, totalAmount, captainId || null, platform || "DINE_IN", createdByUserId || null, requestId || null, now, now, input.isExtraTable ? 1 : 0);
 
     // 2. Create order items (using resolved prices)
     for (const item of resolvedItems) {
@@ -887,28 +895,33 @@ export async function createOrder(
       `).run(kotItemId, kotId, oi.id, oi.menu_item_id, oi.name, oi.quantity, oi.price, oi.notes, now);
     }
 
-    // 5. Update table status + increment table revision
-    const newTableRev = nextTableRevision(tableId);
-    db.query(`UPDATE "table" SET status = 'OCCUPIED', workflow_status = 'Preparing', current_bill = current_bill + ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
-      .run(totalAmount, newTableRev, requestId || null, now, tableId);
+    // 5. Update table status + increment table revision (skip for extra tables)
+    let newTableRev: number | undefined;
+    if (!input.isExtraTable) {
+      newTableRev = nextTableRevision(tableId);
+      db.query(`UPDATE "table" SET status = 'OCCUPIED', workflow_status = 'Preparing', current_bill = current_bill + ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+        .run(totalAmount, newTableRev, requestId || null, now, tableId);
 
-    // 6. Update KOT history on table (safe parse — corrupted JSON should not crash the transaction)
-    let currentHistory: any[] = [];
-    try {
-      currentHistory = JSON.parse(table.kot_history || "[]") as any[];
-      if (!Array.isArray(currentHistory)) currentHistory = [];
-    } catch {
-      currentHistory = [];
+      // 6. Update KOT history on table (safe parse — corrupted JSON should not crash the transaction)
+      let currentHistory: any[] = [];
+      try {
+        currentHistory = JSON.parse(table.kot_history || "[]") as any[];
+        if (!Array.isArray(currentHistory)) currentHistory = [];
+      } catch {
+        currentHistory = [];
+      }
+      // Map by index to handle duplicate menuItemIds correctly
+      const kotEntry = buildKotHistoryEntry(kotNumber, resolvedItems.map((i, idx) => ({ ...i, orderItemId: orderItems[idx]?.id })));
+      currentHistory.push(kotEntry);
+      db.query(`UPDATE "table" SET kot_history = ? WHERE id = ?`).run(JSON.stringify(currentHistory), tableId);
     }
-    // Map by index to handle duplicate menuItemIds correctly
-    const kotEntry = buildKotHistoryEntry(kotNumber, resolvedItems.map((i, idx) => ({ ...i, orderItemId: orderItems[idx]?.id })));
-    currentHistory.push(kotEntry);
-    db.query(`UPDATE "table" SET kot_history = ? WHERE id = ?`).run(JSON.stringify(currentHistory), tableId);
 
     // 7. Enqueue sync records for cloud push
     enqueueSync("order", orderId, "insert");
     enqueueSync("kot", kotId, "insert");
-    enqueueSync("table", tableId, "update");
+    if (!input.isExtraTable) {
+      enqueueSync("table", tableId, "update");
+    }
 
     // 8. Persist print intents in the same transaction (atomicity guarantee)
     persistPrintIntentsInTx(printIntents, restaurantId, orderId, kotId, kotNumber, tableId, captainName);
@@ -940,8 +953,10 @@ export async function createOrder(
   const printResults = localPrinted ? [] : await Promise.all(dispatchPrintIntents(printIntents, requestId));
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
-  lanBroadcast("order:created", { order: { id: orderId, tableId, kotNumber, totalAmount, revision: 1 }, tableId, requestId, revision: 1, tableRevision: newTableRev, commandId: requestId });
-  lanBroadcast("table:updated", { table: { id: tableId, status: "OCCUPIED", workflowStatus: "Preparing", revision: newTableRev }, tableId, requestId, tableRevision: newTableRev, commandId: requestId });
+  lanBroadcast("order:created", { order: { id: orderId, tableId, kotNumber, totalAmount, revision: 1 }, tableId, requestId, revision: 1, tableRevision: newTableRev, commandId: requestId, isExtraTable: !!input.isExtraTable });
+  if (!input.isExtraTable) {
+    lanBroadcast("table:updated", { table: { id: tableId, status: "OCCUPIED", workflowStatus: "Preparing", revision: newTableRev }, tableId, requestId, tableRevision: newTableRev, commandId: requestId });
+  }
 
   // ── Return result ──────────────────────────────────────────────────────────
   const updatedTable = db.query(`
@@ -1013,6 +1028,8 @@ export interface UpdateOrderItemsInput {
   kotEventIds?: KotEventIdEntry[] | null;
   deviceId?: string;
   expectedRevision?: number;
+  isExtraTable?: boolean;
+  tableNumber?: string;
 }
 
 export interface UpdateOrderItemsResult {
@@ -1138,7 +1155,9 @@ export async function updateOrderItems(
   const kotNumber = preReservedKotNumber != null ? preReservedKotNumber : getNextKotNumber(restaurantId);
 
   // ── Build print groups BEFORE transaction (pure computation) ───────────────
-  const formattedTableNumber = formatTableNumber(table);
+  const formattedTableNumber = input.isExtraTable && input.tableNumber
+    ? input.tableNumber
+    : formatTableNumber(table);
   const restaurantName = outlet.receipt_header || outlet.name;
   const sectionName = table.section_name || "Main Hall";
   const sectionTag = table.section_tag;
@@ -1223,27 +1242,32 @@ export async function updateOrderItems(
     db.query("UPDATE order_record SET total_amount = ?, updated_at = ?, last_request_id = ?, revision = ?, last_command_id = ? WHERE id = ?")
       .run(newTotal, now, requestId || null, newOrderRev, requestId || null, orderId);
 
-    // 5. Update table current_bill + increment table revision
-    const newTableRev = nextTableRevision(tableId);
-    db.query(`UPDATE "table" SET current_bill = current_bill + ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
-      .run(additionalAmount, newTableRev, requestId || null, now, tableId);
+    // 5. Update table current_bill + increment table revision (skip for extra tables)
+    let newTableRev: number | undefined;
+    if (!input.isExtraTable) {
+      newTableRev = nextTableRevision(tableId);
+      db.query(`UPDATE "table" SET current_bill = current_bill + ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+        .run(additionalAmount, newTableRev, requestId || null, now, tableId);
 
-    // 6. Update KOT history on table (safe parse — corrupted JSON should not crash the transaction)
-    let currentHistory: any[] = [];
-    try {
-      currentHistory = JSON.parse(table.kot_history || "[]") as any[];
-      if (!Array.isArray(currentHistory)) currentHistory = [];
-    } catch {
-      currentHistory = [];
+      // 6. Update KOT history on table (safe parse — corrupted JSON should not crash the transaction)
+      let currentHistory: any[] = [];
+      try {
+        currentHistory = JSON.parse(table.kot_history || "[]") as any[];
+        if (!Array.isArray(currentHistory)) currentHistory = [];
+      } catch {
+        currentHistory = [];
+      }
+      const kotEntry = buildKotHistoryEntry(kotNumber, resolvedItems.map((i, idx) => ({ ...i, orderItemId: newOrderItemIds[idx] })));
+      currentHistory.push(kotEntry);
+      db.query(`UPDATE "table" SET kot_history = ? WHERE id = ?`).run(JSON.stringify(currentHistory), tableId);
     }
-    const kotEntry = buildKotHistoryEntry(kotNumber, resolvedItems.map((i, idx) => ({ ...i, orderItemId: newOrderItemIds[idx] })));
-    currentHistory.push(kotEntry);
-    db.query(`UPDATE "table" SET kot_history = ? WHERE id = ?`).run(JSON.stringify(currentHistory), tableId);
 
     // 7. Enqueue sync records
     enqueueSync("order", orderId, "update");
     enqueueSync("kot", kotId, "insert");
-    enqueueSync("table", tableId, "update");
+    if (!input.isExtraTable) {
+      enqueueSync("table", tableId, "update");
+    }
     for (const oiId of newOrderItemIds) {
       enqueueSync("order_item", oiId, "insert");
     }
@@ -1273,8 +1297,10 @@ export async function updateOrderItems(
   const printResults = localPrinted ? [] : await Promise.all(dispatchPrintIntents(printIntents, requestId));
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
-  lanBroadcast("order:updated", { orderId, tableId, kotNumber, requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: requestId });
-  lanBroadcast("table:updated", { table: { id: tableId, revision: newTableRev }, tableId, requestId, tableRevision: newTableRev, commandId: requestId });
+  lanBroadcast("order:updated", { orderId, tableId, kotNumber, requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: requestId, isExtraTable: !!input.isExtraTable });
+  if (!input.isExtraTable) {
+    lanBroadcast("table:updated", { table: { id: tableId, revision: newTableRev }, tableId, requestId, tableRevision: newTableRev, commandId: requestId });
+  }
 
   // ── Return result ──────────────────────────────────────────────────────────
   const updatedTable = db.query(`
@@ -1320,11 +1346,12 @@ export interface CancelItemInput {
   orderItemId: string;
   cancelQuantity?: number;
   cancelledBy: string;
-  tableNumber?: string | number;
+  tableNumber?: string;
   requestId?: string;
   localPrinted?: boolean;
   deviceId?: string;
   expectedRevision?: number;
+  isExtraTable?: boolean;
 }
 
 export async function cancelKotItem(input: CancelItemInput): Promise<{ success: boolean; error?: string; printResult?: any; revision?: number; tableRevision?: number }> {
@@ -1390,20 +1417,25 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
 
     const allCancelled = remainingItems.cnt === 0;
 
-    // 5. Reduce table current_bill; free the table if everything is cancelled + increment table revision
-    const newTableRev = nextTableRevision(order.table_id);
-    if (allCancelled) {
-      db.query(`UPDATE "table" SET status = 'AVAILABLE', workflow_status = 'Free', current_bill = 0, captain_id = NULL, guests = 0, session_started_at = NULL, kot_history = '[]', discount = NULL, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
-        .run(newTableRev, input.requestId || null, now, order.table_id);
-    } else {
-      db.query(`UPDATE "table" SET current_bill = MAX(0, current_bill - ?), revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
-        .run(cancelAmount, newTableRev, input.requestId || null, now, order.table_id);
+    // 5. Reduce table current_bill; free the table if everything is cancelled (skip for extra tables)
+    let newTableRev: number | undefined;
+    if (!input.isExtraTable) {
+      newTableRev = nextTableRevision(order.table_id);
+      if (allCancelled) {
+        db.query(`UPDATE "table" SET status = 'AVAILABLE', workflow_status = 'Free', current_bill = 0, captain_id = NULL, guests = 0, session_started_at = NULL, kot_history = '[]', discount = NULL, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+          .run(newTableRev, input.requestId || null, now, order.table_id);
+      } else {
+        db.query(`UPDATE "table" SET current_bill = MAX(0, current_bill - ?), revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+          .run(cancelAmount, newTableRev, input.requestId || null, now, order.table_id);
+      }
     }
 
     // 6. Enqueue sync records
     enqueueSync("order_item", orderItemId, "update");
     enqueueSync("order", orderId, "update");
-    enqueueSync("table", order.table_id, "update");
+    if (!input.isExtraTable) {
+      enqueueSync("table", order.table_id, "update");
+    }
     for (const kotItemId of cancelledKotItemIds) {
       enqueueSync("kot_item", kotItemId, "update");
     }
@@ -1436,11 +1468,15 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
   }
 
   // ── Broadcast to LAN clients ──────────────────────────────────────────────
-  lanBroadcast("order:updated", { orderId, tableId: order.table_id, requestId: input.requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: input.requestId });
-  lanBroadcast("table:updated", { table: { id: order.table_id, revision: newTableRev }, tableId: order.table_id, requestId: input.requestId, tableRevision: newTableRev, commandId: input.requestId });
+  lanBroadcast("order:updated", { orderId, tableId: order.table_id, requestId: input.requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: input.requestId, isExtraTable: !!input.isExtraTable });
+  if (!input.isExtraTable) {
+    lanBroadcast("table:updated", { table: { id: order.table_id, revision: newTableRev }, tableId: order.table_id, requestId: input.requestId, tableRevision: newTableRev, commandId: input.requestId });
+  }
 
   // Build cancel KOT
-  const formattedTableNumber = formatTableNumber(table);
+  const formattedTableNumber = input.isExtraTable && input.tableNumber
+    ? String(input.tableNumber)
+    : formatTableNumber(table);
   const cancelItem = {
     name: orderItem.name,
     quantity: qtyToCancel,
@@ -1675,18 +1711,22 @@ export async function requestBillingEdge(
 
   const now = Date.now();
   let newOrderRev = order.revision ?? 1;
-  let newTableRev = 1;
+  let newTableRev: number | undefined;
   const tx = db.transaction(() => {
     newOrderRev = nextOrderRevision(orderId);
     db.query("UPDATE order_record SET billing_requested = 1, billing_requested_at = ?, updated_at = ?, status = 'BILLING_REQUESTED', revision = ?, last_command_id = ? WHERE id = ?")
       .run(now, now, newOrderRev, meta?.requestId || null, orderId);
 
-    newTableRev = nextTableRevision(order.table_id);
-    db.query(`UPDATE "table" SET workflow_status = 'Waiting Bill', revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
-      .run(newTableRev, meta?.requestId || null, now, order.table_id);
+    if (!meta?.isExtraTable) {
+      newTableRev = nextTableRevision(order.table_id);
+      db.query(`UPDATE "table" SET workflow_status = 'Waiting Bill', revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+        .run(newTableRev, meta?.requestId || null, now, order.table_id);
+    }
 
     enqueueSync("order", orderId, "update");
-    enqueueSync("table", order.table_id, "update");
+    if (!meta?.isExtraTable) {
+      enqueueSync("table", order.table_id, "update");
+    }
 
     return { newOrderRev, newTableRev };
   });
@@ -1702,8 +1742,10 @@ export async function requestBillingEdge(
   }
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
-  lanBroadcast("order:updated", { orderId, status: "BILLING_REQUESTED", requestId: meta?.requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: meta?.requestId });
-  lanBroadcast("table:updated", { table: { id: order.table_id, workflowStatus: "Waiting Bill", revision: newTableRev }, tableId: order.table_id, requestId: meta?.requestId, tableRevision: newTableRev, commandId: meta?.requestId });
+  lanBroadcast("order:updated", { orderId, status: "BILLING_REQUESTED", requestId: meta?.requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: meta?.requestId, isExtraTable: !!meta?.isExtraTable });
+  if (!meta?.isExtraTable) {
+    lanBroadcast("table:updated", { table: { id: order.table_id, workflowStatus: "Waiting Bill", revision: newTableRev }, tableId: order.table_id, requestId: meta?.requestId, tableRevision: newTableRev, commandId: meta?.requestId });
+  }
 
   const result = { success: true, order: { id: orderId, status: "BILLING_REQUESTED" }, revision: newOrderRev, tableRevision: newTableRev };
   recordCommandResult(restaurantId, meta, "requestBilling", "order", orderId, "applied", result, newOrderRev);
@@ -1715,7 +1757,7 @@ export async function requestBillingEdge(
 export interface PrintBillInput {
   orderId: string;
   restaurantId: string;
-  tableNumber?: number;
+  tableNumber?: string;
   discountPercent?: number;
   kotNumbers?: string;
   localPrinted?: boolean;
@@ -1787,7 +1829,9 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
        AND (oi.removed_from_bill IS NULL OR oi.removed_from_bill = 0)`
   ).all(orderId) as any[];
 
-  const formattedTableNumber = formatTableNumber(table);
+  const formattedTableNumber = input.tableNumber
+    ? String(input.tableNumber)
+    : formatTableNumber(table);
   const sectionTag = table.section_tag;
   const serviceChargePercent = outlet.service_charge_percent || 0;
 
@@ -1995,10 +2039,13 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
     db.query("UPDATE order_record SET status = 'SETTLED', paid_at = ?, updated_at = ?, last_request_id = ?, revision = ?, last_command_id = ? WHERE id = ?")
       .run(now, now, requestId || null, newOrderRev, requestId || null, orderId);
 
-    // Free the table + increment table revision
-    const newTableRev = nextTableRevision(order.table_id);
-    db.query(`UPDATE "table" SET status = 'AVAILABLE', workflow_status = 'Free', captain_id = NULL, guests = 0, session_started_at = NULL, current_bill = 0, kot_history = '[]', discount = NULL, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
-      .run(newTableRev, requestId || null, now, order.table_id);
+    // Free the table + increment table revision (skip for extra tables)
+    let newTableRev: number | undefined;
+    if (!input.isExtraTable) {
+      newTableRev = nextTableRevision(order.table_id);
+      db.query(`UPDATE "table" SET status = 'AVAILABLE', workflow_status = 'Free', captain_id = NULL, guests = 0, session_started_at = NULL, current_bill = 0, kot_history = '[]', discount = NULL, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+        .run(newTableRev, requestId || null, now, order.table_id);
+    }
 
     // Store payment details for sync worker to create cloud transaction.
     // Always store — even if paymentMethod is missing, default to CASH.
@@ -2031,7 +2078,9 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
     // Enqueue sync — always enqueue a transaction record so the cloud
     // receives the settlement payment and creates a cloud Transaction.
     enqueueSync("order", orderId, "update");
-    enqueueSync("table", order.table_id, "update");
+    if (!input.isExtraTable) {
+      enqueueSync("table", order.table_id, "update");
+    }
     enqueueSync("transaction", localTxnId, "insert");
 
     return { newOrderRev, newTableRev };
@@ -2057,8 +2106,10 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
   const updatedTable = db.query(`SELECT t.*, s.name as section_name FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?`).get(order.table_id) as any;
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
-  lanBroadcast("order:settled", { orderId, tableId: order.table_id, requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: requestId });
-  lanBroadcast("table:updated", { table: { id: order.table_id, status: "AVAILABLE", workflowStatus: "Free", revision: newTableRev }, tableId: order.table_id, requestId, tableRevision: newTableRev, commandId: requestId });
+  lanBroadcast("order:settled", { orderId, tableId: order.table_id, requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: requestId, isExtraTable: !!input.isExtraTable });
+  if (!input.isExtraTable) {
+    lanBroadcast("table:updated", { table: { id: order.table_id, status: "AVAILABLE", workflowStatus: "Free", revision: newTableRev }, tableId: order.table_id, requestId, tableRevision: newTableRev, commandId: requestId });
+  }
 
   // Fetch order items so the transaction object has complete data for the
   // cashier UI (items list, itemCount) — matches listTransactionsEdge output.
@@ -2130,10 +2181,18 @@ export async function swapTableEdge(
     return rejectResult;
   }
 
-  // Find active order on source table — use the full active status list
-  const activeOrder = db.query(
+  // Find active orders on source table — use the full active status list
+  const activeOrders = db.query(
     `SELECT * FROM order_record WHERE table_id = ? AND restaurant_id = ? AND status IN (${ACTIVE_ORDER_STATUSES.map(() => "?").join(",")}) AND is_deleted = 0`
-  ).get(sourceTableId, restaurantId, ...ACTIVE_ORDER_STATUSES) as any;
+  ).all(sourceTableId, restaurantId, ...ACTIVE_ORDER_STATUSES) as any[];
+
+  if (activeOrders.length > 1) {
+    const rejectResult = { success: false, error: "Cannot swap table with multiple active orders (extra tables)" };
+    recordCommandResult(restaurantId, meta, "swapTable", "table", sourceTableId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
+  }
+
+  const activeOrder = activeOrders[0];
 
   const now = Date.now();
   let newSourceTableRev = 1, newTargetTableRev = 1, newOrderRev: number | undefined;
@@ -2214,18 +2273,30 @@ export async function transferItemsEdge(
   }
 
   // Find active orders on both tables — use the full active status list
-  const sourceOrder = db.query(
+  const sourceOrders = db.query(
     `SELECT * FROM order_record WHERE table_id = ? AND restaurant_id = ? AND status IN (${ACTIVE_ORDER_STATUSES.map(() => "?").join(",")}) AND is_deleted = 0`
-  ).get(sourceTableId, restaurantId, ...ACTIVE_ORDER_STATUSES) as any;
-  if (!sourceOrder) {
+  ).all(sourceTableId, restaurantId, ...ACTIVE_ORDER_STATUSES) as any[];
+  if (sourceOrders.length === 0) {
     const rejectResult = { success: false, error: "No active order on source table" };
     recordCommandResult(restaurantId, meta, "transferItems", "table", sourceTableId, "rejected", rejectResult, null, rejectResult.error);
     return rejectResult;
   }
+  if (sourceOrders.length > 1) {
+    const rejectResult = { success: false, error: "Cannot transfer from table with multiple active orders (extra tables)" };
+    recordCommandResult(restaurantId, meta, "transferItems", "table", sourceTableId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
+  }
+  const sourceOrder = sourceOrders[0];
 
-  let targetOrder = db.query(
+  let targetOrder: any = db.query(
     `SELECT * FROM order_record WHERE table_id = ? AND restaurant_id = ? AND status IN (${ACTIVE_ORDER_STATUSES.map(() => "?").join(",")}) AND is_deleted = 0`
-  ).get(targetTableId, restaurantId, ...ACTIVE_ORDER_STATUSES) as any;
+  ).all(targetTableId, restaurantId, ...ACTIVE_ORDER_STATUSES) as any[];
+  if (targetOrder.length > 1) {
+    const rejectResult = { success: false, error: "Cannot transfer to table with multiple active orders (extra tables)" };
+    recordCommandResult(restaurantId, meta, "transferItems", "table", sourceTableId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
+  }
+  targetOrder = targetOrder[0];
 
   const now = Date.now();
   let newSourceOrderRev = 1, newTargetOrderRev = 1, newSourceTableRev = 1, newTargetTableRev = 1;
@@ -2426,23 +2497,25 @@ export async function editBillEdge(
         enqueueSync("order_item", newItemId, "insert");
       }
 
-      // Bug 3: Update KOT history on table
-      const tableRow = db.query(`SELECT kot_history FROM "table" WHERE id = ?`).get(order.table_id) as any;
-      let currentHistory: any[] = [];
-      try {
-        currentHistory = JSON.parse(tableRow?.kot_history || "[]") as any[];
-        if (!Array.isArray(currentHistory)) currentHistory = [];
-      } catch { currentHistory = []; }
-      const kotEntry = buildKotHistoryEntry(addedKotNumber, resolvedAddedItems.map((i, idx) => ({ ...i, orderItemId: addedOrderItemIds[idx] })));
-      currentHistory.push(kotEntry);
-      db.query(`UPDATE "table" SET kot_history = ? WHERE id = ?`).run(JSON.stringify(currentHistory), order.table_id);
+      // Bug 3: Update KOT history on table (skip for extra tables)
+      if (!meta?.isExtraTable) {
+        const tableRow = db.query(`SELECT kot_history FROM "table" WHERE id = ?`).get(order.table_id) as any;
+        let currentHistory: any[] = [];
+        try {
+          currentHistory = JSON.parse(tableRow?.kot_history || "[]") as any[];
+          if (!Array.isArray(currentHistory)) currentHistory = [];
+        } catch { currentHistory = []; }
+        const kotEntry = buildKotHistoryEntry(addedKotNumber, resolvedAddedItems.map((i, idx) => ({ ...i, orderItemId: addedOrderItemIds[idx] })));
+        currentHistory.push(kotEntry);
+        db.query(`UPDATE "table" SET kot_history = ? WHERE id = ?`).run(JSON.stringify(currentHistory), order.table_id);
+      }
 
       enqueueSync("kot", addedKotId, "insert");
     }
 
-    // Sync table current_bill with the net bill delta + increment table revision
+    // Sync table current_bill with the net bill delta + increment table revision (skip for extra tables)
     let newTableRev: number | undefined;
-    if (billDelta !== 0) {
+    if (billDelta !== 0 && !meta?.isExtraTable) {
       newTableRev = nextTableRevision(order.table_id);
       db.query(`UPDATE "table" SET current_bill = MAX(0, current_bill + ?), revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
         .run(billDelta, newTableRev, meta?.requestId || null, now, order.table_id);
@@ -2493,7 +2566,9 @@ export async function editBillEdge(
         } as EdgeKotItem;
       });
 
-      const formattedTableNumber = formatTableNumber(table);
+      const formattedTableNumber = meta?.isExtraTable && meta?.tableNumber
+        ? meta.tableNumber
+        : formatTableNumber(table);
       const kotOrderData: OrderData = {
         tableNumber: formattedTableNumber,
         orderId,
@@ -2521,8 +2596,10 @@ export async function editBillEdge(
   }
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
-  lanBroadcast("order:updated", { orderId, tableId: order.table_id, addedItems: resolvedAddedItems.length, requestId: meta?.requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: meta?.requestId });
-  lanBroadcast("table:updated", { table: { id: order.table_id, revision: newTableRev }, tableId: order.table_id, requestId: meta?.requestId, tableRevision: newTableRev, commandId: meta?.requestId });
+  lanBroadcast("order:updated", { orderId, tableId: order.table_id, addedItems: resolvedAddedItems.length, requestId: meta?.requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: meta?.requestId, isExtraTable: !!meta?.isExtraTable });
+  if (!meta?.isExtraTable) {
+    lanBroadcast("table:updated", { table: { id: order.table_id, revision: newTableRev }, tableId: order.table_id, requestId: meta?.requestId, tableRevision: newTableRev, commandId: meta?.requestId });
+  }
 
   const updatedOrder = db.query("SELECT * FROM order_record WHERE id = ?").get(orderId) as any;
   const result = { success: true, order: updatedOrder, printResults, revision: newOrderRev, tableRevision: newTableRev };

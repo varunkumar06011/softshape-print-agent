@@ -457,6 +457,7 @@ function initSchema(database: Database) {
       cloud_synced        INTEGER DEFAULT 0,  -- 0 = not yet pushed to cloud, 1 = synced
       revision            INTEGER NOT NULL DEFAULT 1,  -- monotonic per-order aggregate revision
       last_command_id     TEXT,                       -- most recent command_log request_id applied
+      is_extra_table      INTEGER DEFAULT 0,           -- 0 = parent/main table order, 1 = extra table order
       UNIQUE(last_request_id)  -- idempotency: one order per requestId
     );
     CREATE INDEX IF NOT EXISTS idx_order_restaurant_status ON order_record(restaurant_id, status);
@@ -692,6 +693,11 @@ function runMigrations(database: Database) {
   // would throw "no such column" and crash createOrder/updateOrderItems.
   if (!hasColumn("venue", "kot_enabled")) {
     database.exec(`ALTER TABLE venue ADD COLUMN kot_enabled INTEGER DEFAULT 1`);
+  }
+
+  // order_record.is_extra_table — added for extra table isolation
+  if (!hasColumn("order_record", "is_extra_table")) {
+    database.exec(`ALTER TABLE order_record ADD COLUMN is_extra_table INTEGER DEFAULT 0`);
   }
 
   // print_job: add durable queue columns for existing DBs

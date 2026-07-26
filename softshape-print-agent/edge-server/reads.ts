@@ -118,6 +118,7 @@ export function getActiveOrders(statusFilter?: string): any[] {
       platform: order.platform,
       revision: order.revision ?? 1,
       lastCommandId: order.last_command_id ?? null,
+      isExtraTable: !!order.is_extra_table,
       createdAt: new Date(order.created_at).toISOString(),
       updatedAt: new Date(order.updated_at).toISOString(),
       items: items.map((i) => ({
@@ -246,16 +247,15 @@ export function getTablesFlat(): any[] {
 function mapTableRow(t: any): any {
   const db = getDb();
 
-  // Get active orders for this table
+  // Get ALL active orders for this table (parent first: is_extra_table=0 first)
   const activeOrders = db.query(`
     SELECT o.* FROM order_record o
     WHERE o.table_id = ? AND o.status IN (${ACTIVE_ORDER_STATUSES.map(() => "?").join(",")}) AND o.is_deleted = 0
-    ORDER BY o.updated_at DESC LIMIT 1
+    ORDER BY o.is_extra_table ASC, o.updated_at DESC
   `).all(t.id, ...ACTIVE_ORDER_STATUSES) as any[];
 
   let orders: any[] = [];
-  if (activeOrders.length > 0) {
-    const order = activeOrders[0];
+  for (const order of activeOrders) {
     const items = db.query(`
       SELECT oi.*, m.gst_enabled, m.menu_type as mi_menu_type
       FROM order_item oi
@@ -264,7 +264,7 @@ function mapTableRow(t: any): any {
       ORDER BY oi.id ASC
     `).all(order.id) as any[];
 
-    orders = [{
+    orders.push({
       id: order.id,
       tableId: order.table_id,
       restaurantId: order.restaurant_id,
@@ -274,6 +274,7 @@ function mapTableRow(t: any): any {
       platform: order.platform,
       revision: order.revision ?? 1,
       lastCommandId: order.last_command_id ?? null,
+      isExtraTable: !!order.is_extra_table,
       createdAt: new Date(order.created_at).toISOString(),
       updatedAt: new Date(order.updated_at).toISOString(),
       items: items.map((i) => ({
@@ -292,17 +293,19 @@ function mapTableRow(t: any): any {
           menuType: i.mi_menu_type || i.menu_type,
         },
       })),
-    }];
+    });
   }
 
-  // Get KOTs for this table
+  // Get KOTs for this table — filter to parent table orders only (is_extra_table = 0)
+  // Layer 14.1: join order_record to scope KOTs by is_extra_table
   const kots = db.query(`
     SELECT k.*, ki.id as ki_id, ki.order_item_id, ki.menu_item_id as ki_menu_item_id,
            ki.name as ki_name, ki.quantity as ki_quantity, ki.price as ki_price,
            ki.notes as ki_notes, ki.status as ki_status
     FROM kot k
     LEFT JOIN kot_item ki ON k.id = ki.kot_id
-    WHERE k.table_id = ?
+    LEFT JOIN order_record o ON k.order_id = o.id
+    WHERE k.table_id = ? AND (o.is_extra_table = 0 OR o.is_extra_table IS NULL)
     ORDER BY k.created_at ASC, ki.id ASC
   `).all(t.id) as any[];
 
@@ -339,7 +342,7 @@ function mapTableRow(t: any): any {
     id: t.id,
     number: t.number,
     capacity: t.capacity,
-    status: t.status,
+    status: orders.length > 0 ? "OCCUPIED" : t.status,
     sectionId: t.section_id,
     restaurantId: t.restaurant_id,
     workflowStatus: t.workflow_status,
