@@ -9,8 +9,10 @@ import type { OutputIntent } from "@softshape/output";
 
 const mockCreatePrintJob = mock(() => 1);
 const mockDispatchSinglePrintJob = mock(() => Promise.resolve());
+const mockAwaitDispatchBounded = mock(() => Promise.resolve({ ok: true, printerName: "KitchenPrinter", bytes: 0, method: "print_service", eventId: "test" }));
 const mockEmitEvent = mock(() => {});
 const mockResolvePrinterName = mock(() => "KitchenPrinter");
+const mockGetPrintJobByEventId = mock(() => ({ status: "printed", last_error: null, acked_via: "local" }));
 const mockGetDb = mock(() => ({
   query: mock(() => ({ get: mock(() => ({ printer_config: "{}" })) })),
 }));
@@ -18,10 +20,12 @@ const mockGetDb = mock(() => ({
 mock.module("../db.ts", () => ({
   getDb: mockGetDb,
   createPrintJob: mockCreatePrintJob,
+  getPrintJobByEventId: mockGetPrintJobByEventId,
 }));
 
 mock.module("../orderService.ts", () => ({
   dispatchSinglePrintJob: mockDispatchSinglePrintJob,
+  awaitDispatchBounded: mockAwaitDispatchBounded,
 }));
 
 mock.module("../eventBus.ts", () => ({
@@ -48,10 +52,14 @@ mock.module("../auth.ts", () => ({
 beforeEach(() => {
   mockCreatePrintJob.mockClear();
   mockDispatchSinglePrintJob.mockClear();
+  mockAwaitDispatchBounded.mockClear();
   mockEmitEvent.mockClear();
   mockResolvePrinterName.mockClear();
+  mockGetPrintJobByEventId.mockClear();
   mockResolvePrinterName.mockImplementation(() => "KitchenPrinter");
   mockCreatePrintJob.mockImplementation(() => 42);
+  mockAwaitDispatchBounded.mockImplementation(() => Promise.resolve({ ok: true, printerName: "KitchenPrinter", bytes: 0, method: "print_service", eventId: "test" }));
+  mockGetPrintJobByEventId.mockImplementation(() => ({ status: "printed", last_error: null, acked_via: "local" }));
 });
 
 test("processOutputIntent renders and queues a PRINT_KOT job", async () => {
@@ -81,7 +89,7 @@ test("processOutputIntent renders and queues a PRINT_KOT job", async () => {
   expect(result.jobs[0].ok).toBe(true);
   expect(result.jobs[0].jobId).toBe(42);
   expect(mockCreatePrintJob).toHaveBeenCalledTimes(1);
-  expect(mockDispatchSinglePrintJob).toHaveBeenCalledTimes(1);
+  expect(mockAwaitDispatchBounded).toHaveBeenCalledTimes(1);
   expect(mockEmitEvent).toHaveBeenCalledTimes(1);
 });
 
@@ -109,7 +117,7 @@ test("processOutputIntent returns empty results when items array is empty", asyn
   // Planner returns 0 jobs for empty items array
   expect(result.jobs).toHaveLength(0);
   expect(mockCreatePrintJob).not.toHaveBeenCalled();
-  expect(mockDispatchSinglePrintJob).not.toHaveBeenCalled();
+  expect(mockAwaitDispatchBounded).not.toHaveBeenCalled();
 });
 
 test("processOutputIntent handles PRINT_LIQUOR_KOT intent", async () => {
@@ -139,7 +147,7 @@ test("processOutputIntent handles PRINT_LIQUOR_KOT intent", async () => {
   expect(result.jobs).toHaveLength(1);
   expect(result.jobs[0].ok).toBe(true);
   expect(mockCreatePrintJob).toHaveBeenCalledTimes(1);
-  expect(mockDispatchSinglePrintJob).toHaveBeenCalledTimes(1);
+  expect(mockAwaitDispatchBounded).toHaveBeenCalledTimes(1);
 });
 
 test("processOutputIntent produces multiple jobs for mixed food+liquor KOT (R3)", async () => {
@@ -178,6 +186,6 @@ test("processOutputIntent produces multiple jobs for mixed food+liquor KOT (R3)"
   expect(result.jobs.length).toBeGreaterThanOrEqual(2);
   expect(result.jobs.every(j => j.ok)).toBe(true);
   expect(mockCreatePrintJob).toHaveBeenCalledTimes(result.jobs.length);
-  expect(mockDispatchSinglePrintJob).toHaveBeenCalledTimes(result.jobs.length);
+  expect(mockAwaitDispatchBounded).toHaveBeenCalledTimes(result.jobs.length);
   expect(mockEmitEvent).toHaveBeenCalledTimes(result.jobs.length);
 });

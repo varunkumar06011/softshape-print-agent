@@ -13,7 +13,7 @@ import type { OutputIntent, OutputJob } from "@softshape/output";
 import { render } from "@softshape/output";
 import { planOutputIntent } from "./outputPlanner.ts";
 import { createPrintJob } from "./db.ts";
-import { dispatchSinglePrintJob } from "./orderService.ts";
+import { awaitDispatchBounded } from "./orderService.ts";
 import { emitEvent } from "./eventBus.ts";
 import { EVENT_NAMES } from "./contract/events.ts";
 
@@ -21,10 +21,10 @@ export async function processOutputIntent(
   intent: OutputIntent,
   restaurantId: string,
   orderId?: string,
-): Promise<{ jobs: { jobId: number | null; ok: boolean; error?: string }[] }> {
+): Promise<{ jobs: { jobId: number | null; ok: boolean | null; error?: string; pending?: boolean }[] }> {
   const jobs = planOutputIntent(intent, restaurantId);
 
-  const results: { jobId: number | null; ok: boolean; error?: string }[] = [];
+  const results: { jobId: number | null; ok: boolean | null; error?: string; pending?: boolean }[] = [];
 
   for (const job of jobs) {
     const rendered = render(job.intent, job.payload);
@@ -49,19 +49,30 @@ export async function processOutputIntent(
     });
 
     if (jobId) {
-      dispatchSinglePrintJob(eventId, {
-        printerName: job.destination.printerName,
-        escposData: rendered.blocks,
-        type: job.intent,
-      }, job.payload.requestId as string | undefined);
+      let result: any;
+      try {
+        result = await awaitDispatchBounded(eventId, {
+          printerName: job.destination.printerName,
+          escposData: rendered.blocks,
+          type: job.intent,
+        }, job.payload.requestId as string | undefined);
+      } catch (err: any) {
+        result = { ok: false, error: err?.message || "Dispatch crashed", pending: false };
+      }
+
+      emitEvent({
+        event: EVENT_NAMES.PRINT_COMPLETED,
+        data: { jobId: jobId || 0, printerName: job.destination.printerName || "unknown", ok: result.ok } as any,
+      });
+
+      results.push({ jobId, ok: result.ok ?? false, error: result.error, pending: result.pending });
+    } else {
+      emitEvent({
+        event: EVENT_NAMES.PRINT_COMPLETED,
+        data: { jobId: 0, printerName: job.destination.printerName || "unknown", ok: false } as any,
+      });
+      results.push({ jobId: null, ok: false, error: "Failed to create print job" });
     }
-
-    emitEvent({
-      event: EVENT_NAMES.PRINT_COMPLETED,
-      data: { jobId: jobId || 0, printerName: job.destination.printerName || "unknown", ok: Boolean(job.destination.printerName) } as any,
-    });
-
-    results.push({ jobId, ok: !!job.destination.printerName, error: job.destination.printerName ? undefined : "No printer resolved" });
   }
 
   return { jobs: results };

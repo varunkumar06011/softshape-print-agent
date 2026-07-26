@@ -67,13 +67,22 @@ function resolvePrintServiceExe(): string | null {
 export function startPrintService(): boolean {
   const exe = resolvePrintServiceExe();
   if (!exe) {
-    runtimeLog.warn("Print service executable not found — printing will use fallback", {
-      searchedPaths: [
-        process.env.PRINT_SERVICE_EXE,
-        "../print-service/target/release/print-service.exe",
-        "../print-service/target/debug/print-service.exe",
-        "./print-service.exe",
-      ],
+    const moduleDir = typeof __dirname !== "undefined"
+      ? __dirname
+      : dirname(fileURLToPath(import.meta.url));
+    const candidates: string[] = [];
+    if (process.env.PRINT_SERVICE_EXE) candidates.push(process.env.PRINT_SERVICE_EXE);
+    candidates.push(join(moduleDir, "..", "print-service", "target", "release", "print-service.exe"));
+    candidates.push(join(moduleDir, "..", "print-service", "target", "debug", "print-service.exe"));
+    candidates.push(join(moduleDir, "print-service.exe"));
+    if (process.platform === "win32") {
+      const localAppData = process.env.LOCALAPPDATA || "";
+      if (localAppData) candidates.push(join(localAppData, "Softshape", "bin", "print-service.exe"));
+      candidates.push(join("C:", "Program Files", "Softshape", "print-service.exe"));
+    }
+    runtimeLog.warn("Print service executable not found — printing will not work", {
+      searchedPaths: candidates,
+      edgeServerDir: moduleDir,
     });
     return false;
   }

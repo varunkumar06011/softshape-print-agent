@@ -57,8 +57,8 @@ import { startSocketSync, getSocketStatus, startHeartbeat } from "./socketSync.t
 import { acquireInstanceLock, startHeartbeatLoop, forceReleaseLock, getLockStatus } from "./instanceLock.ts";
 import { cloudFetch } from "./cloudFetch.ts";
 import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount, setClientRegistered, lanBroadcast } from "./lanBroadcast.ts";
-import { printToPrinter } from "./printer.ts";
-import { isPrintServiceReady, getPrintServiceStatus, sendToPrintService, listPrintersViaService } from "./printServiceManager.ts";
+import { printToPrinter, resolvePrinterName } from "./printer.ts";
+import { isPrintServiceReady, getPrintServiceStatus, sendToPrintService, listPrintersViaService, startPrintService, stopPrintService } from "./printServiceManager.ts";
 import { deviceManager } from "./drivers/manager.ts";
 import { PrinterDriver } from "./drivers/printer/index.ts";
 import { PaymentDriver } from "./drivers/payment/index.ts";
@@ -484,6 +484,20 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     runtimeLog.info("Runtime restart requested via API");
     runtimeManager.restart();
     return jsonResponse({ ok: true });
+  }
+
+  // ── POST /api/edge/admin/restart-print-service — Restart just the print service ──
+  if (url.pathname === "/api/edge/admin/restart-print-service" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    runtimeLog.info("Print service restart requested via API");
+    stopPrintService();
+    // Allow OS to release the port and clean up the process before restarting
+    await new Promise(resolve => setTimeout(resolve, 500));
+    const started = startPrintService();
+    if (!started) {
+      return jsonResponse({ ok: false, error: "Print service executable not found — see logs for searched paths" }, 500);
+    }
+    return jsonResponse({ ok: true, status: getPrintServiceStatus() });
   }
 
   // ── POST /runtime/shutdown — Shutdown all Runtime services ──────────────────
@@ -1840,7 +1854,30 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       cancelled: (db.query("SELECT COUNT(*) as c FROM print_job WHERE status = 'cancelled'").get() as any)?.c || 0,
     };
 
-    return jsonResponse({ jobs: rows, summary }, 200, { "Cache-Control": "no-store" });
+    // Diagnostic fields: print service status + printer resolution (RC-5/RC-6 diagnostics)
+    const restaurantId = getRestaurantId();
+    let printerConfig: Record<string, any> = {};
+    let resolvedPrinters: Record<string, string | undefined> = {};
+    if (restaurantId) {
+      const outletRow = db.query("SELECT printer_config FROM outlet WHERE id = ?").get(restaurantId) as { printer_config: string } | undefined;
+      if (outletRow?.printer_config) {
+        try { printerConfig = JSON.parse(outletRow.printer_config); } catch { /* ignore */ }
+        resolvedPrinters = {
+          kitchen: resolvePrinterName(null, "KOT_PRINTER", null, printerConfig),
+          bar: resolvePrinterName(null, "BAR_PRINTER", null, printerConfig),
+          bill: resolvePrinterName(null, "BILL_PRINTER", null, printerConfig),
+        };
+      }
+    }
+
+    return jsonResponse({
+      jobs: rows,
+      summary,
+      printServiceReady: isPrintServiceReady(),
+      printServiceStatus: getPrintServiceStatus(),
+      resolvedPrinters,
+      printerConfig,
+    }, 200, { "Cache-Control": "no-store" });
   }
 
   // ── POST /api/edge/print-jobs/retry — manually trigger pending print dispatch ──
@@ -2655,7 +2692,7 @@ loadPlugins().catch(err => {
 });
 
 // ── Background print dispatch loop ────────────────────────────────────────────
-// Every 5 seconds, pick up print_job rows in 'queued' or 'retrying' status
+// Every 2 seconds, pick up print_job rows in 'queued' or 'retrying' status
 // and re-dispatch them. This handles:
 //   - Jobs created while the print bridge was unreachable (cashier was closed)
 //   - Jobs that failed print (printer offline, paper jam) — retried when fixed
@@ -2671,7 +2708,7 @@ setInterval(async () => {
   } catch (err) {
     console.warn("[PrintDispatch] Background dispatch failed:", err);
   }
-}, 5_000);
+}, 2_000);
 
 // ── Periodic driver health check (Phase 6) ───────────────────────────────────
 // Every 10 seconds, check all drivers for state transitions. Logs transitions

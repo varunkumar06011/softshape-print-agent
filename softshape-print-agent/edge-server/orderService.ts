@@ -247,20 +247,59 @@ function persistPrintIntentsInTx(
   }
 }
 
-// Dispatch print intents after the transaction commits (async, fire-and-forget).
+// Dispatch print intents after the transaction commits.
+// Uses bounded-wait (3s timeout) to return actual print status instead of fire-and-forget.
+export async function awaitDispatchBounded(
+  eventId: string,
+  group: PrintGroup,
+  requestId?: string,
+  timeoutMs = 3000,
+): Promise<any> {
+  let dispatchPromise: Promise<any>;
+  try {
+    dispatchPromise = dispatchSinglePrintJob(eventId, group, requestId);
+  } catch (err: any) {
+    return { ok: false, printerName: group.printerName || "unknown", bytes: 0, error: err?.message || "Dispatch threw synchronously", method: "durable_queued", eventId };
+  }
+  const timeoutPromise = new Promise(resolve => setTimeout(() => resolve("timeout"), timeoutMs));
+  let result: any;
+  try {
+    result = await Promise.race([dispatchPromise, timeoutPromise]);
+  } catch (err: any) {
+    return { ok: false, printerName: group.printerName || "unknown", bytes: 0, error: err?.message || "Dispatch failed", method: "durable_queued", eventId };
+  }
+
+  if (result === "timeout") {
+    // Don't cancel the underlying print — just stop awaiting.
+    // The background loop will handle retry if needed.
+    return { ok: null, printerName: group.printerName, bytes: 0, method: "durable_queued", eventId, pending: true };
+  }
+
+  // Dispatch completed within timeout — check actual status
+  try {
+    const job = getPrintJobByEventId(eventId);
+    if (job?.status === "printed") {
+      return { ok: true, printerName: group.printerName, bytes: 0, method: job.acked_via || "print_service", eventId };
+    } else {
+      return { ok: false, printerName: group.printerName || "unknown", bytes: 0, error: job?.last_error || "Print failed — will retry automatically", method: "durable_queued", eventId };
+    }
+  } catch {
+    return { ok: false, printerName: group.printerName || "unknown", bytes: 0, error: "Failed to read print job status", method: "durable_queued", eventId };
+  }
+}
+
 function dispatchPrintIntents(
   intents: PrintIntent[],
   requestId?: string,
-): any[] {
+): Promise<any>[] {
   return intents.map((intent) => {
     if (intent.skip) {
-      return { ok: false, printerName: intent.group.printerName || "unknown", bytes: 0, error: "No print data", method: "noop" };
+      return Promise.resolve({ ok: false, printerName: intent.group.printerName || "unknown", bytes: 0, error: "No print data", method: "noop" });
     }
     if (intent.alreadyPrintedLocally) {
-      return { ok: true, printerName: intent.group.printerName || "unknown", bytes: 0, method: "skipped_local_print", eventId: intent.eventId };
+      return Promise.resolve({ ok: true, printerName: intent.group.printerName || "unknown", bytes: 0, method: "skipped_local_print", eventId: intent.eventId });
     }
-    dispatchSinglePrintJob(intent.eventId, intent.group, requestId);
-    return { ok: null, printerName: intent.group.printerName, bytes: 0, method: "durable_queued", eventId: intent.eventId };
+    return awaitDispatchBounded(intent.eventId, intent.group, requestId);
   });
 }
 
@@ -302,11 +341,14 @@ export async function dispatchSinglePrintJob(
 
 // ─── Background dispatch loop for pending print jobs ──────────────────────────
 // Called periodically by server.ts. Picks up print_job rows in 'queued' or
-// 'retrying' status and re-dispatches them. Enforces per-printer serialization
-// by processing jobs in id ASC order and only dispatching one job per printer
-// per cycle (the ack from the print service will free the printer for the next).
+// 'retrying' status and re-dispatches them. Dispatches up to MAX_PER_PRINTER
+// jobs per printer per cycle. The Rust print-service has per-printer mutex
+// serialization (PRINTER_LOCKS), so concurrent dispatches to the same printer
+// are queued by the mutex. The cap prevents unbounded thread accumulation if
+// a printer jams (no lock timeout in the Rust service).
 
 let _dispatchRunning = false;
+const MAX_PER_PRINTER = 3;
 
 export async function dispatchPendingPrintJobs(): Promise<{ dispatched: number; remaining: number }> {
   if (_dispatchRunning) return { dispatched: 0, remaining: 0 };
@@ -321,14 +363,15 @@ export async function dispatchPendingPrintJobs(): Promise<{ dispatched: number; 
     const pending = getPendingPrintJobs(50);
     if (pending.length === 0) return { dispatched: 0, remaining: 0 };
 
-    // Group by printer_name and dispatch one per printer per cycle
-    const dispatchedPrinters = new Set<string | null>();
+    // Group by printer_name and dispatch up to MAX_PER_PRINTER per printer per cycle
+    const printerJobCounts = new Map<string, number>();
     let dispatched = 0;
 
     for (const job of pending) {
       const printerKey = job.printer_name || "__auto__";
-      if (dispatchedPrinters.has(printerKey)) continue;
-      dispatchedPrinters.add(printerKey);
+      const count = printerJobCounts.get(printerKey) || 0;
+      if (count >= MAX_PER_PRINTER) continue;
+      printerJobCounts.set(printerKey, count + 1);
 
       let escposData: any[];
       try {
@@ -345,8 +388,12 @@ export async function dispatchPendingPrintJobs(): Promise<{ dispatched: number; 
       };
 
       // Dispatch without blocking — fire and forget per printer
-      dispatchSinglePrintJob(job.event_id, group, undefined);
-      dispatched++;
+      try {
+        dispatchSinglePrintJob(job.event_id, group, undefined);
+        dispatched++;
+      } catch (e: any) {
+        updatePrintJobStatus(job.event_id, "retrying", `Background dispatch threw: ${e?.message || e}`);
+      }
     }
 
     return { dispatched, remaining: pending.length - dispatched };
@@ -877,9 +924,9 @@ export async function createOrder(
     throw err;
   }
 
-  // ── Dispatch print intents (async, fire-and-forget) ───────────────────────
+  // ── Dispatch print intents (bounded-wait — 3s timeout per job) ────────────
   // Print jobs were already persisted inside the transaction above.
-  const printResults = localPrinted ? [] : dispatchPrintIntents(printIntents, requestId);
+  const printResults = localPrinted ? [] : await Promise.all(dispatchPrintIntents(printIntents, requestId));
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
   lanBroadcast("order:created", { order: { id: orderId, tableId, kotNumber, totalAmount, revision: 1 }, tableId, requestId, revision: 1, tableRevision: newTableRev, commandId: requestId });
@@ -1202,9 +1249,9 @@ export async function updateOrderItems(
     throw err;
   }
 
-  // ── Dispatch print intents (async, fire-and-forget) ───────────────────────
+  // ── Dispatch print intents (bounded-wait — 3s timeout per job) ────────────
   // Print jobs were already persisted inside the transaction above.
-  const printResults = localPrinted ? [] : dispatchPrintIntents(printIntents, requestId);
+  const printResults = localPrinted ? [] : await Promise.all(dispatchPrintIntents(printIntents, requestId));
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
   lanBroadcast("order:updated", { orderId, tableId, kotNumber, requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: requestId });
@@ -1749,7 +1796,15 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
     // dispatchSinglePrintJob POSTs to the print bridge (HTTP, up to 10s timeout)
     // or falls back to cloud relay. This ensures the HTTP response reflects the
     // actual print status, not a fire-and-forget "queued" placeholder.
-    await dispatchSinglePrintJob(eventId, billGroup, undefined);
+    try {
+      await dispatchSinglePrintJob(eventId, billGroup, undefined);
+    } catch (e: any) {
+      printResults.push({ ok: false, printerName: billPrinterName || "unknown", bytes: 0, error: e?.message || "Dispatch threw", method: "durable_queued", eventId });
+      // Still return success=true — bill number was assigned, print will retry in background
+      const result = { success: true, billNumber, printResults, revision: newOrderRev };
+      recordCommandResult(restaurantId, input, "printBill", "order", orderId, "applied", result, newOrderRev);
+      return result;
+    }
     const job = getPrintJobByEventId(eventId);
     if (job?.status === "printed") {
       printResults.push({ ok: true, printerName: billPrinterName, bytes: 0, method: job.acked_via || "print_service", eventId });
