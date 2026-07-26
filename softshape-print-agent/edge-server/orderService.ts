@@ -2062,7 +2062,7 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
 
   // Fetch order items so the transaction object has complete data for the
   // cashier UI (items list, itemCount) — matches listTransactionsEdge output.
-  const settleItems = db.query("SELECT name, quantity, price, menu_type FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0 AND (cancelled_quantity IS NULL OR cancelled_quantity < quantity)").all(orderId) as any[];
+  const settleItems = db.query("SELECT name, quantity, cancelled_quantity, price, menu_type FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0 AND (cancelled_quantity IS NULL OR cancelled_quantity < quantity)").all(orderId) as any[];
 
   // Build a local transaction object so the cashier UI can display it
   // immediately without synthesizing its own.
@@ -2088,7 +2088,7 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
     tableNumber: updatedTable.number ?? null,
     sectionTag: updatedTable.section_tag || null,
     itemCount: settleItems.length,
-    items: settleItems.map(i => ({ name: i.name, quantity: i.quantity, price: i.price })),
+    items: settleItems.map(i => ({ name: i.name, quantity: i.quantity - Number(i.cancelled_quantity || 0), price: i.price })),
   };
 
   const result = {
@@ -2812,7 +2812,7 @@ export async function listTransactionsEdge(
     }
 
     // Get items for this order
-    const items = db.query("SELECT name, quantity, price, menu_type FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0 AND (cancelled_quantity IS NULL OR cancelled_quantity < quantity)").all(order.id) as any[];
+    const items = db.query("SELECT name, quantity, cancelled_quantity, price, menu_type FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0 AND (cancelled_quantity IS NULL OR cancelled_quantity < quantity)").all(order.id) as any[];
 
     txns.push({
       id: `edge-txn-${order.id}`,
@@ -2830,7 +2830,7 @@ export async function listTransactionsEdge(
       roundOff: Number(paymentData.roundOff ?? 0),
       tipAmount: Number(paymentData.tipAmount ?? 0),
       itemCount: items.length,
-      items: items.map(i => ({ name: i.name, quantity: i.quantity, price: i.price })),
+      items: items.map(i => ({ name: i.name, quantity: i.quantity - Number(i.cancelled_quantity || 0), price: i.price })),
       captainId: order.captain_id || "CASHIER",
       captainName: "Head Cashier",
       method: paymentData.paymentMethod || "CASH",
