@@ -1957,6 +1957,37 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
     return rejectResult;
   }
 
+  // Guard: if the order is already settled by a different requestId, return success
+  // with alreadySettled flag instead of creating a duplicate transaction. This closes
+  // the gap where a second settlement with a new requestId passes both the command_log
+  // idempotency check and the cloud's ProcessedRequest check (both keyed on requestId).
+  // Returns success:true (not 409) so drainSettlementQueue removes the queued action
+  // and handlePayment doesn't rollback the optimistic UI.
+  if (order.status === 'SETTLED') {
+    let existingTxn: any = null;
+    try {
+      const rows = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%'").all() as any[];
+      for (const row of rows) {
+        const data = JSON.parse(row.value);
+        if (data.orderId === orderId) {
+          existingTxn = {
+            id: data.localTxnId,
+            orderId,
+            restaurantId,
+            paymentMethod: data.paymentMethod || "CASH",
+            billNumber: order.bill_number || null,
+            paidAt: new Date(data.settledAt).toISOString(),
+            grandTotal: data.grandTotal ?? null,
+          };
+          break;
+        }
+      }
+    } catch { /* ignore parse errors */ }
+    const replayResult = { success: true, alreadySettled: true, order, transaction: existingTxn, error: "Order already settled", revision: order.revision ?? 1 };
+    recordCommandResult(restaurantId, input, "settleOrder", "order", orderId, "applied", replayResult, order.revision ?? 1);
+    return replayResult;
+  }
+
   const now = Date.now();
   const tx = db.transaction(() => {
     // Mark order as settled + increment order revision

@@ -11,6 +11,8 @@ import {
   renderLiquorKOT,
   renderBill,
   renderCancelKOT,
+  renderXReport,
+  renderExpenditure,
 } from "@softshape/output";
 import type {
   PrintItem,
@@ -19,6 +21,8 @@ import type {
   BillPrintInput,
   CancelKotItem,
   CancelKotPrintInput,
+  XReportData,
+  ExpenditurePrintData,
   RenderedOutput,
 } from "@softshape/output";
 
@@ -35,6 +39,8 @@ export {
   type BillPrintInput,
   type CancelKotItem,
   type CancelKotPrintInput,
+  type XReportData,
+  type ExpenditurePrintData,
 };
 
 export function buildFoodKOT(orderData: OrderData): RawBlock[] {
@@ -51,4 +57,12 @@ export function buildBill(input: BillPrintInput): RawBlock[] {
 
 export function buildCancelKOT(input: CancelKotPrintInput): RawBlock[] {
   return toBlocks(renderCancelKOT(input));
+}
+
+export function buildXReport(data: XReportData): RawBlock[] {
+  return toBlocks(renderXReport(data));
+}
+
+export function buildExpenditure(data: ExpenditurePrintData): RawBlock[] {
+  return toBlocks(renderExpenditure(data));
 }

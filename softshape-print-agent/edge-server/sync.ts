@@ -319,6 +319,25 @@ function loadRecordData(tableName: string, recordId: string): any | null {
       }
     }
 
+    case "expenditure": {
+      const row = db.query("SELECT * FROM expenditure WHERE id = ?").get(recordId) as any;
+      if (!row) return null;
+      return {
+        id: row.id,
+        restaurantId: row.restaurant_id,
+        amount: row.amount,
+        paidToType: row.paid_to_type,
+        paidToName: row.paid_to_name,
+        category: row.category,
+        narration: row.narration,
+        approver: row.approver,
+        createdBy: row.created_by,
+        expenditureNo: row.expenditure_no,
+        date: row.date,
+        voided: !!row.voided,
+      };
+    }
+
     default:
       return null;
   }

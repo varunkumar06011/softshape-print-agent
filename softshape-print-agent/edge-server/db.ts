@@ -651,6 +651,26 @@ function initSchema(database: Database) {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_command_log_dedup ON command_log(restaurant_id, request_id, command_type);
     CREATE INDEX IF NOT EXISTS idx_command_log_entity ON command_log(entity_type, entity_id, applied_at);
     CREATE INDEX IF NOT EXISTS idx_command_log_status ON command_log(status) WHERE status IN ('rejected','failed');
+
+    -- Expenditures (cash payments for staff/maintenance/other)
+    CREATE TABLE IF NOT EXISTS expenditure (
+      id              TEXT PRIMARY KEY,
+      restaurant_id   TEXT NOT NULL,
+      amount          REAL NOT NULL,
+      paid_to_type    TEXT,
+      paid_to_name    TEXT,
+      category        TEXT,
+      narration       TEXT,
+      approver        TEXT,
+      created_by      TEXT,
+      expenditure_no  INTEGER,
+      date            TEXT NOT NULL,
+      created_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+      voided          INTEGER DEFAULT 0,
+      cloud_synced    INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_expenditure_date ON expenditure(date);
+    CREATE INDEX IF NOT EXISTS idx_expenditure_synced ON expenditure(cloud_synced) WHERE cloud_synced = 0;
   `);
 }
 

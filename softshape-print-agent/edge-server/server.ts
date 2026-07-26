@@ -46,7 +46,7 @@
 //   WS   /events                — Runtime event bus (§3)
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enqueueSync, getRecoveryStatus, updatePrintJobStatus, getPendingPrintJobs, getOrderSyncStatus, getPrintJobByEventId, cancelPrintJob, reprintPrintJob, getPrintJobsByOrder, insertSyncAudit, getSyncAuditRecords, createPrintJob, claimPrintJob } from "./db.ts";
+import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enqueueSync, getRecoveryStatus, updatePrintJobStatus, getPendingPrintJobs, getOrderSyncStatus, getPrintJobByEventId, cancelPrintJob, reprintPrintJob, getPrintJobsByOrder, insertSyncAudit, getSyncAuditRecords, createPrintJob, claimPrintJob, getKolkataDateString } from "./db.ts";
 import os from "os";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getSessionToken, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { pullIncrementalChanges } from "./config.ts";
@@ -58,6 +58,7 @@ import { acquireInstanceLock, startHeartbeatLoop, forceReleaseLock, getLockStatu
 import { cloudFetch } from "./cloudFetch.ts";
 import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount, setClientRegistered, lanBroadcast } from "./lanBroadcast.ts";
 import { printToPrinter, resolvePrinterName } from "./printer.ts";
+import { buildXReport, buildExpenditure } from "./escpos.ts";
 import { isPrintServiceReady, getPrintServiceStatus, getPrintServiceExeDiagnostics, sendToPrintService, listPrintersViaService, startPrintService, stopPrintService } from "./printServiceManager.ts";
 import { deviceManager } from "./drivers/manager.ts";
 import { PrinterDriver } from "./drivers/printer/index.ts";
@@ -74,6 +75,14 @@ import { hashSync, compareSync } from "bcryptjs";
 import { runtimeManager } from "./runtimeManager.ts";
 
 const PORT = parseInt(process.env.EDGE_PORT || "3101", 10);
+
+// Rate limiting for /health endpoint — 1 request per 5s per IP
+const _healthRateLimit = new Map<string, number>();
+// Cache for print_job summary on /health — refreshed every 5s
+let _printJobSummaryCache: any = null;
+let _printJobSummaryCacheAt = 0;
+// Cache for full /health response — used to serve rate-limited callers
+let _healthCache: any = null;
 
 // ── Edge role verification (S4 offline) ──────────────────────────────────────
 // Verifies that the caller's userId + pin match a local user with an allowed role.
@@ -372,10 +381,25 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   }
 
   // ── GET /health ─────────────────────────────────────────────────────────────
+  // Rate-limited to 1 request per 5s per IP to reduce SQLite contention from
+  // multiple captain/cashier devices polling simultaneously.
+  // Returns 200 with cached data on rate-limited calls so callers like
+  // waitForEdgeReady (which polls every 1s during startup) don't break.
   if (url.pathname === "/health" && req.method === "GET") {
+    const clientIp = (req.headers.get("x-forwarded-for") || req.headers.get("x-real-ip") || "unknown").split(",")[0].trim();
+    const now = Date.now();
+    const lastHit = _healthRateLimit.get(clientIp) || 0;
+    if (now - lastHit < 5000) {
+      // Return cached health snapshot instead of 429 — the full query runs
+      // at most once per 5s, but callers still get a valid response.
+      const cached = _healthCache || { status: "ok", isOperational: false };
+      return jsonResponse({ ...cached, rateLimited: true, retryAfterMs: 5000 - (now - lastHit) }, 200, { "Cache-Control": "no-store" });
+    }
+    _healthRateLimit.set(clientIp, now);
+
     const rmHealth = runtimeManager.getHealth();
     if (!rmHealth.isOperational) {
-      return jsonResponse({
+      const healthResp = {
         status: rmHealth.status,
         service: "softshape-edge-server",
         version: "23.4.2",
@@ -385,7 +409,9 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         connectionState: rmHealth.connectionState,
         isOperational: false,
         error: rmHealth.startupError,
-      });
+      };
+      _healthCache = healthResp;
+      return jsonResponse(healthResp);
     }
     const session = loadSession();
     const recovery = getRecoveryStatus();
@@ -412,22 +438,29 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
 
     let printMetrics: any = null;
     try {
-      const db = getDb();
-      const summary = db.query(`
-        SELECT
-          SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) as queued,
-          SUM(CASE WHEN status = 'printing' THEN 1 ELSE 0 END) as printing,
-          SUM(CASE WHEN status = 'printed' THEN 1 ELSE 0 END) as printed,
-          SUM(CASE WHEN status = 'retrying' THEN 1 ELSE 0 END) as retrying,
-          SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
-          SUM(CASE WHEN status = 'dead_letter' THEN 1 ELSE 0 END) as dead_letter,
-          SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelled
-        FROM print_job
-      `).get() as any;
-      printMetrics = summary;
+      const now2 = Date.now();
+      if (_printJobSummaryCache && (now2 - _printJobSummaryCacheAt) < 5000) {
+        printMetrics = _printJobSummaryCache;
+      } else {
+        const db = getDb();
+        const summary = db.query(`
+          SELECT
+            SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) as queued,
+            SUM(CASE WHEN status = 'printing' THEN 1 ELSE 0 END) as printing,
+            SUM(CASE WHEN status = 'printed' THEN 1 ELSE 0 END) as printed,
+            SUM(CASE WHEN status = 'retrying' THEN 1 ELSE 0 END) as retrying,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+            SUM(CASE WHEN status = 'dead_letter' THEN 1 ELSE 0 END) as dead_letter,
+            SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelled
+          FROM print_job
+        `).get() as any;
+        _printJobSummaryCache = summary;
+        _printJobSummaryCacheAt = now2;
+        printMetrics = summary;
+      }
     } catch { /* ignore */ }
 
-    return jsonResponse({
+    const healthResp = {
       status: "ok",
       service: "softshape-edge-server",
       version: "23.4.2",
@@ -456,7 +489,9 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       printQueue: printMetrics,
       printService: getPrintServiceStatus(),
       drivers: deviceManager.getDeviceHealths(),
-    });
+    };
+    _healthCache = healthResp;
+    return jsonResponse(healthResp);
   }
 
   // ── GET /runtime/status — Runtime status (§1.1) ─────────────────────────────
@@ -1239,6 +1274,482 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const limit = parseInt(url.searchParams.get("limit") || "2000", 10);
     const txns = await listTransactionsEdge(restaurantId, { date, month, limit });
     return jsonResponse(txns, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── GET /api/edge/analytics/items-sold — item analytics from local SQLite ──
+  // Used by edge-local (PIN) auth to populate ItemAnalytics from local settled orders.
+  // Mirrors cloud /api/analytics/items-sold response format.
+  if (url.pathname === "/api/edge/analytics/items-sold" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const startDate = url.searchParams.get("startDate") || new Date(Date.now() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const endDate = url.searchParams.get("endDate") || startDate;
+    const sectionName = url.searchParams.get("sectionName");
+
+    // IST date range
+    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+    const [sy, sm, sd] = startDate.split("-").map(Number);
+    const [ey, em, ed] = endDate.split("-").map(Number);
+    const startTs = Date.UTC(sy, sm - 1, sd, 0, 0, 0, 0) - IST_OFFSET_MS;
+    const endTs = Date.UTC(ey, em - 1, ed, 23, 59, 59, 999) - IST_OFFSET_MS;
+
+    const db = getDb();
+
+    // Resolve section filter to table IDs
+    let sectionTableIds: string[] = [];
+    if (sectionName) {
+      const sections = db.query("SELECT id FROM section WHERE restaurant_id = ? AND LOWER(name) = LOWER(?)").all(restaurantId, sectionName) as any[];
+      const sectionIds = sections.map(s => s.id);
+      if (sectionIds.length > 0) {
+        const tables = db.query("SELECT id FROM \"table\" WHERE section_id IN (" + sectionIds.map(() => "?").join(",") + ")").all(...sectionIds) as any[];
+        sectionTableIds = tables.map(t => t.id);
+      }
+    }
+
+    // 1. Settled orders from order_record + order_item
+    let orderQuery = `SELECT o.id, o.paid_at FROM order_record o WHERE o.restaurant_id = ? AND o.status = 'SETTLED' AND o.paid_at >= ? AND o.paid_at <= ?`;
+    const orderParams: any[] = [restaurantId, startTs, endTs];
+    if (sectionTableIds.length > 0) {
+      orderQuery += ` AND o.table_id IN (${sectionTableIds.map(() => "?").join(",")})`;
+      orderParams.push(...sectionTableIds);
+    }
+    const settledOrders = db.query(orderQuery).all(...orderParams) as any[];
+
+    // 2. Walk-in transactions from edge_config
+    let walkinRows: any[] = [];
+    try {
+      const walkinQuery = `SELECT key, value FROM edge_config WHERE key LIKE 'walkin_txn:%'`;
+      const allWalkinRows = db.query(walkinQuery).all() as any[];
+      for (const row of allWalkinRows) {
+        try {
+          const data = JSON.parse(row.value);
+          if (data.restaurantId === restaurantId && data.createdAt >= startTs && data.createdAt <= endTs) {
+            walkinRows.push(data);
+          }
+        } catch { /* ignore parse errors */ }
+      }
+    } catch { /* ignore */ }
+
+    // Aggregate items
+    const itemMap = new Map<string, { name: string; quantity: number; revenue: number; type: string; orderCount: number }>();
+
+    // Process settled orders
+    for (const order of settledOrders) {
+      const items = db.query("SELECT name, price, quantity, menu_type FROM order_item WHERE order_id = ? AND removed_from_bill = 0").all(order.id) as any[];
+      // Get discount from settle record
+      const settleRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
+      let discountPercent = 0;
+      if (settleRow?.value) {
+        try { discountPercent = Number(JSON.parse(settleRow.value).discountPercent || 0); } catch {}
+      }
+      const discountFactor = discountPercent > 0 ? (1 - discountPercent / 100) : 1;
+
+      for (const item of items) {
+        const name = (item.name || "Unknown").trim();
+        const key = name.toLowerCase().replace(/\s+/g, " ").trim();
+        const quantity = Number(item.quantity || 0);
+        const price = Number(item.price || 0);
+        const revenue = Math.round(price * quantity * discountFactor * 100) / 100;
+        const rawType = String(item.menu_type || "FOOD").toUpperCase();
+        const type = rawType === "LIQUOR" || rawType === "BAR" ? "liquor" : "food";
+
+        if (itemMap.has(key)) {
+          const existing = itemMap.get(key)!;
+          existing.quantity += quantity;
+          existing.revenue += revenue;
+          existing.orderCount += 1;
+        } else {
+          itemMap.set(key, { name, quantity, revenue, type, orderCount: 1 });
+        }
+      }
+    }
+
+    // Process walk-in transactions
+    for (const txn of walkinRows) {
+      const items = Array.isArray(txn.items) ? txn.items : [];
+      const discountPercent = Number(txn.discountPercent || 0);
+      const discountFactor = discountPercent > 0 ? (1 - discountPercent / 100) : 1;
+
+      for (const item of items) {
+        const name = (item.name || item.n || "Unknown").trim();
+        const key = name.toLowerCase().replace(/\s+/g, " ").trim();
+        const quantity = Number(item.quantity || item.q || 0);
+        const price = Number(item.price || item.p || 0);
+        const revenue = Math.round(price * quantity * discountFactor * 100) / 100;
+        const rawType = String(item.menuType || "FOOD").toUpperCase();
+        const type = rawType === "LIQUOR" || rawType === "BAR" ? "liquor" : "food";
+
+        if (itemMap.has(key)) {
+          const existing = itemMap.get(key)!;
+          existing.quantity += quantity;
+          existing.revenue += revenue;
+          existing.orderCount += 1;
+        } else {
+          itemMap.set(key, { name, quantity, revenue, type, orderCount: 1 });
+        }
+      }
+    }
+
+    const itemsData = Array.from(itemMap.entries())
+      .map(([_, data]) => ({
+        name: data.name,
+        quantity: data.quantity,
+        revenue: Math.round(data.revenue * 100) / 100,
+        type: data.type,
+        orderCount: data.orderCount,
+      }))
+      .sort((a, b) => b.revenue - a.revenue);
+
+    const totalQuantity = itemsData.reduce((sum, item) => sum + item.quantity, 0);
+    const totalRevenue = itemsData.reduce((sum, item) => sum + item.revenue, 0);
+
+    return jsonResponse({
+      items: itemsData,
+      summary: {
+        totalItems: itemsData.length,
+        totalQuantity,
+        totalRevenue: Math.round(totalRevenue * 100) / 100,
+      },
+      dateRange: { startDate, endDate },
+    }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── GET /api/edge/analytics/captain-performance — captain performance from local SQLite ──
+  // Used by edge-local (PIN) auth to populate CaptainPerformanceDashboard.
+  // Mirrors cloud /api/reports/captain-performance response format.
+  if (url.pathname === "/api/edge/analytics/captain-performance" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const startDate = url.searchParams.get("startDate") || new Date(Date.now() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const endDate = url.searchParams.get("endDate") || startDate;
+
+    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+    const [sy, sm, sd] = startDate.split("-").map(Number);
+    const [ey, em, ed] = endDate.split("-").map(Number);
+    const startTs = Date.UTC(sy, sm - 1, sd, 0, 0, 0, 0) - IST_OFFSET_MS;
+    const endTs = Date.UTC(ey, em - 1, ed, 23, 59, 59, 999) - IST_OFFSET_MS;
+
+    const db = getDb();
+
+    // Get all captains from users table
+    const captains = db.query("SELECT id, name FROM users WHERE outlet_id = ? AND role = 'CAPTAIN' AND is_active = 1").all(restaurantId) as any[];
+    const byCaptain = new Map<string, { id: string; name: string; totalSales: number; orderCount: number; itemCount: number; items: any[] }>();
+    for (const c of captains) {
+      byCaptain.set(c.id, { id: c.id, name: c.name, totalSales: 0, orderCount: 0, itemCount: 0, items: [] });
+    }
+
+    // Get settled orders with captain_id in date range
+    const orders = db.query(
+      "SELECT id, captain_id, paid_at FROM order_record WHERE restaurant_id = ? AND status = 'SETTLED' AND paid_at >= ? AND paid_at <= ? AND captain_id IS NOT NULL"
+    ).all(restaurantId, startTs, endTs) as any[];
+
+    for (const order of orders) {
+      const cid = order.captain_id;
+      if (!byCaptain.has(cid)) {
+        byCaptain.set(cid, { id: cid, name: cid, totalSales: 0, orderCount: 0, itemCount: 0, items: [] });
+      }
+      const entry = byCaptain.get(cid)!;
+      entry.orderCount += 1;
+
+      // Get payment details from settle record
+      const settleRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
+      if (settleRow?.value) {
+        try {
+          const pd = JSON.parse(settleRow.value);
+          entry.totalSales += Number(pd.grandTotal || 0);
+        } catch {}
+      }
+
+      // Get items for highest-selling item calculation
+      const items = db.query("SELECT name, quantity FROM order_item WHERE order_id = ? AND removed_from_bill = 0").all(order.id) as any[];
+      entry.itemCount += items.length;
+      for (const item of items) {
+        entry.items.push({ name: item.name, quantity: item.quantity });
+      }
+    }
+
+    // Compute highest selling item per captain
+    const result = Array.from(byCaptain.values()).map(c => {
+      const itemMap = new Map<string, number>();
+      for (const item of c.items) {
+        itemMap.set(item.name, (itemMap.get(item.name) || 0) + Number(item.quantity || 0));
+      }
+      let highestItem = null;
+      let maxQty = 0;
+      for (const [name, qty] of itemMap.entries()) {
+        if (qty > maxQty) { maxQty = qty; highestItem = { name, quantity: qty }; }
+      }
+      return {
+        id: c.id,
+        name: c.name,
+        sales: Math.round(c.totalSales * 100) / 100,
+        orders: c.orderCount,
+        items: c.itemCount,
+        highestSellingItem: highestItem,
+        trends: [],
+      };
+    }).sort((a, b) => b.sales - a.sales);
+
+    return jsonResponse({ startDate, endDate, captains: result }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── Helper: round to 2 decimal places ──────────────────────────────────────
+  function round2(n: number): number {
+    return Math.round((n + Number.EPSILON) * 100) / 100;
+  }
+
+  // ── Helper: get printer config + resolve bill printer name ──────────────────
+  function getBillPrinterName(): string | null {
+    try {
+      const outlet = getOutletSettings();
+      const pc = outlet?.printerConfig || {};
+      return resolvePrinterName(null, "BILL_PRINTER", null, pc) || null;
+    } catch { return null; }
+  }
+
+  // ── GET /api/edge/x-report?date=YYYY-MM-DD ──────────────────────────────────
+  // X Report data from local SQLite — aggregates settled orders + expenditures.
+  if (url.pathname === "/api/edge/x-report" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const date = url.searchParams.get("date") || getKolkataDateString();
+
+    const db = getDb();
+    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+    const [dy, dm, dd] = date.split("-").map(Number);
+    const startTs = Date.UTC(dy, dm - 1, dd, 0, 0, 0, 0) - IST_OFFSET_MS;
+    const endTs = Date.UTC(dy, dm - 1, dd, 23, 59, 59, 999) - IST_OFFSET_MS;
+
+    // Settled orders for the date
+    const orders = db.query(
+      "SELECT id FROM order_record WHERE restaurant_id = ? AND status = 'SETTLED' AND paid_at >= ? AND paid_at <= ?"
+    ).all(restaurantId, startTs, endTs) as any[];
+
+    let totalSales = 0, cashAmount = 0, cardAmount = 0, upiAmount = 0, otherAmount = 0, tipsAmount = 0;
+
+    for (const order of orders) {
+      const settleRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
+      if (!settleRow?.value) continue;
+      try {
+        const pd = JSON.parse(settleRow.value);
+        const grand = Number(pd.grandTotal || 0);
+        totalSales += grand;
+        tipsAmount += Number(pd.tipAmount || 0);
+        const method = (pd.paymentMethod || "CASH").toUpperCase();
+        if (method === "CASH") cashAmount += Number(pd.cashAmount || grand);
+        else if (method === "CARD") cardAmount += Number(pd.cardAmount || grand);
+        else if (method === "UPI") upiAmount += Number(pd.cashAmount || grand);
+        else if (method === "MIXED") {
+          cashAmount += Number(pd.cashAmount || 0);
+          cardAmount += Number(pd.cardAmount || 0);
+          otherAmount += Math.max(0, grand - Number(pd.cashAmount || 0) - Number(pd.cardAmount || 0));
+        } else otherAmount += grand;
+      } catch {}
+    }
+
+    // Expenditures for the date
+    const expenditures = db.query(
+      "SELECT * FROM expenditure WHERE restaurant_id = ? AND date = ? AND voided = 0 ORDER BY created_at DESC"
+    ).all(restaurantId, date) as any[];
+    const expenditureAmount = expenditures.reduce((sum, e) => sum + Number(e.amount || 0), 0);
+
+    return jsonResponse({
+      reportDate: date,
+      totalSales: round2(totalSales),
+      cashAmount: round2(cashAmount),
+      cardAmount: round2(cardAmount),
+      upiAmount: round2(upiAmount),
+      otherAmount: round2(otherAmount),
+      tipsAmount: round2(tipsAmount),
+      expenditureAmount: round2(expenditureAmount),
+      expenditures: expenditures.map(e => ({
+        id: e.id, amount: Number(e.amount), paidToType: e.paid_to_type,
+        paidToName: e.paid_to_name, category: e.category, narration: e.narration,
+        approver: e.approver, expenditureNo: e.expenditure_no,
+      })),
+    }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── POST /api/edge/x-report/print ───────────────────────────────────────────
+  // Build ESC/POS and create print job for X Report — instant printing via durable queue.
+  if (url.pathname === "/api/edge/x-report/print" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    let body: any; try { body = JSON.parse(await req.text()); } catch { return errorResponse("Invalid JSON", 400); }
+
+    const outlet = getOutletSettings();
+    const printerName = getBillPrinterName();
+    const escposData = buildXReport({
+      restaurantName: outlet?.name || "",
+      reportDate: body.reportDate || getKolkataDateString(),
+      cashierName: body.cashierName || "",
+      totalSales: Number(body.totalSales) || 0,
+      cardAmount: Number(body.cardAmount) || 0,
+      cashAmount: Number(body.cashAmount) || 0,
+      upiAmount: Number(body.upiAmount) || 0,
+      otherAmount: Number(body.otherAmount) || 0,
+      tipsAmount: Number(body.tipsAmount) || 0,
+      expenditureAmount: Number(body.expenditureAmount) || 0,
+      finalAmount: round2((Number(body.totalSales) || 0) - (Number(body.expenditureAmount) || 0)),
+      expenditures: body.expenditures || [],
+      denominations: body.denominations || [],
+      cashFromNotes: Number(body.cashFromNotes) || 0,
+    });
+
+    const eventId = `xreport-${restaurantId}-${body.reportDate || "today"}-${Date.now()}`;
+    createPrintJob({
+      eventId, restaurantId,
+      orderId: `xreport-${body.reportDate || "today"}`,
+      printerName, jobType: "X_REPORT", escposData,
+    });
+
+    return jsonResponse({ success: true, eventId });
+  }
+
+  // ── GET /api/edge/expenditures?date=YYYY-MM-DD ──────────────────────────────
+  if (url.pathname === "/api/edge/expenditures" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const date = url.searchParams.get("date") || getKolkataDateString();
+    const limit = Math.min(parseInt(url.searchParams.get("limit") || "100", 10), 500);
+
+    const db = getDb();
+    const rows = db.query(
+      "SELECT * FROM expenditure WHERE restaurant_id = ? AND date = ? ORDER BY created_at DESC LIMIT ?"
+    ).all(restaurantId, date, limit) as any[];
+
+    return jsonResponse(rows.map(e => ({
+      id: e.id, amount: Number(e.amount), paidToType: e.paid_to_type,
+      paidToName: e.paid_to_name, category: e.category, narration: e.narration,
+      approver: e.approver, createdBy: e.created_by,
+      expenditureNo: e.expenditure_no, date: e.date,
+      voided: !!e.voided, createdAt: e.created_at,
+    })), 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── POST /api/edge/expenditures ─────────────────────────────────────────────
+  // Create expenditure + enqueue sync + instant print via durable queue.
+  if (url.pathname === "/api/edge/expenditures" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    let body: any; try { body = JSON.parse(await req.text()); } catch { return errorResponse("Invalid JSON", 400); }
+
+    const db = getDb();
+    const id = `edge-exp-${restaurantId}-${Date.now()}`;
+    const date = body.date || getKolkataDateString();
+    const now = Date.now();
+
+    // Get next expenditure number for this restaurant+date
+    const counter = db.query(
+      "SELECT COALESCE(MAX(expenditure_no), 0) + 1 as next_no FROM expenditure WHERE restaurant_id = ? AND date = ?"
+    ).get(restaurantId, date) as any;
+
+    db.query(
+      "INSERT INTO expenditure (id, restaurant_id, amount, paid_to_type, paid_to_name, category, narration, approver, created_by, expenditure_no, date, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(id, restaurantId, Number(body.amount), body.paidToType, body.paidToName,
+          body.category, body.narration, body.approver, body.createdBy,
+          counter.next_no, date, now);
+
+    enqueueSync("expenditure", id, "insert");
+
+    // Instant print
+    const outlet = getOutletSettings();
+    const printerName = getBillPrinterName();
+    const escposData = buildExpenditure({
+      expenditureNo: counter.next_no,
+      expenditureDate: date,
+      paidToType: body.paidToType || "",
+      paidToName: body.paidToName || "",
+      amount: Number(body.amount) || 0,
+      narration: body.narration || null,
+      approvedByName: body.approver || null,
+      createdByName: body.createdBy || null,
+      status: "ACTIVE",
+      restaurant: { name: outlet?.name || "" },
+    });
+
+    const eventId = `exp-${id}-${now}`;
+    createPrintJob({
+      eventId, restaurantId,
+      orderId: `expenditure-${id}`,
+      printerName, jobType: "EXPENDITURE", escposData,
+    });
+
+    return jsonResponse({ success: true, id, expenditureNo: counter.next_no, eventId });
+  }
+
+  // ── GET /api/edge/expenditures/today-summary?date=YYYY-MM-DD ────────────────
+  if (url.pathname === "/api/edge/expenditures/today-summary" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const date = url.searchParams.get("date") || getKolkataDateString();
+
+    const db = getDb();
+    const rows = db.query(
+      "SELECT COUNT(*) as count, COALESCE(SUM(amount), 0) as totalAmount FROM expenditure WHERE restaurant_id = ? AND date = ? AND voided = 0"
+    ).all(restaurantId, date) as any[];
+
+    return jsonResponse(rows[0] || { count: 0, totalAmount: 0 }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── GET /api/edge/expenditures/paid-to-options ──────────────────────────────
+  if (url.pathname === "/api/edge/expenditures/paid-to-options" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const db = getDb();
+    const staff = db.query(
+      "SELECT id, name, role FROM users WHERE outlet_id = ? AND is_active = 1 ORDER BY name"
+    ).all(restaurantId) as any[];
+
+    return jsonResponse({ staff }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── POST /api/edge/expenditures/print ───────────────────────────────────────
+  // Reprint an expenditure receipt.
+  if (url.pathname === "/api/edge/expenditures/print" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    let body: any; try { body = JSON.parse(await req.text()); } catch { return errorResponse("Invalid JSON", 400); }
+
+    const db = getDb();
+    const row = db.query("SELECT * FROM expenditure WHERE id = ?").get(body.expenditureId) as any;
+    if (!row) return errorResponse("Expenditure not found", 404);
+
+    const outlet = getOutletSettings();
+    const printerName = getBillPrinterName();
+    const escposData = buildExpenditure({
+      expenditureNo: row.expenditure_no,
+      expenditureDate: row.date,
+      paidToType: row.paid_to_type || "",
+      paidToName: row.paid_to_name || "",
+      amount: Number(row.amount),
+      narration: row.narration || null,
+      approvedByName: row.approver || null,
+      createdByName: row.created_by || null,
+      status: row.voided ? "VOIDED" : "ACTIVE",
+      restaurant: { name: outlet?.name || "" },
+    });
+
+    const eventId = `exp-reprint-${body.expenditureId}-${Date.now()}`;
+    createPrintJob({
+      eventId, restaurantId,
+      orderId: `expenditure-${body.expenditureId}`,
+      printerName, jobType: "EXPENDITURE", escposData,
+    });
+
+    return jsonResponse({ success: true, eventId });
   }
 
   // ── GET /api/edge/tables — sections with nested tables + active orders ────
