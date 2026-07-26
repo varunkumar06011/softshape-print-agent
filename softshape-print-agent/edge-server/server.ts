@@ -1044,8 +1044,6 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   if (url.pathname === "/api/edge/order/print-bill" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("No valid session", 401);
     const body = await req.json().catch(() => ({}));
-    const roleError = await verifyEdgeRole(body, ["CASHIER", "MANAGER", "OWNER"]);
-    if (roleError) return roleError;
     const validationError = validateFields(body, { orderId: "string" });
     if (validationError) return errorResponse(validationError, 400);
     const restaurantId = getRestaurantId();
@@ -1070,8 +1068,6 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   if (url.pathname === "/api/edge/order/settle" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("No valid session", 401);
     const body = await req.json().catch(() => ({}));
-    const roleError = await verifyEdgeRole(body, ["CASHIER", "MANAGER", "OWNER"]);
-    if (roleError) return roleError;
     const validationError = validateFields(body, { orderId: "string", paymentMethod: "string" });
     if (validationError) return errorResponse(validationError, 400);
     const restaurantId = getRestaurantId();
@@ -1106,6 +1102,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       requestId: body.requestId,
       deviceId: body.deviceId,
       expectedRevision: body.expectedRevision,
+      isExtraTable: body.isExtraTable,
     });
     if (!result.success) return errorResponse(result.error || "Settle failed", 400);
     return jsonResponse(result);
@@ -1115,8 +1112,6 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   if (url.pathname === "/api/edge/order/swap-table" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("No valid session", 401);
     const body = await req.json().catch(() => ({}));
-    const roleError = await verifyEdgeRole(body, ["CASHIER", "MANAGER", "OWNER"]);
-    if (roleError) return roleError;
     const validationError = validateFields(body, { sourceTableId: "string", targetTableId: "string" });
     if (validationError) return errorResponse(validationError, 400);
     const restaurantId = getRestaurantId();
@@ -1134,8 +1129,6 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   if (url.pathname === "/api/edge/order/transfer-items" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("No valid session", 401);
     const body = await req.json().catch(() => ({}));
-    const roleError = await verifyEdgeRole(body, ["CASHIER", "MANAGER", "OWNER"]);
-    if (roleError) return roleError;
     const validationError = validateFields(body, { sourceTableId: "string", targetTableId: "string", orderItemIds: "array" });
     if (validationError) return errorResponse(validationError, 400);
     const restaurantId = getRestaurantId();
@@ -1153,8 +1146,6 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   if (url.pathname === "/api/edge/order/edit-bill" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("No valid session", 401);
     const body = await req.json().catch(() => ({}));
-    const roleError = await verifyEdgeRole(body, ["CASHIER", "MANAGER", "OWNER"]);
-    if (roleError) return roleError;
     const validationError = validateFields(body, { orderId: "string" });
     if (validationError) return errorResponse(validationError, 400);
     const restaurantId = getRestaurantId();
@@ -1174,8 +1165,6 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   if (url.pathname === "/api/edge/order/confirm-payment" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("No valid session", 401);
     const body = await req.json().catch(() => ({}));
-    const roleError = await verifyEdgeRole(body, ["CASHIER", "MANAGER", "OWNER"]);
-    if (roleError) return roleError;
     const restaurantId = getRestaurantId();
     if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
     const result = await confirmPaymentEdge(restaurantId, body.transactionId, {
@@ -1870,6 +1859,25 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       }
     }
 
+    // Diagnostic: venue kot_enabled settings
+    let venueDiagnostics: any[] = [];
+    if (restaurantId) {
+      const venues = db.query(`
+        SELECT v.id, v.name, v.kot_enabled, v.kot_printer_name, v.bill_printer_name,
+               (SELECT COUNT(*) FROM section s WHERE s.venue_id = v.id AND s.restaurant_id = ?) as section_count
+        FROM venue v WHERE v.restaurant_id = ?
+      `).all(restaurantId, restaurantId) as any[];
+      venueDiagnostics = venues.map(v => ({
+        id: v.id,
+        name: v.name,
+        kot_enabled: v.kot_enabled,
+        kotEnabledInterpreted: v.kot_enabled !== 0 ? "ENABLED" : "DISABLED",
+        kotPrinterName: v.kot_printer_name,
+        billPrinterName: v.bill_printer_name,
+        sectionCount: v.section_count,
+      }));
+    }
+
     return jsonResponse({
       jobs: rows,
       summary,
@@ -1878,6 +1886,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       printServiceExe: getPrintServiceExeDiagnostics(),
       resolvedPrinters,
       printerConfig,
+      venueDiagnostics,
     }, 200, { "Cache-Control": "no-store" });
   }
 
@@ -1921,13 +1930,13 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     if (!eventId) return errorResponse("eventId is required", 400);
     const result = reprintPrintJob(eventId, newEventId);
     if (!result) return errorResponse("Original print job not found", 404);
-    // Dispatch the new reprint immediately
-    const { dispatchSinglePrintJob } = await import("./orderService.ts");
+    // Dispatch the new reprint immediately (bounded-wait, 3s timeout)
+    const { awaitDispatchBounded } = await import("./orderService.ts");
     const job = getPrintJobByEventId(result.eventId);
     if (job) {
       try {
         const escposData = JSON.parse(job.escpos_data);
-        dispatchSinglePrintJob(result.eventId, { printerName: job.printer_name, escposData, type: job.job_type });
+        await awaitDispatchBounded(result.eventId, { printerName: job.printer_name, escposData, type: job.job_type }, undefined);
       } catch (e) {
         console.warn("[Reprint] Failed to dispatch reprint job:", e);
       }
