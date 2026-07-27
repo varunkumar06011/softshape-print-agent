@@ -106,4 +106,5 @@ export const PUBLIC_PATHS = new Set<string>([
   "/health",
   "/api/edge/register",
   "/api/edge/auth/pin",
+  "/api/edge/staff",
 ]);
