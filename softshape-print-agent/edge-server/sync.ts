@@ -27,7 +27,7 @@ import { pullIncrementalChanges } from "./config.ts";
 const SYNC_INTERVAL_MS = parseInt(process.env.EDGE_SYNC_INTERVAL_MS || "10000", 10);
 const CONFIG_PULL_INTERVAL_MS = parseInt(process.env.EDGE_CONFIG_PULL_INTERVAL_MS || "60000", 10);
 const MAX_BATCH_SIZE = 50;
-const MAX_ATTEMPTS = 2;
+const MAX_ATTEMPTS = 5;
 const BACKOFF_BASE_MS = 10_000;   // 10 seconds
 const BACKOFF_MAX_MS = 5 * 60_000; // 5 minutes cap
 const SYNC_SCHEMA_VERSION = 2;
