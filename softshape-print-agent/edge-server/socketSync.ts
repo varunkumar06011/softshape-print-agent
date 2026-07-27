@@ -75,7 +75,7 @@ export function startSocketSync(): void {
     socket!.emit("edge:register", {
       restaurantId,
       sessionToken: token,
-      edgeVersion: "23.4.3",
+      edgeVersion: "23.4.4",
       capabilities: ["print"],
     });
   });
@@ -102,7 +102,7 @@ export function startSocketSync(): void {
     socket!.emit("edge:register", {
       restaurantId,
       sessionToken: token,
-      edgeVersion: "23.4.3",
+      edgeVersion: "23.4.4",
       capabilities: ["print"],
     });
   });
@@ -268,7 +268,7 @@ async function handleCloudPrintJob(envelope: any): Promise<void> {
       const mapping = JSON.parse(db.query("SELECT value FROM edge_config WHERE key = 'printer_mapping'").get() as any)?.value || "{}";
       if (type === "KOT" || type === "CANCEL_KOT") targetPrinter = mapping.kitchen || null;
       else if (type === "BAR_KOT") targetPrinter = mapping.bar || null;
-      else if (type === "BILL" || type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "EXPENDITURE") targetPrinter = mapping.bill || null;
+      else if (type === "BILL" || type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "EXPENDITURE" || type === "X_REPORT") targetPrinter = mapping.bill || null;
       else if (type === "TABLE_SWAP") targetPrinter = mapping.kitchen || null;
     } catch { /* ignore */ }
   }
@@ -281,7 +281,7 @@ async function handleCloudPrintJob(envelope: any): Promise<void> {
       const pc = row?.printer_config ? JSON.parse(row.printer_config) : {};
       if (type === "KOT" || type === "CANCEL_KOT") targetPrinter = resolvePrinterName(null, "KOT_PRINTER", null, pc) || null;
       else if (type === "BAR_KOT") targetPrinter = resolvePrinterName(null, "BAR_PRINTER", null, pc) || null;
-      else if (type === "BILL" || type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "EXPENDITURE") targetPrinter = resolvePrinterName(null, "BILL_PRINTER", null, pc) || null;
+      else if (type === "BILL" || type === "FINAL_BILL" || type === "CANCELLED_BILL" || type === "EXPENDITURE" || type === "X_REPORT") targetPrinter = resolvePrinterName(null, "BILL_PRINTER", null, pc) || null;
       else if (type === "TABLE_SWAP") targetPrinter = resolvePrinterName(null, "KOT_PRINTER", null, pc) || null;
     } catch { /* ignore */ }
   }

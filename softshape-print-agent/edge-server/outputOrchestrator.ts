@@ -65,7 +65,7 @@ export async function processOutputIntent(
         data: { jobId: jobId || 0, printerName: job.destination.printerName || "unknown", ok: result.ok } as any,
       });
 
-      results.push({ jobId, ok: result.ok ?? false, error: result.error, pending: result.pending });
+      results.push({ jobId, ok: result.ok ?? null, error: result.error, pending: result.pending });
     } else {
       emitEvent({
         event: EVENT_NAMES.PRINT_COMPLETED,

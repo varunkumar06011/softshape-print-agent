@@ -7,7 +7,7 @@
   },
   "package": {
     "productName": "SoftShape Print Agent",
-    "version": "23.4.3"
+    "version": "23.4.4"
   },
   "tauri": {
     "windows": [

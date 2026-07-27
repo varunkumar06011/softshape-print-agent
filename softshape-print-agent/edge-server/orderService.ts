@@ -258,7 +258,7 @@ export async function awaitDispatchBounded(
   eventId: string,
   group: PrintGroup,
   requestId?: string,
-  timeoutMs = 3000,
+  timeoutMs = 5000,
 ): Promise<any> {
   let dispatchPromise: Promise<any>;
   try {
@@ -1765,6 +1765,7 @@ export interface PrintBillInput {
   requestId?: string;
   deviceId?: string;
   expectedRevision?: number;
+  isExtraTable?: boolean;
 }
 
 export async function printBillEdge(input: PrintBillInput): Promise<{ success: boolean; error?: string; billNumber?: string; printResults?: any[]; printPending?: boolean; revision?: number }> {
@@ -1815,9 +1816,9 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
   }
 
   // Resolve discount: prefer explicit input, fall back to table's stored discount
-  const effectiveDiscountPercent = discountPercent != null
-    ? discountPercent
-    : (table.discount != null ? Number(table.discount) : 0);
+  const effectiveDiscountPercent = (!!order.is_extra_table || input.isExtraTable)
+    ? (discountPercent ?? 0)
+    : (discountPercent != null ? discountPercent : (table.discount != null ? Number(table.discount) : 0));
 
   // Get order items with gst_enabled from menu_item (excluding fully cancelled and removed from bill)
   const orderItems = db.query(

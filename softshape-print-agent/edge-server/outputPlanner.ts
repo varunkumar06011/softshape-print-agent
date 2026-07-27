@@ -140,6 +140,27 @@ export function planOutputIntent(
     return planKotJobs(intent, restaurantId, printerConfig);
   }
 
+  // Fix 13D: Bill-printer intents — always route to BILL_PRINTER target
+  if (intent.intent === "PRINT_X_REPORT" || intent.intent === "PRINT_EXPENDITURE" || intent.intent === "PRINT_BILL" || intent.intent === "PRINT_RECEIPT") {
+    const billPrinter = resolvePrinterName(
+      intent.payload.printerName as string | null,
+      "BILL_PRINTER",
+      null,
+      printerConfig,
+    ) ?? null;
+    const destination: Destination = { printerName: billPrinter, printerTarget: "BILL_PRINTER" };
+    return [{
+      jobId: "",
+      intentId: intent.intentId,
+      renderer: "escpos",
+      destination,
+      copies: (intent.payload.copies as number) ?? 1,
+      priority: intent.priority,
+      intent: intent.intent,
+      payload: intent.payload,
+    }];
+  }
+
   // Non-KOT intents: single job
   const destination: Destination = {
     printerName: resolvePrinterName(

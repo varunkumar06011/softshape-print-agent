@@ -402,7 +402,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       const healthResp = {
         status: rmHealth.status,
         service: "softshape-edge-server",
-        version: "23.4.3",
+        version: "23.4.4",
         uptime: process.uptime(),
         runtimeState: rmHealth.runtimeState,
         configSyncState: rmHealth.configSyncState,
@@ -1603,7 +1603,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       otherAmount: Number(body.otherAmount) || 0,
       tipsAmount: Number(body.tipsAmount) || 0,
       expenditureAmount: Number(body.expenditureAmount) || 0,
-      finalAmount: round2((Number(body.totalSales) || 0) - (Number(body.expenditureAmount) || 0)),
+      finalAmount: round2((Number(body.totalSales) || 0) - (Number(body.cardAmount) || 0) - (Number(body.expenditureAmount) || 0)),
       expenditures: body.expenditures || [],
       denominations: body.denominations || [],
       cashFromNotes: Number(body.cashFromNotes) || 0,
@@ -1616,7 +1616,12 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       printerName, jobType: "X_REPORT", escposData,
     });
 
-    return jsonResponse({ success: true, eventId });
+    // Await print dispatch to return actual print status
+    const { awaitDispatchBounded } = await import("./orderService.ts");
+    const printResult = await awaitDispatchBounded(eventId, { printerName, escposData, type: "X_REPORT" });
+    const printed = printResult?.ok === true;
+    const pending = printResult?.ok === null || printResult?.pending === true;
+    return jsonResponse({ success: true, eventId, printed, pending, printError: printResult?.error || null });
   }
 
   // ── GET /api/edge/expenditures?date=YYYY-MM-DD ──────────────────────────────
@@ -1690,7 +1695,12 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       printerName, jobType: "EXPENDITURE", escposData,
     });
 
-    return jsonResponse({ success: true, id, expenditureNo: counter.next_no, eventId });
+    // Await print dispatch to return actual print status
+    const { awaitDispatchBounded } = await import("./orderService.ts");
+    const printResult = await awaitDispatchBounded(eventId, { printerName, escposData, type: "EXPENDITURE" });
+    const printed = printResult?.ok === true;
+    const pending = printResult?.ok === null || printResult?.pending === true;
+    return jsonResponse({ success: true, id, expenditureNo: counter.next_no, eventId, printed, pending, printError: printResult?.error || null });
   }
 
   // ── GET /api/edge/expenditures/today-summary?date=YYYY-MM-DD ────────────────
@@ -1756,7 +1766,12 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       printerName, jobType: "EXPENDITURE", escposData,
     });
 
-    return jsonResponse({ success: true, eventId });
+    // Await print dispatch to return actual print status
+    const { awaitDispatchBounded } = await import("./orderService.ts");
+    const printResult = await awaitDispatchBounded(eventId, { printerName, escposData, type: "EXPENDITURE" });
+    const printed = printResult?.ok === true;
+    const pending = printResult?.ok === null || printResult?.pending === true;
+    return jsonResponse({ success: true, eventId, printed, pending, printError: printResult?.error || null });
   }
 
   // ── GET /api/edge/tables — sections with nested tables + active orders ────
@@ -2277,7 +2292,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   // returns the download URL if an update exists. The Host handles the
   // download, binary swap, and restart.
   if (url.pathname === "/api/edge/update-check" && req.method === "GET") {
-    const currentVersion = "23.4.3";
+    const currentVersion = "23.4.4";
     const backendUrl = getBackendUrl();
     const sessionToken = getSessionToken();
 
