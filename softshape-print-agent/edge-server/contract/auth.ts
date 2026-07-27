@@ -105,4 +105,5 @@ export function extractBearerToken(authHeader: string | null): string | null {
 export const PUBLIC_PATHS = new Set<string>([
   "/health",
   "/api/edge/register",
+  "/api/edge/auth/pin",
 ]);

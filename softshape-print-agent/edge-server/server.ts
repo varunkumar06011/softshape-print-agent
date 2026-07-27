@@ -2121,6 +2121,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         role: user.role,
         restaurantId: getRestaurantId(),
       },
+      runtimeToken: getOrCreateRuntimeToken(),
     });
   }
 

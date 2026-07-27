@@ -32,6 +32,7 @@ interface PlannerKotItem {
   price: number;
   notes?: string | null;
   menuType?: string;
+  type?: string;
   printerName?: string | null;
   printerTarget?: string | null;
   categoryPrinterTarget?: string | null;
@@ -47,7 +48,25 @@ function planKotJobs(
   restaurantId: string,
   printerConfig: Record<string, any>,
 ): OutputJob[] {
-  const items = (intent.payload.items as PlannerKotItem[]) || [];
+  const allItems = (intent.payload.items as PlannerKotItem[]) || [];
+  if (allItems.length === 0) return [];
+
+  // Filter items by intent type — PRINT_KOT processes only food items,
+  // PRINT_LIQUOR_KOT processes only liquor items. Without this filter,
+  // a PRINT_KOT intent with both food+liquor items would create an
+  // unintended PRINT_LIQUOR_KOT job for bar items. If the bar printer
+  // isn't mapped or fails, the entire intent returns ok:false, causing
+  // Path 1 (sendOutputIntent) to fail even though the kitchen print
+  // succeeded. It also causes duplicate prints when both intents succeed.
+  const isLiquorItem = (i: PlannerKotItem): boolean =>
+    String(i.menuType || "").toUpperCase() === "LIQUOR" ||
+    String(i.type || "").toLowerCase() === "liquor" ||
+    i.printerTarget === "BAR_PRINTER";
+
+  const isLiquorIntent = intent.intent === "PRINT_LIQUOR_KOT";
+  const items = isLiquorIntent
+    ? allItems.filter(isLiquorItem)
+    : allItems.filter((i) => !isLiquorItem(i));
   if (items.length === 0) return [];
 
   // Resolve printer for each item
