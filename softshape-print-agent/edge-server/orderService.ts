@@ -1949,6 +1949,7 @@ export interface SettleOrderInput {
   deviceId?: string;
   expectedRevision?: number;
   isExtraTable?: boolean;
+  items?: any[];
 }
 
 export async function settleOrderEdge(input: SettleOrderInput): Promise<{ success: boolean; error?: string; order?: any; table?: any; transaction?: any; statusCode?: number; revision?: number; tableRevision?: number }> {
@@ -2072,6 +2073,7 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
       requestId,
       settledAt: now,
       isExtraTable: input.isExtraTable ?? false,
+      items: input.items,
     });
     db.query("INSERT INTO edge_config (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?")
       .run(paymentKey, paymentData, now, paymentData, now);

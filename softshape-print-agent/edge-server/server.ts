@@ -1142,6 +1142,8 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       sgst: body.sgst,
       grandTotal: body.grandTotal,
       roundOff: body.roundOff,
+      serviceChargeAmount: body.serviceChargeAmount,
+      items: body.items,
       localTxnId: body.localTxnId,
       requestId: body.requestId,
       deviceId: body.deviceId,
