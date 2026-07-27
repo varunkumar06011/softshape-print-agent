@@ -1,6 +1,6 @@
 {
   "name": "softshape-edge-server",
-  "version": "23.4.4",
+  "version": "23.5.0",
   "description": "Local edge server for SoftShape POS — handles order creation, KOT printing, and table management on the restaurant LAN",
   "type": "module",
   "scripts": {
