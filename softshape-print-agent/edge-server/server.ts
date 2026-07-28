@@ -34,6 +34,7 @@
 //   GET  /api/edge/sync/status  — sync worker status
 //   POST /api/edge/sync/push    — manually trigger sync push
 //   POST /api/edge/sync/retry   — retry dead-lettered records
+//   POST /api/edge/sync/backfill — re-enqueue missing transaction syncs
 //   GET  /api/edge/sync/socket  — socket connection status
 //   GET  /api/edge/update-check — Runtime update status (Host polls this)
 //   GET  /api/edge/drivers      — list all drivers and their health
@@ -2219,6 +2220,116 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const result = retryDeadLetters();
     return jsonResponse({ success: true, ...result });
+  }
+
+  // ── POST /api/edge/sync/backfill — re-enqueue missing transaction syncs ────
+  // Scans all settled orders and re-enqueues transaction sync records that are
+  // missing from sync_queue (dequeued as rejected/conflict, dead-lettered, or
+  // never enqueued). Also handles walk-in transactions.
+  //
+  // Query params:
+  //   ?dry-run=1 — return what would be re-enqueued without making changes
+  if (url.pathname === "/api/edge/sync/backfill" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const dryRun = url.searchParams.get("dry-run") === "1";
+    const db = getDb();
+
+    const settledOrders = db.query(
+      `SELECT id, restaurant_id, paid_at, bill_number
+       FROM order_record
+       WHERE status = 'SETTLED'
+       AND NOT EXISTS (SELECT 1 FROM edge_config WHERE key = 'txn_deleted:' || order_record.id)
+       ORDER BY paid_at DESC`
+    ).all() as any[];
+
+    let enqueued = 0;
+    let skippedQueued = 0;
+    let skippedSynced = 0;
+    let skippedNoSettle = 0;
+    const details: any[] = [];
+
+    for (const order of settledOrders) {
+      const settleRow = db.query(
+        `SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?`
+      ).get(order.id) as { value: string } | null;
+
+      if (!settleRow) {
+        skippedNoSettle++;
+        continue;
+      }
+
+      let settleData: any;
+      try { settleData = JSON.parse(settleRow.value); } catch { skippedNoSettle++; continue; }
+      const localTxnId = settleData.localTxnId;
+      if (!localTxnId) { skippedNoSettle++; continue; }
+
+      const pendingRow = db.query(
+        `SELECT id, synced, attempts FROM sync_queue WHERE table_name = 'transaction' AND record_id = ? ORDER BY id DESC LIMIT 1`
+      ).get(localTxnId) as any;
+
+      if (pendingRow) {
+        if (pendingRow.synced === 1) {
+          const auditRow = db.query(
+            `SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'transaction' ORDER BY audited_at DESC LIMIT 1`
+          ).get(pendingRow.id) as any;
+
+          if (auditRow && ["rejected", "conflict", "duplicate"].includes(auditRow.outcome)) {
+            if (!dryRun) {
+              enqueueSync("transaction", localTxnId, "insert");
+            }
+            enqueued++;
+            details.push({ orderId: order.id, localTxnId, grandTotal: settleData.grandTotal, reason: `was ${auditRow.outcome}` });
+          } else {
+            skippedSynced++;
+          }
+        } else {
+          skippedQueued++;
+        }
+      } else {
+        if (!dryRun) {
+          enqueueSync("transaction", localTxnId, "insert");
+        }
+        enqueued++;
+        details.push({ orderId: order.id, localTxnId, grandTotal: settleData.grandTotal, reason: "missing from queue" });
+      }
+    }
+
+    // Walk-in transactions
+    const walkinRows = db.query(`SELECT key, value FROM edge_config WHERE key LIKE 'walkin_txn:%'`).all() as any[];
+    let walkinEnqueued = 0;
+
+    for (const row of walkinRows) {
+      const localId = row.key.replace("walkin_txn:", "");
+      const pendingRow = db.query(
+        `SELECT id, synced FROM sync_queue WHERE table_name = 'walkin_transaction' AND record_id = ? ORDER BY id DESC LIMIT 1`
+      ).get(localId) as any;
+
+      if (pendingRow) {
+        if (pendingRow.synced === 0) skippedQueued++;
+        else skippedSynced++;
+        continue;
+      }
+
+      if (!dryRun) {
+        enqueueSync("walkin_transaction", localId, "insert");
+      }
+      walkinEnqueued++;
+      details.push({ localTxnId: localId, reason: "walk-in missing from queue" });
+    }
+
+    return jsonResponse({
+      success: true,
+      dryRun,
+      summary: {
+        settledOrdersScanned: settledOrders.length,
+        transactionsReEnqueued: enqueued,
+        walkinReEnqueued: walkinEnqueued,
+        skippedAlreadyQueued: skippedQueued,
+        skippedAlreadySynced: skippedSynced,
+        skippedNoSettleRecord: skippedNoSettle,
+      },
+      details: details.slice(0, 50),
+    });
   }
 
   // ── GET /api/edge/sync/dead-letter — list dead-lettered records ────────────

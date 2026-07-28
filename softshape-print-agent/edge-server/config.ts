@@ -857,6 +857,29 @@ function applyChange(db: any, change: any): boolean {
 
   // Handle delete operations
   if (op === "delete") {
+    // ── Transaction delete (cloud → edge) ──────────────────────────────────
+    // Transactions aren't stored in a SQLite table — they live in edge_config
+    // under settle:* keys. Remove the settle record and mark the order so
+    // listTransactionsEdge excludes it from Past Transactions.
+    if (table === "transaction") {
+      const orderId = row?.orderId;
+      if (!orderId) {
+        runtimeLog.warn("[Config] Transaction delete received with no orderId — skipping");
+        return false;
+      }
+      try {
+        // Remove the settle:* key that matches this orderId
+        db.query("DELETE FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").run(orderId);
+        // Mark the order as txn-deleted so listTransactionsEdge filters it out
+        setConfig(`txn_deleted:${orderId}`, String(Date.now()));
+        console.log(`[Config] Transaction deleted for order ${orderId} — settle record removed, txn_deleted marker set`);
+        return true;
+      } catch (err: any) {
+        runtimeLog.warn("[Config] Transaction delete failed", { orderId, error: err.message });
+        return false;
+      }
+    }
+
     const tableName = TABLE_NAME_MAP[table] || table;
     try {
       db.query(`DELETE FROM ${tableName} WHERE id = ?`).run(row?.id || row);
