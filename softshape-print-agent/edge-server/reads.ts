@@ -296,8 +296,8 @@ function mapTableRow(t: any): any {
     });
   }
 
-  // Get KOTs for this table — filter to parent table orders only (is_extra_table = 0)
-  // Layer 14.1: join order_record to scope KOTs by is_extra_table
+  // Get KOTs for this table — filter to active parent table orders only (is_extra_table = 0)
+  // Layer 14.1: join order_record to scope KOTs by is_extra_table and active status
   const kots = db.query(`
     SELECT k.*, ki.id as ki_id, ki.order_item_id, ki.menu_item_id as ki_menu_item_id,
            ki.name as ki_name, ki.quantity as ki_quantity, ki.price as ki_price,
@@ -305,9 +305,9 @@ function mapTableRow(t: any): any {
     FROM kot k
     LEFT JOIN kot_item ki ON k.id = ki.kot_id
     LEFT JOIN order_record o ON k.order_id = o.id
-    WHERE k.table_id = ? AND (o.is_extra_table = 0 OR o.is_extra_table IS NULL)
+    WHERE k.table_id = ? AND (o.is_extra_table = 0 OR o.is_extra_table IS NULL) AND o.status IN (${ACTIVE_ORDER_STATUSES.map(() => "?").join(",")})
     ORDER BY k.created_at ASC, ki.id ASC
-  `).all(t.id) as any[];
+  `).all(t.id, ...ACTIVE_ORDER_STATUSES) as any[];
 
   // Group KOT items by KOT
   const kotsMap = new Map<string, any>();
