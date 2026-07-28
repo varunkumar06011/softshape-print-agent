@@ -1008,7 +1008,7 @@ function safeParseKotHistory(raw: any): any[] {
 
 export interface UpdateOrderItemsInput {
   orderId: string;
-  tableId: string;
+  tableId?: string;
   items: Array<{
     menuItemId: string;
     name: string;
@@ -1100,8 +1100,21 @@ export async function updateOrderItems(
     return rejectResult;
   }
 
+  // ── Resolve tableId: fall back to order.table_id if not provided ──────────
+  // The frontend may omit tableId or pass the table number instead of the UUID
+  // in edge-local mode. Without this fallback, updateOrderItems would skip
+  // the edge path in orderApi.js and fall through to the cloud backend,
+  // which rejects the edge-local token with "Invalid or expired token".
+  let effectiveTableId = tableId || order.table_id;
+
   // ── Get table + outlet info ────────────────────────────────────────────────
-  const table = getTableWithSection(tableId);
+  let table = getTableWithSection(effectiveTableId);
+  if (!table && tableId && tableId !== order.table_id) {
+    // The provided tableId didn't match any table (e.g. table number passed
+    // instead of UUID). Retry with the order's actual table_id.
+    effectiveTableId = order.table_id;
+    table = getTableWithSection(effectiveTableId);
+  }
   if (!table) {
     const rejectResult = { success: false, error: "Table not found", statusCode: 404 };
     recordCommandResult(restaurantId, input, "updateOrderItems", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
@@ -1198,7 +1211,7 @@ export async function updateOrderItems(
   // default to ENABLED (same as pre-gating behavior).
   const venueKotEnabled = table.kot_enabled !== 0;
   if (!venueKotEnabled) {
-    console.warn(`[updateOrderItems] KOT printing DISABLED for table ${tableId} — venue kot_enabled=${table.kot_enabled}, venue_id=${table.venue_id}`);
+    console.warn(`[updateOrderItems] KOT printing DISABLED for table ${effectiveTableId} — venue kot_enabled=${table.kot_enabled}, venue_id=${table.venue_id}`);
   }
   const printGroups = venueKotEnabled ? buildKotPrintGroups(mappedItems, kotOrderData, table, printerConfig) : [];
   // CRITICAL: When localPrinted=true, printIntents is empty — no print jobs
@@ -1226,7 +1239,7 @@ export async function updateOrderItems(
     // 2. Create new KOT for the new items
     db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, created_at, cloud_synced)
       VALUES (?, ?, ?, ?, ?, ?, 0)
-    `).run(kotId, restaurantId, tableId, orderId, kotNumber, now);
+    `).run(kotId, restaurantId, effectiveTableId, orderId, kotNumber, now);
 
     // 3. Create KOT items for just the new items (using resolved prices)
     for (let i = 0; i < resolvedItems.length; i++) {
@@ -1245,9 +1258,9 @@ export async function updateOrderItems(
     // 5. Update table current_bill + increment table revision (skip for extra tables)
     let newTableRev: number | undefined;
     if (!input.isExtraTable) {
-      newTableRev = nextTableRevision(tableId);
+      newTableRev = nextTableRevision(effectiveTableId);
       db.query(`UPDATE "table" SET current_bill = current_bill + ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
-        .run(additionalAmount, newTableRev, requestId || null, now, tableId);
+        .run(additionalAmount, newTableRev, requestId || null, now, effectiveTableId);
 
       // 6. Update KOT history on table (safe parse — corrupted JSON should not crash the transaction)
       let currentHistory: any[] = [];
@@ -1259,21 +1272,21 @@ export async function updateOrderItems(
       }
       const kotEntry = buildKotHistoryEntry(kotNumber, resolvedItems.map((i, idx) => ({ ...i, orderItemId: newOrderItemIds[idx] })));
       currentHistory.push(kotEntry);
-      db.query(`UPDATE "table" SET kot_history = ? WHERE id = ?`).run(JSON.stringify(currentHistory), tableId);
+      db.query(`UPDATE "table" SET kot_history = ? WHERE id = ?`).run(JSON.stringify(currentHistory), effectiveTableId);
     }
 
     // 7. Enqueue sync records
     enqueueSync("order", orderId, "update");
     enqueueSync("kot", kotId, "insert");
     if (!input.isExtraTable) {
-      enqueueSync("table", tableId, "update");
+      enqueueSync("table", effectiveTableId, "update");
     }
     for (const oiId of newOrderItemIds) {
       enqueueSync("order_item", oiId, "insert");
     }
 
     // 8. Persist print intents in the same transaction (atomicity guarantee)
-    persistPrintIntentsInTx(printIntents, restaurantId, orderId, kotId, kotNumber, tableId, captainName);
+    persistPrintIntentsInTx(printIntents, restaurantId, orderId, kotId, kotNumber, effectiveTableId, captainName);
 
     return { newOrderRev, newTableRev };
   });
@@ -1297,16 +1310,16 @@ export async function updateOrderItems(
   const printResults = localPrinted ? [] : await Promise.all(dispatchPrintIntents(printIntents, requestId));
 
   // ── Broadcast to LAN clients (Bug 2 fix) ────────────────────────────────────
-  lanBroadcast("order:updated", { orderId, tableId, kotNumber, requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: requestId, isExtraTable: !!input.isExtraTable });
+  lanBroadcast("order:updated", { orderId, tableId: effectiveTableId, kotNumber, requestId, revision: newOrderRev, tableRevision: newTableRev, commandId: requestId, isExtraTable: !!input.isExtraTable });
   if (!input.isExtraTable) {
-    lanBroadcast("table:updated", { table: { id: tableId, revision: newTableRev }, tableId, requestId, tableRevision: newTableRev, commandId: requestId });
+    lanBroadcast("table:updated", { table: { id: effectiveTableId, revision: newTableRev }, tableId: effectiveTableId, requestId, tableRevision: newTableRev, commandId: requestId });
   }
 
   // ── Return result ──────────────────────────────────────────────────────────
   const updatedTable = db.query(`
     SELECT t.*, s.name as section_name
     FROM "table" t LEFT JOIN section s ON t.section_id = s.id WHERE t.id = ?
-  `).get(tableId) as any;
+  `).get(effectiveTableId) as any;
 
   const orderItems = db.query("SELECT * FROM order_item WHERE order_id = ?").all(orderId) as any[];
   const updatedOrder = db.query("SELECT * FROM order_record WHERE id = ?").get(orderId) as any;
@@ -1320,7 +1333,7 @@ export async function updateOrderItems(
     tableRevision: newTableRev,
     order: {
       id: orderId,
-      tableId,
+      tableId: effectiveTableId,
       status: updatedOrder.status,
       totalAmount: Number(updatedOrder.total_amount),
       items: orderItems,
