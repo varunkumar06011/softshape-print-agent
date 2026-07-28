@@ -527,6 +527,8 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
         pushedAt: new Date().toISOString(),
         batch: payload,
       }),
+      connectTimeout: 60_000,
+      bodyTimeout: 120_000,
     });
 
     if (!res.ok) {
