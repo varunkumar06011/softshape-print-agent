@@ -939,8 +939,15 @@ export async function createOrder(
     const txResult = tx();
     newTableRev = (txResult as any)?.newTableRev ?? 1;
   } catch (err: any) {
-    // UNIQUE constraint violation on last_request_id — duplicate request
+    // UNIQUE constraint violation — could be kot.UNIQUE(restaurant_id, kot_number) or order_record.UNIQUE(last_request_id)
     if (err.message && err.message.includes("UNIQUE")) {
+      const isKotConstraint = err.message.includes("kot") || err.message.includes("kot_number");
+      const constraintName = isKotConstraint ? "kot.UNIQUE(restaurant_id, kot_number)" : "order_record.UNIQUE(last_request_id)";
+      console.error(`[createOrder] UNIQUE constraint violation: ${constraintName}`, {
+        tableId,
+        requestId,
+        error: err.message,
+      });
       const rejectResult: CreateOrderResult = { success: false, error: "Duplicate request — order already exists", statusCode: 409 };
       recordCommandResult(restaurantId, input, "createOrder", "table", tableId, "rejected", rejectResult, null, rejectResult.error);
       return rejectResult;
@@ -1298,6 +1305,14 @@ export async function updateOrderItems(
     newTableRev = (txResult as any)?.newTableRev ?? 1;
   } catch (err: any) {
     if (err.message && err.message.includes("UNIQUE")) {
+      const isKotConstraint = err.message.includes("kot") || err.message.includes("kot_number");
+      const constraintName = isKotConstraint ? "kot.UNIQUE(restaurant_id, kot_number)" : "order_record.UNIQUE(last_request_id)";
+      console.error(`[updateOrderItems] UNIQUE constraint violation: ${constraintName}`, {
+        orderId,
+        requestId,
+        kotNumber,
+        error: err.message,
+      });
       const rejectResult: UpdateOrderItemsResult = { success: false, error: "Duplicate request — order already updated", statusCode: 409 };
       recordCommandResult(restaurantId, input, "updateOrderItems", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
       return rejectResult;

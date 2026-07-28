@@ -1,12 +1,12 @@
 {
   "name": "softshape-edge-server",
-  "version": "23.7.4",
+  "version": "23.7.5",
   "description": "Local edge server for SoftShape POS — handles order creation, KOT printing, and table management on the restaurant LAN",
   "type": "module",
   "scripts": {
     "dev": "bun run --watch server.ts",
     "start": "bun run server.ts",
-    "build": "bun build --compile server.ts --outfile edge-server.exe"
+    "build": "bun build --compile server.ts --outfile edge-server.exe --target=bun-windows-x64-baseline"
   },
   "dependencies": {
     "@softshape/output": "file:../../../packages/output",

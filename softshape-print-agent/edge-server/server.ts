@@ -404,7 +404,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       const healthResp = {
         status: rmHealth.status,
         service: "softshape-edge-server",
-        version: "23.7.4",
+        version: "23.7.5",
         uptime: process.uptime(),
         runtimeState: rmHealth.runtimeState,
         configSyncState: rmHealth.configSyncState,
@@ -465,7 +465,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const healthResp = {
       status: "ok",
       service: "softshape-edge-server",
-      version: "23.7.4",
+      version: "23.7.5",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
@@ -2130,6 +2130,19 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     });
   }
 
+  // ── GET /api/edge/runtime-token — exchange edge API key for runtime token ──
+  // Allows captains that logged in via cloud (and thus never obtained a runtime
+  // token from PIN login) to fetch one using their edge API key. The edge API
+  // key check (PUBLIC_LAN_PATHS gate above) already enforced authentication;
+  // this endpoint is in PUBLIC_PATHS so the runtime token check is skipped.
+  if (url.pathname === "/api/edge/runtime-token" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    return jsonResponse({
+      success: true,
+      runtimeToken: getOrCreateRuntimeToken(),
+    });
+  }
+
   // ── GET /api/edge/sync/status — sync worker status ────────────────────────
   if (url.pathname === "/api/edge/sync/status" && req.method === "GET") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
@@ -2298,7 +2311,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   // returns the download URL if an update exists. The Host handles the
   // download, binary swap, and restart.
   if (url.pathname === "/api/edge/update-check" && req.method === "GET") {
-    const currentVersion = "23.7.4";
+    const currentVersion = "23.7.5";
     const backendUrl = getBackendUrl();
     const sessionToken = getSessionToken();
 

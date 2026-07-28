@@ -1023,6 +1023,17 @@ export function getNextKotNumber(restaurantId: string): number {
   db.query("INSERT INTO daily_counter (id, restaurant_id, counter_date, kot_count) VALUES (?, ?, ?, 0) ON CONFLICT(restaurant_id, counter_date) DO NOTHING")
     .run(crypto.randomUUID(), restaurantId, today);
 
+  // Sync: ensure daily counter is at least as high as the global max kot_number.
+  // The kot table has UNIQUE(restaurant_id, kot_number) which is NOT scoped per day,
+  // but daily_counter resets each morning. Without this sync, today's counter
+  // could generate a number that collides with a KOT from a previous day.
+  const maxRow = db.query("SELECT MAX(kot_number) AS max_kot FROM kot WHERE restaurant_id = ?").get(restaurantId) as { max_kot: number | null } | undefined;
+  const globalMax = maxRow?.max_kot ?? 0;
+  if (globalMax > 0) {
+    db.query("UPDATE daily_counter SET kot_count = MAX(kot_count, ?) WHERE restaurant_id = ? AND counter_date = ?")
+      .run(globalMax, restaurantId, today);
+  }
+
   // Atomically increment kot_count and return the new value
   const row = db.query("UPDATE daily_counter SET kot_count = kot_count + 1 WHERE restaurant_id = ? AND counter_date = ? RETURNING kot_count")
     .get(restaurantId, today) as { kot_count: number };

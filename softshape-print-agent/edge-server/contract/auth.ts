@@ -107,4 +107,5 @@ export const PUBLIC_PATHS = new Set<string>([
   "/api/edge/register",
   "/api/edge/auth/pin",
   "/api/edge/staff",
+  "/api/edge/runtime-token",
 ]);
