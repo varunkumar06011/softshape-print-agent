@@ -471,18 +471,24 @@ export function getMenu(venueId?: string): any[] {
     ORDER BY sort_order ASC, name ASC
   `).all(restaurantId) as any[];
 
-  // Get venue price map if venueId is provided
+  // Get venue price map from PriceProfile (same source as buildEdgePriceMap in orderService.ts)
   let venuePriceMap: Map<string, number> = new Map();
   if (venueId) {
-    const venuePrices = db.query("SELECT menu_item_id, price FROM venue_price WHERE venue_id = ? AND is_active = 1").all(venueId) as any[];
-    for (const vp of venuePrices) {
-      venuePriceMap.set(vp.menu_item_id, Number(vp.price));
+    const venue = db.query("SELECT price_profile_id FROM venue WHERE id = ?").get(venueId) as any;
+    if (venue?.price_profile_id) {
+      const profileItems = db.query("SELECT menu_item_id, price FROM price_profile_item WHERE price_profile_id = ?").all(venue.price_profile_id) as any[];
+      for (const pi of profileItems) {
+        venuePriceMap.set(pi.menu_item_id, Number(pi.price));
+      }
     }
   }
 
   // Get all venue prices grouped by item (for client-side resolution)
   const allVenuePrices = db.query(`
-    SELECT venue_id, menu_item_id, price FROM venue_price WHERE is_active = 1 AND restaurant_id = ?
+    SELECT v.id as venue_id, ppi.menu_item_id, ppi.price
+    FROM venue v
+    JOIN price_profile_item ppi ON v.price_profile_id = ppi.price_profile_id
+    WHERE v.is_deleted = 0 AND v.restaurant_id = ?
   `).all(restaurantId) as any[];
 
   const allVenuePricesByItem: Record<string, Record<string, number>> = {};
@@ -577,17 +583,24 @@ export function getMenuItems(venueId?: string): any[] {
 
   const db = getDb();
 
+  // Get venue price map from PriceProfile (same source as buildEdgePriceMap in orderService.ts)
   let venuePriceMap: Map<string, number> = new Map();
   if (venueId) {
-    const venuePrices = db.query("SELECT menu_item_id, price FROM venue_price WHERE venue_id = ? AND is_active = 1").all(venueId) as any[];
-    for (const vp of venuePrices) {
-      venuePriceMap.set(vp.menu_item_id, Number(vp.price));
+    const venue = db.query("SELECT price_profile_id FROM venue WHERE id = ?").get(venueId) as any;
+    if (venue?.price_profile_id) {
+      const profileItems = db.query("SELECT menu_item_id, price FROM price_profile_item WHERE price_profile_id = ?").all(venue.price_profile_id) as any[];
+      for (const pi of profileItems) {
+        venuePriceMap.set(pi.menu_item_id, Number(pi.price));
+      }
     }
   }
 
   // Build all venue prices by item (for client-side venue price resolution)
   const allVenuePrices = db.query(`
-    SELECT venue_id, menu_item_id, price FROM venue_price WHERE is_active = 1 AND restaurant_id = ?
+    SELECT v.id as venue_id, ppi.menu_item_id, ppi.price
+    FROM venue v
+    JOIN price_profile_item ppi ON v.price_profile_id = ppi.price_profile_id
+    WHERE v.is_deleted = 0 AND v.restaurant_id = ?
   `).all(restaurantId) as any[];
   const allVenuePricesByItem: Record<string, Record<string, number>> = {};
   for (const vp of allVenuePrices) {
