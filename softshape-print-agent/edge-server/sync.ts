@@ -555,14 +555,14 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
 
     // Handle rejected records based on their outcome:
     // - "error": transient failure — increment attempts for retry
-    // - "rejected"/"conflict": permanent — write audit row, then dequeue
+    // - "rejected"/"conflict"/"duplicate": permanent — write audit row, then dequeue
     //   (the cloud has seen this record and decided not to apply it)
     // - missing outcome: treat as error for backward compatibility
     const retryIds: number[] = [];
     const dequeueIds: number[] = [];
     if (result.rejected && result.rejected.length > 0) {
       for (const rej of result.rejected) {
-        if (rej.outcome === "rejected" || rej.outcome === "conflict") {
+        if (rej.outcome === "rejected" || rej.outcome === "conflict" || rej.outcome === "duplicate") {
           dequeueIds.push(rej.queueId);
           // Persist audit record before dequeuing
           const item = payloadMap.get(rej.queueId);
