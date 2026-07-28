@@ -37,10 +37,18 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
+      - name: Setup Bun (baseline — SSE4.2, no AVX2)
+        shell: bash
+        run: |
+          # Download the baseline Bun binary directly instead of using setup-bun.
+          # When you compile with --target=bun-windows-x64-baseline, Bun tries to
+          # download the baseline runtime at build time — this download fails on
+          # some Bun versions (1.3.14).  By installing the baseline Bun binary
+          # itself, bun build --compile embeds the baseline runtime automatically
+          # and no separate download is needed.
+          curl -sL https://github.com/oven-sh/bun/releases/download/bun-v1.2.19/bun-windows-x64-baseline.zip -o bun-baseline.zip
+          unzip -o bun-baseline.zip -d "$RUNNER_TEMP/bun-baseline"
+          echo "$RUNNER_TEMP/bun-baseline" >> "$GITHUB_PATH"
 
       - name: Install dependencies
         run: npm ci --legacy-peer-deps
@@ -104,7 +112,7 @@ jobs:
           # which we rewrote in the previous step. Fresh resolution is required.
           rm -f bun.lock package-lock.json
           bun install
-          bun build --compile server.ts --outfile edge-server.exe --target=bun-windows-x64-baseline
+          bun build --compile server.ts --outfile edge-server.exe
 
       - name: Verify edge-server.exe
         working-directory: softshape-print-agent/edge-server
