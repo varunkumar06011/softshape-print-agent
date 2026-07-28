@@ -633,8 +633,14 @@ async function runSyncCycle(): Promise<void> {
   }
 
   syncRunning = true;
+  let skipBackoff = false;
   try {
     const result = await pushSyncBatch();
+
+    // Label exhausted records (attempts >= MAX_ATTEMPTS) with DEAD_LETTER prefix
+    // so the recovery UI can surface them. This must run every cycle to catch
+    // records that just crossed the attempt threshold.
+    deadLetterExhausted();
 
     // Checkpoint WAL to keep the -wal file small and reads fast.
     // Without this, the WAL grows throughout a shift and every query
@@ -647,9 +653,16 @@ async function runSyncCycle(): Promise<void> {
 
     if (result.ok) {
       consecutiveFailures = 0;
-    } else {
+    } else if (result.pushed > 0) {
+      // Record-level failure — back off to avoid hammering the cloud.
       consecutiveFailures++;
       console.warn(`[Sync] Push failed (${consecutiveFailures} consecutive) — backing off for ${getBackoffDelay()}ms`);
+    } else {
+      // Session/network issue with no records pushed — don't back off.
+      // Retry at the normal interval so we recover instantly when the
+      // underlying issue (expired token, network outage, cloud restart) resolves.
+      skipBackoff = true;
+      console.warn(`[Sync] Push skipped (${result.error}) — retrying at normal interval`);
     }
 
     // Periodically pull config changes from cloud (printer config, menu updates, etc.)
@@ -673,7 +686,7 @@ async function runSyncCycle(): Promise<void> {
     syncRunning = false;
   }
 
-  scheduleNextCycle(getBackoffDelay());
+  scheduleNextCycle(skipBackoff ? SYNC_INTERVAL_MS : getBackoffDelay());
 }
 
 function scheduleNextCycle(delay: number): void {

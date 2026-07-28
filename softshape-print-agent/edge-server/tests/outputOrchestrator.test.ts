@@ -153,23 +153,41 @@ test("processOutputIntent handles PRINT_LIQUOR_KOT intent", async () => {
 test("processOutputIntent produces multiple jobs for mixed food+liquor KOT (R3)", async () => {
   const { processOutputIntent } = await import("../outputOrchestrator.ts");
 
-  let callCount = 0;
   mockResolvePrinterName.mockImplementation((_, target) => {
-    callCount++;
     if (target === "BAR_PRINTER") return "BarPrinter";
     return "KitchenPrinter";
   });
   mockCreatePrintJob.mockImplementation(() => 99);
 
-  const intent: OutputIntent = {
+  // The planner filters items by intent type: PRINT_KOT processes only food,
+  // PRINT_LIQUOR_KOT processes only liquor. orderService sends separate
+  // intents for kitchen and bar — mirror that here.
+  const foodIntent: OutputIntent = {
     type: "OUTPUT",
-    intentId: "test-intent-multi-r3",
+    intentId: "test-intent-kitchen-r3",
     intent: "PRINT_KOT",
     payload: {
       tableNumber: "T10",
       orderId: "ord-multi-r3",
       items: [
         { name: "Biryani", quantity: 2, price: 220, menuType: "FOOD", printerTarget: "KOT_PRINTER" },
+      ],
+      kotId: "10",
+      sectionName: "Main Hall",
+      captainName: "Captain Multi",
+      requestId: "req-multi-r3",
+    },
+    priority: "CRITICAL",
+  };
+
+  const liquorIntent: OutputIntent = {
+    type: "OUTPUT",
+    intentId: "test-intent-bar-r3",
+    intent: "PRINT_LIQUOR_KOT",
+    payload: {
+      tableNumber: "T10",
+      orderId: "ord-multi-r3",
+      items: [
         { name: "Beer", quantity: 1, price: 180, menuType: "LIQUOR", printerTarget: "BAR_PRINTER" },
       ],
       kotId: "10",
@@ -180,12 +198,15 @@ test("processOutputIntent produces multiple jobs for mixed food+liquor KOT (R3)"
     priority: "CRITICAL",
   };
 
-  const result = await processOutputIntent(intent, "test-restaurant-id", "ord-multi-r3");
+  const foodResult = await processOutputIntent(foodIntent, "test-restaurant-id", "ord-multi-r3");
+  const liquorResult = await processOutputIntent(liquorIntent, "test-restaurant-id", "ord-multi-r3");
 
-  // Should produce 2 jobs: kitchen + bar
-  expect(result.jobs.length).toBeGreaterThanOrEqual(2);
-  expect(result.jobs.every(j => j.ok)).toBe(true);
-  expect(mockCreatePrintJob).toHaveBeenCalledTimes(result.jobs.length);
-  expect(mockAwaitDispatchBounded).toHaveBeenCalledTimes(result.jobs.length);
-  expect(mockEmitEvent).toHaveBeenCalledTimes(result.jobs.length);
+  // Each intent produces 1 job — 2 total across kitchen + bar
+  expect(foodResult.jobs).toHaveLength(1);
+  expect(liquorResult.jobs).toHaveLength(1);
+  expect(foodResult.jobs[0].ok).toBe(true);
+  expect(liquorResult.jobs[0].ok).toBe(true);
+  expect(mockCreatePrintJob).toHaveBeenCalledTimes(2);
+  expect(mockAwaitDispatchBounded).toHaveBeenCalledTimes(2);
+  expect(mockEmitEvent).toHaveBeenCalledTimes(2);
 });

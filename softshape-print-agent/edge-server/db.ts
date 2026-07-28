@@ -848,6 +848,12 @@ export function setSyncState(key: string, value: string): void {
 
 export function enqueueSync(tableName: string, recordId: string, operation: string): void {
   const db = getDb();
+  // Dedup: remove any existing pending entry for the same record so the queue
+  // holds only the latest operation per (table_name, record_id). Without this,
+  // repeated updates to the same table/order create one queue row per operation,
+  // causing the queue to grow linearly with POS activity instead of unique records.
+  db.query("DELETE FROM sync_queue WHERE table_name = ? AND record_id = ? AND synced = 0")
+    .run(tableName, recordId);
   db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)")
     .run(tableName, recordId, operation, Date.now());
 }

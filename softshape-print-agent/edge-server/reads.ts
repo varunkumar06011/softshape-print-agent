@@ -342,7 +342,7 @@ function mapTableRow(t: any): any {
     id: t.id,
     number: t.number,
     capacity: t.capacity,
-    status: orders.length > 0 ? "OCCUPIED" : t.status,
+    status: (t.status === 'AVAILABLE' || t.workflow_status === 'Free') ? 'AVAILABLE' : (orders.length > 0 ? "OCCUPIED" : t.status),
     sectionId: t.section_id,
     restaurantId: t.restaurant_id,
     workflowStatus: t.workflow_status,
