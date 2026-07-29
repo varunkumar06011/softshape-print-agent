@@ -23,6 +23,7 @@ import { getDb, insertSyncAudit } from "./db.ts";
 import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid, getDeviceId, saveSession, loadSession } from "./auth.ts";
 import { cloudFetch } from "./cloudFetch.ts";
 import { pullIncrementalChanges } from "./config.ts";
+import { startSocketSync } from "./socketSync.ts";
 
 const SYNC_INTERVAL_MS = parseInt(process.env.EDGE_SYNC_INTERVAL_MS || "10000", 10);
 const CONFIG_PULL_INTERVAL_MS = parseInt(process.env.EDGE_CONFIG_PULL_INTERVAL_MS || "60000", 10);
@@ -392,13 +393,114 @@ function deadLetterExhausted(): void {
 // ─── Main sync push ──────────────────────────────────────────────────────────
 
 let _cloudRegistrationAttempted = false;
+let _lastRefreshAttemptAt = 0;
+const REFRESH_COOLDOWN_MS = 60_000; // don't retry refresh more than once per minute
+
+// ─── Refresh an expired (or near-expiry) agent JWT ────────────────────────────
+// Calls POST /api/edge/refresh-session with the current (possibly expired)
+// token in the Authorization header. The cloud verifies the signature
+// (ignoring expiry) and issues a fresh 30-day token.
+// Returns true if the session was refreshed.
+async function refreshCloudSession(): Promise<boolean> {
+  const session = loadSession();
+  if (!session || !session.sessionToken) return false;
+
+  // Local onboarding tokens can't be refreshed — they need register-offline
+  if (session.sessionToken.startsWith("local-onboard-")) return false;
+
+  const now = Date.now();
+  if (now - _lastRefreshAttemptAt < REFRESH_COOLDOWN_MS) return false;
+  _lastRefreshAttemptAt = now;
+
+  const backendUrl = getBackendUrl();
+  if (!backendUrl) return false;
+
+  console.log("[Sync] Attempting cloud session refresh...");
+  try {
+    const res = await cloudFetch(`${backendUrl}/api/edge/refresh-session`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.sessionToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ deviceId: getDeviceId() }),
+      connectTimeout: 15_000,
+      bodyTimeout: 30_000,
+    });
+
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      console.warn(`[Sync] Session refresh failed: HTTP ${res.status} — ${errBody.error || ""}`);
+      return false;
+    }
+
+    const data = await res.json() as {
+      sessionToken: string;
+      restaurantName?: string;
+      restaurantCode?: string;
+      expiresAt?: number;
+    };
+
+    saveSession({
+      ...session,
+      sessionToken: data.sessionToken,
+      restaurantName: data.restaurantName || session.restaurantName,
+      restaurantCode: data.restaurantCode || session.restaurantCode,
+      expiresAt: data.expiresAt || (Date.now() + 30 * 24 * 60 * 60 * 1000),
+    });
+
+    console.log("[Sync] Session refreshed successfully — new JWT saved");
+
+    // Start socket sync if it wasn't running (e.g. edge booted with expired session)
+    try {
+      startSocketSync();
+    } catch (err: any) {
+      console.warn("[Sync] Socket sync start failed after refresh:", err.message || err);
+    }
+
+    // Reset dead-lettered records — they failed due to expired token, not data issues.
+    // With a fresh JWT they should succeed on the next sync cycle.
+    try {
+      const db = getDb();
+      const resetResult = db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL WHERE synced = 0 AND attempts >= ?").run(MAX_ATTEMPTS);
+      if (resetResult.changes && resetResult.changes > 0) {
+        console.log(`[Sync] Reset ${resetResult.changes} dead-lettered records after session refresh`);
+      }
+    } catch (err: any) {
+      console.warn("[Sync] Dead-letter reset failed after refresh:", err.message || err);
+    }
+
+    return true;
+  } catch (err: any) {
+    console.warn("[Sync] Session refresh error:", err.message || err);
+    return false;
+  }
+}
+
+// Check if a JWT will expire within the given threshold (default 24h).
+// Returns true for tokens that are already expired OR will expire soon.
+function isJwtExpiringSoon(expiresAt: number, thresholdMs: number = 24 * 60 * 60 * 1000): boolean {
+  if (!expiresAt) return false; // no expiry set — assume valid
+  return Date.now() + thresholdMs > expiresAt;
+}
 
 async function ensureCloudSession(): Promise<boolean> {
   const session = loadSession();
   if (!session) return false;
 
-  // If the token is a real JWT (not a local onboarding token), we're fine
-  if (!session.sessionToken.startsWith("local-onboard-")) return true;
+  // If the token is a real JWT (not a local onboarding token), check expiry.
+  // If it's expired or expiring within 24h, proactively refresh it.
+  if (!session.sessionToken.startsWith("local-onboard-")) {
+    if (isJwtExpiringSoon(session.expiresAt)) {
+      const refreshed = await refreshCloudSession();
+      if (!refreshed) {
+        // Refresh failed — if the session is actually expired, we can't push.
+        // If it's just near-expiry (still valid), proceed with the current token.
+        if (!isSessionValid()) return false;
+      }
+    }
+    return true;
+  }
 
   // Already tried and failed — don't retry every cycle, just on startup
   if (_cloudRegistrationAttempted) return false;
@@ -513,6 +615,10 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
     return lastSyncResult;
   }
 
+  // Build lookup from queueId → payload item for audit logging
+  // (defined here so it's in scope for both the 401 retry path and the normal path)
+  const payloadMap = new Map(payload.map((p) => [p.queueId, p]));
+
   try {
     const res = await cloudFetch(`${backendUrl}/api/edge/sync`, {
       method: "POST",
@@ -532,6 +638,75 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
     });
 
     if (!res.ok) {
+      // ── 401: Token expired — attempt refresh and retry once ──────────────
+      if (res.status === 401) {
+        console.warn("[Sync] Push got 401 — attempting session refresh...");
+        const refreshed = await refreshCloudSession();
+        if (refreshed) {
+          // Retry the push with the new token
+          const newToken = getSessionToken();
+          const retryRes = await cloudFetch(`${backendUrl}/api/edge/sync`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${newToken}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              restaurantId,
+              deviceId: getDeviceId(),
+              schemaVersion: SYNC_SCHEMA_VERSION,
+              pushedAt: new Date().toISOString(),
+              batch: payload,
+            }),
+            connectTimeout: 60_000,
+            bodyTimeout: 120_000,
+          });
+
+          if (retryRes.ok) {
+            const retryResult = await retryRes.json() as {
+              accepted: number[];
+              rejected: Array<{ queueId: number; error: string; outcome?: string }>;
+            };
+            markSynced(retryResult.accepted);
+            const retryDequeueIds: number[] = [];
+            if (retryResult.rejected && retryResult.rejected.length > 0) {
+              for (const rej of retryResult.rejected) {
+                if (rej.outcome === "rejected" || rej.outcome === "conflict" || rej.outcome === "duplicate") {
+                  retryDequeueIds.push(rej.queueId);
+                  const item = payloadMap.get(rej.queueId);
+                  if (item) insertSyncAudit(rej.queueId, item.tableName, item.recordId, item.operation, rej.outcome, rej.error);
+                } else {
+                  incrementAttempts([rej.queueId], rej.error);
+                }
+              }
+              if (retryDequeueIds.length > 0) markSynced(retryDequeueIds);
+            }
+            lastSyncAt = Date.now();
+            lastSyncResult = {
+              ok: true,
+              pushed: payload.length,
+              accepted: retryResult.accepted.length + retryDequeueIds.length,
+              rejected: (retryResult.rejected || []).length - retryDequeueIds.length,
+            };
+            console.log(`[Sync] Push succeeded after token refresh — ${retryResult.accepted.length} accepted`);
+            return lastSyncResult;
+          }
+          // Retry also failed — fall through to error handling
+          const retryErrBody = await retryRes.json().catch(() => ({}));
+          const retryErrorMsg = retryErrBody.error || `HTTP ${retryRes.status}`;
+          incrementAttempts(batch.map((b) => b.id), retryErrorMsg);
+          lastSyncAt = Date.now();
+          lastSyncResult = { ok: false, pushed: payload.length, accepted: 0, rejected: payload.length, error: retryErrorMsg };
+          console.error(`[Sync] Push failed after refresh: ${retryErrorMsg}`);
+          return lastSyncResult;
+        }
+        // Refresh failed — don't increment attempts on the records (not their fault)
+        lastSyncAt = Date.now();
+        lastSyncResult = { ok: false, pushed: 0, accepted: 0, rejected: 0, error: "Session expired and refresh failed" };
+        console.error("[Sync] Session expired — refresh failed. Manual re-registration required.");
+        return lastSyncResult;
+      }
+
       const errBody = await res.json().catch(() => ({}));
       const errorMsg = errBody.error || `HTTP ${res.status}`;
       // All records in batch failed — increment attempts
@@ -549,9 +724,6 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
 
     // Mark accepted records as synced (dequeued)
     markSynced(result.accepted);
-
-    // Build lookup from queueId → payload item for audit logging
-    const payloadMap = new Map(payload.map((p) => [p.queueId, p]));
 
     // Handle rejected records based on their outcome:
     // - "error": transient failure — increment attempts for retry
@@ -621,13 +793,20 @@ let _sessionInvalidLoggedAt = 0;
 
 async function runSyncCycle(): Promise<void> {
   if (!isSessionValid()) {
-    const now = Date.now();
-    if (now - _sessionInvalidLoggedAt > 60_000) {
-      _sessionInvalidLoggedAt = now;
-      console.warn("[Sync] Session invalid or expired — sync worker skipping. Re-register via POST /api/edge/register");
+    // Session is invalid or expired — attempt a refresh before giving up.
+    // This handles the case where the JWT expired between sync cycles.
+    const refreshed = await refreshCloudSession();
+    if (!refreshed) {
+      const now = Date.now();
+      if (now - _sessionInvalidLoggedAt > 60_000) {
+        _sessionInvalidLoggedAt = now;
+        console.warn("[Sync] Session invalid or expired — refresh failed. Re-register via POST /api/edge/register");
+      }
+      scheduleNextCycle(SYNC_INTERVAL_MS);
+      return;
     }
-    scheduleNextCycle(SYNC_INTERVAL_MS);
-    return;
+    // Refresh succeeded — fall through to normal sync cycle
+    console.log("[Sync] Session refreshed — continuing with sync cycle");
   }
   if (syncRunning) {
     scheduleNextCycle(SYNC_INTERVAL_MS);

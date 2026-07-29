@@ -52,9 +52,9 @@ function checkCommandIdempotency<T>(
       return { replay: false };
     }
   }
-  if (entry.status === "rejected" || entry.status === "failed") {
-    return { replay: true, result: { success: false, error: entry.error_message || "Command previously rejected" } as any };
-  }
+  // Rejected/failed commands are NOT replayed — the transaction was rolled back
+  // (nothing was written), so retrying with the same requestId is safe and
+  // should be allowed to re-attempt the operation.
   return { replay: false };
 }
 
@@ -807,7 +807,7 @@ export async function createOrder(
   // ── Generate IDs ───────────────────────────────────────────────────────────
   const orderId = crypto.randomUUID();
   const kotId = crypto.randomUUID();
-  const kotNumber = preReservedKotNumber != null ? preReservedKotNumber : getNextKotNumber(restaurantId);
+  const kotNumber = typeof preReservedKotNumber === 'number' && preReservedKotNumber > 0 ? preReservedKotNumber : getNextKotNumber(restaurantId);
 
   // ── Build print groups BEFORE transaction (pure computation) ───────────────
   // Print intents are persisted inside the transaction to guarantee atomicity.
@@ -1172,7 +1172,7 @@ export async function updateOrderItems(
 
   // ── Generate new KOT for just the new items ─────────────────────────────────
   const kotId = crypto.randomUUID();
-  const kotNumber = preReservedKotNumber != null ? preReservedKotNumber : getNextKotNumber(restaurantId);
+  const kotNumber = typeof preReservedKotNumber === 'number' && preReservedKotNumber > 0 ? preReservedKotNumber : getNextKotNumber(restaurantId);
 
   // ── Build print groups BEFORE transaction (pure computation) ───────────────
   const formattedTableNumber = input.isExtraTable && input.tableNumber
@@ -2889,7 +2889,8 @@ export async function listTransactionsEdge(
     FROM order_record o
     LEFT JOIN "table" t ON o.table_id = t.id
     LEFT JOIN section s ON t.section_id = s.id
-    WHERE o.restaurant_id = ? AND o.status = 'SETTLED'`;
+    WHERE o.restaurant_id = ? AND o.status = 'SETTLED'
+    AND NOT EXISTS (SELECT 1 FROM edge_config WHERE key = 'txn_deleted:' || o.id)`;
   const orderParams: any[] = [restaurantId];
 
   if (opts.date) {
@@ -3087,7 +3088,8 @@ export async function listItemsSoldEdge(
   let orderQuery = `SELECT o.id, o.paid_at, o.bill_number, t.number as table_number, t.section_id, t.section_tag
     FROM order_record o
     LEFT JOIN "table" t ON o.table_id = t.id
-    WHERE o.restaurant_id = ? AND o.status = 'SETTLED' AND o.paid_at >= ? AND o.paid_at <= ?`;
+    WHERE o.restaurant_id = ? AND o.status = 'SETTLED' AND o.paid_at >= ? AND o.paid_at <= ?
+    AND NOT EXISTS (SELECT 1 FROM edge_config WHERE key = 'txn_deleted:' || o.id)`;
   const orderParams: any[] = [restaurantId, dayStart, dayEnd];
 
   if (sectionTableIds.length > 0) {

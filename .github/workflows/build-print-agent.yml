@@ -37,10 +37,16 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
+      - name: Setup Bun (baseline — SSE4.2, no AVX2)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          Invoke-WebRequest -Uri "https://github.com/oven-sh/bun/releases/download/bun-v1.2.19/bun-windows-x64-baseline.zip" -OutFile "bun-baseline.zip"
+          Expand-Archive -Path "bun-baseline.zip" -DestinationPath "C:\bun-baseline" -Force
+          $bunExe = Get-ChildItem -Path "C:\bun-baseline" -Filter "bun.exe" -Recurse | Select-Object -First 1
+          if (-not $bunExe) { Write-Error "bun.exe not found after extraction"; exit 1 }
+          Write-Host "Found bun.exe at: $($bunExe.FullName)"
+          Add-Content -Path $env:GITHUB_PATH -Value $bunExe.DirectoryName
 
       - name: Install dependencies
         run: npm ci --legacy-peer-deps
@@ -104,7 +110,7 @@ jobs:
           # which we rewrote in the previous step. Fresh resolution is required.
           rm -f bun.lock package-lock.json
           bun install
-          bun build --compile server.ts --outfile edge-server.exe --target=bun-windows-x64-baseline
+          bun build --compile server.ts --outfile edge-server.exe
 
       - name: Verify edge-server.exe
         working-directory: softshape-print-agent/edge-server

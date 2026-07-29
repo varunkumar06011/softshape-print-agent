@@ -265,24 +265,25 @@ class RuntimeManager {
     }
 
     // ── Step 4: Check session validity → determine auth readiness ────────────
-    if (isSessionValid()) {
-      runtimeLog.info("Session valid — proceeding with background services");
-
-      const lockResult = acquireInstanceLock();
-      if (!lockResult.acquired) {
-        runtimeLog.warn("Instance lock held by another instance — sync services disabled", {
-          holder: lockResult.holder?.instanceId,
-        });
-      } else {
-        startHeartbeatLoop();
-        startSyncWorker();
+    // The sync worker is always started — it handles session refresh internally
+    // (refreshCloudSession) and will retry automatically when the JWT expires.
+    // Socket sync and heartbeat require a valid session at startup.
+    const lockResult = acquireInstanceLock();
+    if (!lockResult.acquired) {
+      runtimeLog.warn("Instance lock held by another instance — sync services disabled", {
+        holder: lockResult.holder?.instanceId,
+      });
+    } else {
+      startHeartbeatLoop();
+      startSyncWorker();
+      if (isSessionValid()) {
         startSocketSync();
         startHeartbeat();
         this.startIncrementalPolling();
         runtimeLog.info("Background sync services started");
+      } else {
+        runtimeLog.info("Sync worker started with invalid session — will attempt refresh on next cycle");
       }
-    } else {
-      runtimeLog.info("No valid session — waiting for registration via POST /api/edge/register");
     }
 
     // ── Step 5: If session valid and config not yet downloaded, trigger sync ──
