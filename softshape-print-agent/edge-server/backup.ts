@@ -9,7 +9,7 @@
 
 import { Database } from "bun:sqlite";
 import { join, dirname } from "node:path";
-import { existsSync, mkdirSync, readdirSync, unlinkSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, unlinkSync, statSync, rmSync } from "node:fs";
 import { getDbPath } from "./recovery.ts";
 
 const BACKUP_DIR = join(dirname(getDbPath()), "backups");
@@ -86,6 +86,12 @@ function doBackup(db: Database): void {
 
   const timestamp = new Date().toISOString().slice(0, 10);
   const backupPath = join(BACKUP_DIR, `edge-${timestamp}.db`);
+
+  // VACUUM INTO refuses to overwrite an existing file — delete it first
+  // (happens when the server restarts on the same day)
+  if (existsSync(backupPath)) {
+    try { rmSync(backupPath); } catch { /* ignore */ }
+  }
 
   // Use SQLite's online backup API via raw SQL
   // Bun's sqlite doesn't expose backup directly, so use VACUUM INTO

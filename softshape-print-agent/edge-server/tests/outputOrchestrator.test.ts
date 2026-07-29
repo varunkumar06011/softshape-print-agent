@@ -210,3 +210,58 @@ test("processOutputIntent produces multiple jobs for mixed food+liquor KOT (R3)"
   expect(mockAwaitDispatchBounded).toHaveBeenCalledTimes(2);
   expect(mockEmitEvent).toHaveBeenCalledTimes(2);
 });
+
+test("processOutputIntent creates distinct eventIds for 2 same-type items on different printers (regression)", async () => {
+  const { processOutputIntent } = await import("../outputOrchestrator.ts");
+
+  // 2 liquor items resolve to 2 different printers — the planner produces 2 jobs
+  // from one PRINT_LIQUOR_KOT intent. Before the fix, both jobs shared the same
+  // eventId (intent.intentId) and the 2nd was silently dropped by
+  // ON CONFLICT(event_id) DO NOTHING in createPrintJob.
+  const seenEventIds = new Set<string>();
+  mockCreatePrintJob.mockImplementation((job: any) => {
+    seenEventIds.add(job.eventId);
+    return seenEventIds.size;
+  });
+  mockAwaitDispatchBounded.mockImplementation(() =>
+    Promise.resolve({ ok: true, printerName: "any", bytes: 0, method: "print_service", eventId: "any" })
+  );
+
+  // Item 1 has explicit printerName → BarPrinter-A
+  // Item 2 has printerTarget BAR_PRINTER → resolvePrinterName returns BarPrinter-B
+  mockResolvePrinterName.mockImplementation((_name, target) => {
+    if (target === "BAR_PRINTER") return "BarPrinter-B";
+    return undefined;
+  });
+
+  const liquorIntent: OutputIntent = {
+    type: "OUTPUT",
+    intentId: "regression-two-bar-printers",
+    intent: "PRINT_LIQUOR_KOT",
+    payload: {
+      tableNumber: "T12",
+      orderId: "ord-regression",
+      items: [
+        { name: "Kingfisher Beer", quantity: 1, price: 180, menuType: "LIQUOR", printerName: "BarPrinter-A" },
+        { name: "Royal Challenge", quantity: 1, price: 320, menuType: "LIQUOR", printerTarget: "BAR_PRINTER" },
+      ],
+      kotId: "12",
+      sectionName: "Bar",
+      captainName: "Captain Reg",
+      requestId: "req-regression",
+    },
+    priority: "CRITICAL",
+  };
+
+  const result = await processOutputIntent(liquorIntent, "test-restaurant-id", "ord-regression");
+
+  // Both jobs must be created — no silent drop
+  expect(result.jobs).toHaveLength(2);
+  expect(result.jobs[0].ok).toBe(true);
+  expect(result.jobs[1].ok).toBe(true);
+  // Both eventIds must be distinct (the bug was that they collided)
+  expect(seenEventIds.size).toBe(2);
+  // createPrintJob called twice (not once + silent drop)
+  expect(mockCreatePrintJob).toHaveBeenCalledTimes(2);
+  expect(mockAwaitDispatchBounded).toHaveBeenCalledTimes(2);
+});

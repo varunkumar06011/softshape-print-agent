@@ -218,8 +218,12 @@ function preparePrintIntents(
     if (group.escposData.length === 0) {
       return { eventId: "", group, skip: true, alreadyPrintedLocally: false };
     }
-    const eventId = eventIdByType[group.type] || `${group.type}-${requestId || Date.now()}-${i}`;
-    const alreadyPrintedLocally = locallyPrintedEventIds.has(eventId);
+    // Suffix with printerName (or index fallback) so multiple groups of the
+    // same type (e.g. 2 bar printers) don't collide on the UNIQUE event_id.
+    // Replays of the same group still dedup because (type, printer, requestId) is stable.
+    const baseEventId = eventIdByType[group.type] || `${group.type}-${requestId || Date.now()}-${i}`;
+    const eventId = `${baseEventId}-${group.printerName || i}`;
+    const alreadyPrintedLocally = locallyPrintedEventIds.has(baseEventId);
     return { eventId, group, skip: false, alreadyPrintedLocally };
   });
 }
