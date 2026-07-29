@@ -16,6 +16,8 @@ src-tauri/gen/
 src-tauri/edge-server.exe
 src-tauri/print-service.exe
 src-tauri/softshape-host.exe
+softshape-print-agent/edge-server/edge-server.exe
+*.exe
 
 # Environment
 .env
