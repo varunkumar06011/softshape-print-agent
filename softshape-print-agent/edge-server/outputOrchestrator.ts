@@ -33,12 +33,7 @@ export async function processOutputIntent(
       continue;
     }
 
-    // eventId must be unique per (intent, printer) so that multi-printer
-    // expansion (R3) doesn't collide on the UNIQUE event_id constraint.
-    // Replays of the same intent+printer still dedup correctly.
-    const eventId = intent.intentId
-      ? `${intent.intentId}-${job.destination.printerName || 'auto'}`
-      : `${job.intent}-${Date.now()}`;
+    const eventId = intent.intentId || `${job.intent}-${Date.now()}`;
     const jobId = createPrintJob({
       eventId,
       restaurantId,

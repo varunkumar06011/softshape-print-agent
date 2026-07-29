@@ -12,7 +12,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { getDb, getNextKotNumber, enqueueSync, getKolkataDateString, createPrintJob, updatePrintJobStatus, getPendingPrintJobs, claimPrintJob, reclaimStalePrintingJobs, getPrintJobByEventId, lookupCommand, recordCommand, nextTableRevision, nextOrderRevision } from "./db.ts";
-import { buildFoodKOT, buildLiquorKOT, buildCancelKOT, buildBill, type PrintItem, type OrderData } from "./escpos.ts";
+import { buildFoodKOT, buildLiquorKOT, buildCancelKOT, buildFinalBill, type PrintItem, type OrderData, type BillData } from "./escpos.ts";
 import { resolvePrinterName, printToPrinter } from "./printer.ts";
 import { lanBroadcast } from "./lanBroadcast.ts";
 
@@ -218,12 +218,8 @@ function preparePrintIntents(
     if (group.escposData.length === 0) {
       return { eventId: "", group, skip: true, alreadyPrintedLocally: false };
     }
-    // Suffix with printerName (or index fallback) so multiple groups of the
-    // same type (e.g. 2 bar printers) don't collide on the UNIQUE event_id.
-    // Replays of the same group still dedup because (type, printer, requestId) is stable.
-    const baseEventId = eventIdByType[group.type] || `${group.type}-${requestId || Date.now()}-${i}`;
-    const eventId = `${baseEventId}-${group.printerName || i}`;
-    const alreadyPrintedLocally = locallyPrintedEventIds.has(baseEventId);
+    const eventId = eventIdByType[group.type] || `${group.type}-${requestId || Date.now()}-${i}`;
+    const alreadyPrintedLocally = locallyPrintedEventIds.has(eventId);
     return { eventId, group, skip: false, alreadyPrintedLocally };
   });
 }
@@ -650,6 +646,36 @@ function getMenuItemsWithCategories(menuItemIds: string[]): Map<string, any> {
   }
 
   return map;
+}
+
+// ─── Helper: GST rate + breakdown (mirrors @softshape/output helpers) ────────
+
+function getEffectiveGstRate(
+  gstRate: number | null | undefined,
+  gstCategory: string | null | undefined,
+  gstRegistered: boolean | null | undefined,
+): number {
+  if (gstRegistered === false) return 0;
+  if (gstRate != null && gstRate > 0) return gstRate;
+  const category = (gstCategory || "NON_AC").toUpperCase();
+  return category === "AC" ? 18 : 5;
+}
+
+function getGstBreakdownWithRate(
+  taxableAmount: number,
+  ratePercent: number,
+  _pricesIncludeGst?: boolean,
+): { cgst: number; sgst: number; tax: number } {
+  const amount = Math.max(0, Number(taxableAmount) || 0);
+  if (ratePercent <= 0) {
+    return { cgst: 0, sgst: 0, tax: 0 };
+  }
+  const totalRate = ratePercent / 100;
+  const halfRate = totalRate / 2;
+  const tax = amount * totalRate;
+  const cgst = amount * halfRate;
+  const sgst = amount * halfRate;
+  return { cgst, sgst, tax };
 }
 
 // ─── Helper: Format table number for display ─────────────────────────────────
@@ -1270,8 +1296,19 @@ export async function updateOrderItems(
     let newTableRev: number | undefined;
     if (!input.isExtraTable) {
       newTableRev = nextTableRevision(effectiveTableId);
-      db.query(`UPDATE "table" SET current_bill = current_bill + ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
-        .run(additionalAmount, newTableRev, requestId || null, now, effectiveTableId);
+      // Re-occupy the table if it's currently Free/AVAILABLE. This happens when
+      // updateOrderItems is called via the 409 fallback on a table that was freed
+      // (e.g. all items cancelled) but still has a ghost active order. Without
+      // this, items are added to the order but the table stays Free, so the next
+      // table refresh clears kotHistory/currentBill/activeOrder and items vanish.
+      const tableIsFree = table.status === 'AVAILABLE' || table.workflow_status === 'Free';
+      if (tableIsFree) {
+        db.query(`UPDATE "table" SET status = 'OCCUPIED', workflow_status = 'Preparing', current_bill = current_bill + ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+          .run(additionalAmount, newTableRev, requestId || null, now, effectiveTableId);
+      } else {
+        db.query(`UPDATE "table" SET current_bill = current_bill + ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+          .run(additionalAmount, newTableRev, requestId || null, now, effectiveTableId);
+      }
 
       // 6. Update KOT history on table (safe parse — corrupted JSON should not crash the transaction)
       let currentHistory: any[] = [];
@@ -1421,9 +1458,19 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
   // Wrap all DB updates in a transaction so order total, table bill, KOT item
   // status, and table status are atomic. If any step fails, none are applied.
   const tx = db.transaction(() => {
-    // 1. Update cancelled_quantity on the order item
-    db.query("UPDATE order_item SET cancelled_quantity = ? WHERE id = ?")
-      .run(newCancelledQty, orderItem.id);
+    // 1. Update cancelled_quantity, quantity, and removed_from_bill on the order item.
+    //    Without decrementing quantity, reads.ts returns the original quantity for
+    //    partial cancels (cancelled_quantity < quantity passes the filter), causing
+    //    the frontend to overcharge. Setting removed_from_bill=1 on full cancels
+    //    is belt-and-suspenders (reads.ts already filters via cancelled_quantity < quantity)
+    //    but matches the cloud backend.
+    if (isFullCancel) {
+      db.query("UPDATE order_item SET cancelled_quantity = ?, removed_from_bill = 1, quantity = 0 WHERE id = ?")
+        .run(newCancelledQty, orderItem.id);
+    } else {
+      db.query("UPDATE order_item SET cancelled_quantity = ?, quantity = MAX(0, quantity - ?), removed_from_bill = 0 WHERE id = ?")
+        .run(newCancelledQty, qtyToCancel, orderItem.id);
+    }
 
     // 2. Mark the KOT item as CANCELLED so KDS stops showing it as active
     //    Capture affected kot_item IDs and kot_ids first so we can sync them.
@@ -1456,6 +1503,13 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
       if (allCancelled) {
         db.query(`UPDATE "table" SET status = 'AVAILABLE', workflow_status = 'Free', current_bill = 0, captain_id = NULL, guests = 0, session_started_at = NULL, kot_history = '[]', discount = NULL, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
           .run(newTableRev, input.requestId || null, now, order.table_id);
+        // Mark the order as CANCELLED so it's no longer treated as an active order.
+        // Without this, the table is freed but the order_record stays in PREPARING/PENDING
+        // status — createOrder will 409 on the next KOT ("Table already has an active
+        // order") and updateOrderItems will append to the ghost order without
+        // re-occupying the table, causing items to vanish on the next table refresh.
+        db.query("UPDATE order_record SET status = 'CANCELLED', updated_at = ?, last_command_id = ? WHERE id = ?")
+          .run(now, input.requestId || null, orderId);
       } else {
         db.query(`UPDATE "table" SET current_bill = MAX(0, current_bill - ?), revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
           .run(cancelAmount, newTableRev, input.requestId || null, now, order.table_id);
@@ -1786,6 +1840,23 @@ export async function requestBillingEdge(
 
 // ─── Print Bill (assign bill number + print) ──────────────────────────────────
 
+// Looks up stored settlement data from edge_config by orderId.
+// Settlement data is stored with key `settle:<localTxnId>` and contains the
+// exact subtotal, discount, taxes, service charge, grand total, and items
+// from settlement time. Used for exact reprint of settled bills.
+function getSettlementDataByOrderId(db: ReturnType<typeof getDb>, orderId: string): any | null {
+  try {
+    const rows = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%'").all() as any[];
+    for (const row of rows) {
+      try {
+        const data = JSON.parse(row.value);
+        if (data.orderId === orderId) return data;
+      } catch { /* ignore parse errors */ }
+    }
+  } catch { /* ignore query errors */ }
+  return null;
+}
+
 export interface PrintBillInput {
   orderId: string;
   restaurantId: string;
@@ -1847,40 +1918,151 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
     return failResult;
   }
 
-  // Resolve discount: prefer explicit input, fall back to table's stored discount
-  const effectiveDiscountPercent = (!!order.is_extra_table || input.isExtraTable)
-    ? (discountPercent ?? 0)
-    : (discountPercent != null ? discountPercent : (table.discount != null ? Number(table.discount) : 0));
-
-  // Get order items with gst_enabled from menu_item (excluding fully cancelled and removed from bill)
-  const orderItems = db.query(
-    `SELECT oi.*, mi.gst_enabled as menu_gst_enabled
-     FROM order_item oi
-     LEFT JOIN menu_item mi ON oi.menu_item_id = mi.id
-     WHERE oi.order_id = ?
-       AND (oi.cancelled_quantity IS NULL OR oi.cancelled_quantity < oi.quantity)
-       AND (oi.removed_from_bill IS NULL OR oi.removed_from_bill = 0)`
-  ).all(orderId) as any[];
-
   const formattedTableNumber = input.tableNumber
     ? String(input.tableNumber)
     : formatTableNumber(table);
   const sectionTag = table.section_tag;
-  const serviceChargePercent = outlet.service_charge_percent || 0;
 
-  // Build bill ESC/POS
-  const billItems = orderItems.map(oi => ({
-    name: oi.name,
-    quantity: oi.quantity - (oi.cancelled_quantity || 0),
-    price: Number(oi.price),
-    menuType: oi.menu_type === "LIQUOR" ? "LIQUOR" as const : "FOOD" as const,
-    gstEnabled: oi.menu_gst_enabled !== 0,
-  }));
+  // ── Settled order: use exact stored settlement values for reprint ────────
+  // When an order is SETTLED, edge_config has the exact subtotal, discount,
+  // taxes, service charge, grand total, and items from settlement time.
+  // Recalculating from order_item rows would produce wrong totals if anything
+  // changed after settlement (item edits, config changes, GST rate changes).
+  let billItems: any[];
+  let subtotal: number;
+  let discount: { percent: number; amount: number } | undefined;
+  let cgst: number;
+  let sgst: number;
+  let tax: number;
+  let scPercent: number;
+  let serviceChargeAmount: number;
+  let grandTotal: number;
+  let roundOff: number;
 
-  const escposData = buildBill({
-    tableNumber: formattedTableNumber,
-    items: billItems,
-    totalAmount: 0,
+  const settleData = order.status === 'SETTLED' ? getSettlementDataByOrderId(db, orderId) : null;
+
+  if (settleData) {
+    // Exact reprint using stored settlement values
+    subtotal = Number(settleData.subtotal ?? 0);
+    const discPercent = Number(settleData.discountPercent ?? 0);
+    const discAmount = Number(settleData.discountAmount ?? 0);
+    discount = discPercent > 0 && discAmount > 0 ? { percent: discPercent, amount: discAmount } : undefined;
+    cgst = Number(settleData.cgst ?? 0);
+    sgst = Number(settleData.sgst ?? 0);
+    tax = cgst + sgst;
+    serviceChargeAmount = Number(settleData.serviceChargeAmount ?? 0);
+    scPercent = serviceChargeAmount > 0 ? Number(outlet.service_charge_percent ?? 0) : 0;
+    grandTotal = Math.round(Number(settleData.grandTotal ?? 0));
+    roundOff = Number(settleData.roundOff ?? 0);
+
+    // Build bill items from stored settlement items (exact line items from settlement)
+    const storedItems = Array.isArray(settleData.items) ? settleData.items : [];
+    billItems = storedItems.map((item: any) => ({
+      name: item.name || 'Unknown',
+      quantity: Number(item.quantity || 1),
+      price: Number(item.price || 0),
+      amount: Number(item.price || 0) * Number(item.quantity || 1),
+      menuType: ((item.menuType || 'FOOD') as string).toUpperCase() as 'FOOD' | 'LIQUOR',
+      notes: item.notes || null,
+    }));
+  } else {
+    // Active order (or settled but settlement data not found): recalculate from current items
+    const effectiveDiscountPercent = (!!order.is_extra_table || input.isExtraTable)
+      ? (discountPercent ?? 0)
+      : (discountPercent != null ? discountPercent : (table.discount != null ? Number(table.discount) : 0));
+
+    const orderItems = db.query(
+      `SELECT oi.*, mi.gst_enabled as menu_gst_enabled
+       FROM order_item oi
+       LEFT JOIN menu_item mi ON oi.menu_item_id = mi.id
+       WHERE oi.order_id = ?
+         AND (oi.cancelled_quantity IS NULL OR oi.cancelled_quantity < oi.quantity)
+         AND (oi.removed_from_bill IS NULL OR oi.removed_from_bill = 0)`
+    ).all(orderId) as any[];
+
+    const serviceChargePercent = outlet.service_charge_percent || 0;
+
+    billItems = orderItems.map(oi => ({
+      name: oi.name,
+      quantity: oi.quantity - (oi.cancelled_quantity || 0),
+      price: Number(oi.price),
+      amount: Number(oi.price) * (oi.quantity - (oi.cancelled_quantity || 0)),
+      menuType: (oi.menu_type === "LIQUOR" ? "LIQUOR" : "FOOD") as "FOOD" | "LIQUOR",
+      gstEnabled: oi.menu_gst_enabled !== 0,
+      notes: oi.notes || null,
+    }));
+
+    const foodItems = billItems.filter(i => i.menuType === "FOOD");
+    const liquorItems = billItems.filter(i => i.menuType !== "FOOD");
+    const foodSubtotal = foodItems.reduce((s, i) => s + i.amount, 0);
+    const liquorSubtotal = liquorItems.reduce((s, i) => s + i.amount, 0);
+    subtotal = foodSubtotal + liquorSubtotal;
+
+    const gstExemptFood = foodItems.filter(i => i.gstEnabled === false).reduce((s, i) => s + i.amount, 0);
+    const gstExemptLiquor = liquorItems.filter(i => i.gstEnabled === false).reduce((s, i) => s + i.amount, 0);
+    const gstExemptTotal = gstExemptFood + gstExemptLiquor;
+
+    const discPercent = Number(effectiveDiscountPercent || 0);
+    const discountAmount = discPercent > 0
+      ? Math.round(subtotal * (discPercent / 100) * 100) / 100
+      : 0;
+    discount = discPercent > 0 && discountAmount > 0
+      ? { percent: discPercent, amount: discountAmount }
+      : undefined;
+
+    const discountedSubtotal = Math.max(0, subtotal - discountAmount);
+    const gstExemptAfterDiscount = Math.max(0, gstExemptTotal - (discountAmount > 0 && subtotal > 0 ? discountAmount * (gstExemptTotal / subtotal) : 0));
+    const taxableAmount = Math.max(0, discountedSubtotal - gstExemptAfterDiscount);
+
+    const effectiveRate = getEffectiveGstRate(outlet.gst_rate, outlet.gst_category, outlet.gst_registered);
+    const gstBreakdown = getGstBreakdownWithRate(taxableAmount, effectiveRate, !!outlet.prices_include_gst);
+    cgst = gstBreakdown.cgst;
+    sgst = gstBreakdown.sgst;
+    tax = gstBreakdown.tax;
+
+    scPercent = Number(serviceChargePercent || 0);
+    serviceChargeAmount = scPercent > 0
+      ? (discountedSubtotal + tax) * (scPercent / 100)
+      : 0;
+
+    const rawGrandTotal = Math.max(0, discountedSubtotal + tax + serviceChargeAmount);
+    grandTotal = Math.round(rawGrandTotal);
+    roundOff = Math.round((grandTotal - rawGrandTotal) * 100) / 100;
+  }
+
+  // Fetch KOT numbers for this order
+  const kots = db.query("SELECT kot_number FROM kot WHERE order_id = ? ORDER BY kot_number").all(orderId) as any[];
+  const kotNumbers = kots.map(k => String(k.kot_number)).filter(Boolean);
+
+  // Format date/time in IST
+  const now = new Date();
+  const dateStr = now.toLocaleDateString("en-IN", { day: "2-digit", month: "2-digit", year: "numeric", timeZone: "Asia/Kolkata" });
+  const timeStr = now.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "Asia/Kolkata" });
+
+  // isReprint: true if the bill number was already assigned before this call
+  const isReprint = !!order.bill_number;
+
+  // Build BillData and render via renderFinalBill (same renderer as cloud + local print)
+  const billData: BillData = {
+    billNumber,
+    date: dateStr,
+    time: timeStr,
+    kotNumbers,
+    tableNumber: String(formattedTableNumber),
+    captain: order.captain_id || "N/A",
+    items: billItems.map(({ gstEnabled, ...rest }) => rest),
+    subtotal,
+    discount,
+    serviceCharge: scPercent > 0 ? { percent: scPercent, amount: serviceChargeAmount } : undefined,
+    tax: { cgst, sgst, total: tax },
+    grandTotal,
+    roundOff,
+    section: table.section_name || "Main Hall",
+    sectionTag: sectionTag || undefined,
+    itemCount: billItems.length,
+    qtyCount: billItems.reduce((s, i) => s + i.quantity, 0),
+    isReprint,
+    ...(outlet.gstin ? { gstIn: outlet.gstin } : {}),
     restaurant: {
       name: outlet.name,
       receiptHeader: outlet.receipt_header,
@@ -1889,15 +2071,9 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
       phone: outlet.phone,
       gstin: outlet.gstin,
     },
-    sectionTag,
-    gstCategory: outlet.gst_category,
-    gstRate: outlet.gst_rate,
-    gstRegistered: outlet.gst_registered,
-    pricesIncludeGst: outlet.prices_include_gst,
-    discountPercent: effectiveDiscountPercent,
-    serviceChargePercent,
-    billNumber,
-  });
+  };
+
+  const escposData = buildFinalBill(billData);
 
   // Resolve bill printer — use per-venue override from table if available (same pattern as KOT path)
   const printerConfig = outlet.printerConfig || {};

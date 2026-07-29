@@ -345,8 +345,8 @@ test("buildFinalBill vs buildBill parity — GST + 5% service charge + 10% disco
   const buildBillResult = parseBillAmounts(backendBuildBill(buildBillInput as any) as any);
   const finalBillResult = parseFinalBillAmounts(backendBuildFinalBill(finalBillData) as any);
 
-  // buildBill renders with 2 decimal places; buildFinalBill rounds to integers.
-  // Compare rounded values to verify the calculation matches.
+  // Both buildBill and buildFinalBill round to integers.
+  // Compare values to verify the calculation matches.
   expect(finalBillResult.serviceCharge).toBe(Math.round(buildBillResult.serviceCharge));
   expect(finalBillResult.discount).toBe(Math.round(buildBillResult.discount));
   expect(finalBillResult.total).toBe(Math.round(buildBillResult.total));

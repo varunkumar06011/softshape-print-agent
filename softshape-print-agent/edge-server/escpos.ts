@@ -10,6 +10,7 @@ import {
   renderFoodKOT,
   renderLiquorKOT,
   renderBill,
+  renderFinalBill,
   renderCancelKOT,
   renderXReport,
   renderExpenditure,
@@ -19,6 +20,7 @@ import type {
   OrderData,
   BillPrintRestaurant,
   BillPrintInput,
+  BillData,
   CancelKotItem,
   CancelKotPrintInput,
   XReportData,
@@ -37,6 +39,7 @@ export {
   type OrderData,
   type BillPrintRestaurant,
   type BillPrintInput,
+  type BillData,
   type CancelKotItem,
   type CancelKotPrintInput,
   type XReportData,
@@ -53,6 +56,10 @@ export function buildLiquorKOT(orderData: OrderData): RawBlock[] {
 
 export function buildBill(input: BillPrintInput): RawBlock[] {
   return toBlocks(renderBill(input));
+}
+
+export function buildFinalBill(data: BillData): RawBlock[] {
+  return toBlocks(renderFinalBill(data));
 }
 
 export function buildCancelKOT(input: CancelKotPrintInput): RawBlock[] {
