@@ -405,7 +405,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       const healthResp = {
         status: rmHealth.status,
         service: "softshape-edge-server",
-        version: "23.9.3",
+        version: "23.9.5",
         uptime: process.uptime(),
         runtimeState: rmHealth.runtimeState,
         configSyncState: rmHealth.configSyncState,
@@ -466,7 +466,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const healthResp = {
       status: "ok",
       service: "softshape-edge-server",
-      version: "23.9.3",
+      version: "23.9.5",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
@@ -2422,7 +2422,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   // returns the download URL if an update exists. The Host handles the
   // download, binary swap, and restart.
   if (url.pathname === "/api/edge/update-check" && req.method === "GET") {
-    const currentVersion = "23.9.3";
+    const currentVersion = "23.9.5";
     const backendUrl = getBackendUrl();
     const sessionToken = getSessionToken();
 
@@ -2896,6 +2896,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     if (body.number !== undefined) { updates.push("number = ?"); values.push(Number(body.number)); }
     if (body.capacity !== undefined) { updates.push("capacity = ?"); values.push(Number(body.capacity)); }
     if (body.sectionId !== undefined) { updates.push("section_id = ?"); values.push(body.sectionId); }
+    if (body.discount !== undefined) { updates.push("discount = ?"); values.push(body.discount ? Number(body.discount) : null); }
 
     // If a status is provided, also derive workflow_status and reset session fields
     // when status is AVAILABLE, matching cloud PATCH /api/tables/:id/status.

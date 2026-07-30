@@ -2521,7 +2521,8 @@ export async function transferItemsEdge(
       targetOrder = { id: newOrderId, table_id: targetTableId, total_amount: 0 };
     }
 
-    // Move items
+    // Move items — track old→new ID mapping for KOT migration
+    const itemIdMap = new Map<string, string>();
     let transferredAmount = 0;
     for (const itemId of orderItemIds) {
       const item = db.query("SELECT * FROM order_item WHERE id = ? AND order_id = ?").get(itemId, sourceOrder.id) as any;
@@ -2539,6 +2540,7 @@ export async function transferItemsEdge(
       db.query("UPDATE order_item SET removed_from_bill = 1, removed_by = ?, removed_at = ? WHERE id = ?")
         .run(transferredBy, now, itemId);
 
+      itemIdMap.set(itemId, newItemId);
       transferredAmount += Number(item.price) * effectiveQty;
       enqueueSync("order_item", newItemId, "insert");
       enqueueSync("order_item", itemId, "update");
@@ -2552,13 +2554,91 @@ export async function transferItemsEdge(
     db.query("UPDATE order_record SET total_amount = total_amount + ?, updated_at = ?, revision = ?, last_command_id = ? WHERE id = ?")
       .run(transferredAmount, now, newTargetOrderRev, meta?.requestId || null, targetOrder.id);
 
+    // ── Migrate KOTs (mirror cloud transferOrderItemsService) ─────────────────
+    // Edge creates new order_item rows on the target, so the new target KOT
+    // references the new order_item_ids via itemIdMap.
+    let sourceHistoryJSON: string | null = null;
+    let targetHistoryJSON: string | null = null;
+    if (itemIdMap.size > 0) {
+      const transferredIds = Array.from(itemIdMap.keys());
+      const ph = transferredIds.map(() => "?").join(",");
+      const sourceKotItems = db.query(
+        `SELECT ki.* FROM kot_item ki JOIN kot k ON ki.kot_id = k.id WHERE ki.order_item_id IN (${ph}) AND k.table_id = ?`
+      ).all(...transferredIds, sourceTableId) as any[];
+
+      if (sourceKotItems.length > 0) {
+        const newKotId = crypto.randomUUID();
+        const newKotNumber = getNextKotNumber(restaurantId);
+        db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, created_at, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, 0)`)
+          .run(newKotId, restaurantId, targetTableId, targetOrder.id, newKotNumber, now);
+
+        const newKotItemsForHistory: any[] = [];
+        for (const ski of sourceKotItems) {
+          const newOiId = itemIdMap.get(ski.order_item_id);
+          if (!newOiId) continue;
+          db.query(`INSERT INTO kot_item (id, kot_id, order_item_id, menu_item_id, name, quantity, price, notes, status, created_at, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`)
+            .run(crypto.randomUUID(), newKotId, newOiId, ski.menu_item_id, ski.name, ski.quantity, ski.price, ski.notes, ski.status, now);
+          newKotItemsForHistory.push({ menuItemId: ski.menu_item_id, name: ski.name, price: ski.price, quantity: ski.quantity, orderItemId: newOiId, notes: ski.notes });
+        }
+        enqueueSync("kot", newKotId, "insert");
+
+        // Delete old KotItems from source KOTs and prune empty source KOTs
+        const delPh = sourceKotItems.map(() => "?").join(",");
+        db.query(`DELETE FROM kot_item WHERE id IN (${delPh})`).run(...sourceKotItems.map((ski) => ski.id));
+        db.query(`DELETE FROM kot WHERE table_id = ? AND NOT EXISTS (SELECT 1 FROM kot_item WHERE kot_item.kot_id = kot.id)`).run(sourceTableId);
+
+        // Rebuild source kot_history JSON from remaining KOTs
+        const remainingKots = db.query(`SELECT * FROM kot WHERE table_id = ? ORDER BY created_at ASC`).all(sourceTableId) as any[];
+        const rebuiltSourceHistory: any[] = [];
+        for (const rkot of remainingKots) {
+          const rItems = db.query(`SELECT * FROM kot_item WHERE kot_id = ? AND status != 'CANCELLED' ORDER BY id ASC`).all(rkot.id) as any[];
+          rebuiltSourceHistory.push({
+            id: String(rkot.kot_number),
+            time: rkot.created_at ? new Date(rkot.created_at).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" }) : null,
+            items: rItems.map((ki) => ({ id: ki.menu_item_id || ki.id, n: ki.name, p: Number(ki.price), q: ki.quantity, s: ki.status === "CANCELLED" ? "Cancelled" : "KOT Sent", orderItemId: ki.order_item_id, notes: ki.notes })),
+          });
+        }
+        sourceHistoryJSON = JSON.stringify(rebuiltSourceHistory);
+
+        // Append new KOT entry to target's kot_history
+        let targetHistory: any[] = [];
+        try {
+          const targetRow = db.query(`SELECT kot_history FROM "table" WHERE id = ?`).get(targetTableId) as any;
+          targetHistory = JSON.parse(targetRow?.kot_history || "[]");
+          if (!Array.isArray(targetHistory)) targetHistory = [];
+        } catch { targetHistory = []; }
+        targetHistory.push(buildKotHistoryEntry(newKotNumber, newKotItemsForHistory));
+        targetHistoryJSON = JSON.stringify(targetHistory);
+      }
+    }
+
+    // Determine if source order is now empty (all items transferred)
+    const remainingSourceItems = db.query(
+      "SELECT id FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0 AND (cancelled_quantity IS NULL OR cancelled_quantity < quantity)"
+    ).all(sourceOrder.id) as any[];
+    const sourceIsEmpty = remainingSourceItems.length === 0;
+
     // Update table current bills + increment table revisions
     newSourceTableRev = nextTableRevision(sourceTableId);
     newTargetTableRev = nextTableRevision(targetTableId);
-    db.query(`UPDATE "table" SET current_bill = MAX(0, current_bill - ?), revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
-      .run(transferredAmount, newSourceTableRev, meta?.requestId || null, now, sourceTableId);
+
+    if (sourceIsEmpty) {
+      db.query(`UPDATE "table" SET status = 'AVAILABLE', workflow_status = 'Free', current_bill = 0, captain_id = NULL, guests = 0, session_started_at = NULL, kot_history = '[]', discount = NULL, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+        .run(newSourceTableRev, meta?.requestId || null, now, sourceTableId);
+      db.query("UPDATE order_record SET status = 'CANCELLED', updated_at = ? WHERE id = ?").run(now, sourceOrder.id);
+    } else {
+      db.query(`UPDATE "table" SET current_bill = MAX(0, current_bill - ?), revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+        .run(transferredAmount, newSourceTableRev, meta?.requestId || null, now, sourceTableId);
+      if (sourceHistoryJSON !== null) {
+        db.query(`UPDATE "table" SET kot_history = ? WHERE id = ?`).run(sourceHistoryJSON, sourceTableId);
+      }
+    }
+
     db.query(`UPDATE "table" SET current_bill = current_bill + ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
       .run(transferredAmount, newTargetTableRev, meta?.requestId || null, now, targetTableId);
+    if (targetHistoryJSON !== null) {
+      db.query(`UPDATE "table" SET kot_history = ? WHERE id = ?`).run(targetHistoryJSON, targetTableId);
+    }
 
     enqueueSync("order", sourceOrder.id, "update");
     enqueueSync("order", targetOrder.id, "update");
