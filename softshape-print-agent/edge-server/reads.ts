@@ -105,7 +105,6 @@ export function getActiveOrders(statusFilter?: string): any[] {
       FROM order_item oi
       LEFT JOIN menu_item m ON oi.menu_item_id = m.id
       WHERE oi.order_id = ? AND oi.removed_from_bill = 0 AND oi.quantity > 0
-        AND (oi.cancelled_quantity IS NULL OR oi.cancelled_quantity < oi.quantity)
       ORDER BY oi.id ASC
     `).all(order.id) as any[];
 
@@ -262,7 +261,6 @@ function mapTableRow(t: any): any {
       FROM order_item oi
       LEFT JOIN menu_item m ON oi.menu_item_id = m.id
       WHERE oi.order_id = ? AND oi.removed_from_bill = 0 AND oi.quantity > 0
-        AND (oi.cancelled_quantity IS NULL OR oi.cancelled_quantity < oi.quantity)
       ORDER BY oi.id ASC
     `).all(order.id) as any[];
 

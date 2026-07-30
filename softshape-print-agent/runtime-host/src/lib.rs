@@ -7,8 +7,8 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-pub const CRASH_LIMIT: u32 = 5;
-pub const CRASH_WINDOW_SECS: u64 = 30;
+pub const CRASH_LIMIT: u32 = 3;
+pub const CRASH_WINDOW_SECS: u64 = 60;
 
 // ── Crash-loop guard logic ───────────────────────────────────────────────────
 

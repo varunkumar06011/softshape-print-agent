@@ -13,7 +13,7 @@
 // connects to the Runtime as a client. If the Cashier is closed, the
 // Runtime keeps running. If the Runtime crashes, the Host respawns it.
 //
-// Crash-loop guard: if the Runtime dies 5+ times within 30 seconds,
+// Crash-loop guard: if the Runtime dies 3+ times within 60 seconds,
 // the Host stops respawning and writes an error to the log. This
 // prevents infinite respawn loops from a broken binary or corrupted DB.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -847,7 +847,16 @@ fn main() {
         // Check if the process has exited
         let exited = match child.try_wait() {
             Ok(Some(status)) => {
-                log(&format!("Runtime exited with status: {}", status));
+                let code = status.code().unwrap_or(-1);
+                // 0xc000001d = STATUS_ILLEGAL_INSTRUCTION (as signed i32: -1073741795)
+                if code == -1073741795 {
+                    log("Runtime exited with STATUS_ILLEGAL_INSTRUCTION (0xc000001d)");
+                    log("This CPU does not support the instruction set used by edge-server.exe.");
+                    log("The binary was likely built without --target=bun-windows-x64-baseline.");
+                    log("Rebuild with the baseline target or use a CPU with SSE4.2+ support.");
+                } else {
+                    log(&format!("Runtime exited with status: {}", status));
+                }
                 true
             }
             Ok(None) => false, // still running

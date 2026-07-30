@@ -110,7 +110,7 @@ jobs:
           # which we rewrote in the previous step. Fresh resolution is required.
           rm -f bun.lock package-lock.json
           bun install
-          bun build --compile server.ts --outfile edge-server.exe
+          bun build --compile server.ts --outfile edge-server.exe --target=bun-windows-x64-baseline
 
       - name: Verify edge-server.exe
         working-directory: softshape-print-agent/edge-server

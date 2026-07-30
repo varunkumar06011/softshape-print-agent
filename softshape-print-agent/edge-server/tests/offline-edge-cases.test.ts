@@ -483,15 +483,15 @@ test("offline -> online end-to-end sync — correct records, no duplicates", asy
 
   enqueueSync("order", orderId, "insert");
   enqueueSync("kot", kotId, "insert");
-  enqueueSync("table", 'table1', "update");
+  // Table status sync removed from production — no longer enqueued for cloud sync.
+  // Table status is LAN-only (broadcast via lanBroadcast).
 
   // 2. Verify writes landed in sync_queue
   const pendingBefore = testDb.query(`SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0`).get() as any;
-  expect(pendingBefore.count).toBe(3);
+  expect(pendingBefore.count).toBe(2);
   const queueBefore = testDb.query(`SELECT * FROM sync_queue WHERE synced = 0 ORDER BY id ASC`).all() as any[];
   expect(queueBefore[0].table_name).toBe("order");
   expect(queueBefore[1].table_name).toBe("kot");
-  expect(queueBefore[2].table_name).toBe("table");
 
   // 3. Cloud is unreachable: first push fails, records remain in queue, attempts incremented
   globalThis.fetch = (() => { throw new Error("Network error: cloud unreachable"); }) as any;
@@ -500,13 +500,13 @@ test("offline -> online end-to-end sync — correct records, no duplicates", asy
   const offlineResult = await manualSyncPush();
 
   expect(offlineResult.ok).toBe(false);
-  expect(offlineResult.pushed).toBe(3);
+  expect(offlineResult.pushed).toBe(2);
   expect(offlineResult.accepted).toBe(0);
 
   const pendingAfterOffline = testDb.query(`SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0`).get() as any;
-  expect(pendingAfterOffline.count).toBe(3);
+  expect(pendingAfterOffline.count).toBe(2);
   const attemptsAfterOffline = testDb.query(`SELECT SUM(attempts) as total FROM sync_queue WHERE synced = 0`).get() as any;
-  expect(attemptsAfterOffline.total).toBe(3);
+  expect(attemptsAfterOffline.total).toBe(2);
 
   // 4. Cloud is reachable again: mock the cloud accepting all records
   let capturedBatches: any[] = [];
@@ -524,8 +524,8 @@ test("offline -> online end-to-end sync — correct records, no duplicates", asy
   const onlineResult = await manualSyncPush();
 
   expect(onlineResult.ok).toBe(true);
-  expect(onlineResult.pushed).toBe(3);
-  expect(onlineResult.accepted).toBe(3);
+  expect(onlineResult.pushed).toBe(2);
+  expect(onlineResult.accepted).toBe(2);
   expect(onlineResult.rejected).toBe(0);
 
   // 6. Verify sync_queue records are removed (markSynced deletes rows)
@@ -537,20 +537,17 @@ test("offline -> online end-to-end sync — correct records, no duplicates", asy
   // 7. Verify cloud received the correct records in the correct order with no duplicates
   expect(acceptFetchMock).toHaveBeenCalledTimes(1);
   const batch = capturedBatches[0].batch;
-  expect(batch).toHaveLength(3);
+  expect(batch).toHaveLength(2);
 
   const orderPayload = batch.find((b: any) => b.tableName === "order" && b.recordId === orderId);
   const kotPayload = batch.find((b: any) => b.tableName === "kot" && b.recordId === kotId);
-  const tablePayload = batch.find((b: any) => b.tableName === "table" && b.recordId === 'table1');
 
   expect(orderPayload).toBeDefined();
   expect(kotPayload).toBeDefined();
-  expect(tablePayload).toBeDefined();
 
-  // Order preserved (insert order: order, kot, table)
+  // Order preserved (insert order: order, kot)
   expect(batch[0].tableName).toBe("order");
   expect(batch[1].tableName).toBe("kot");
-  expect(batch[2].tableName).toBe("table");
 
   // No duplicates by queue id
   const queueIds = batch.map((b: any) => b.queueId);
@@ -560,7 +557,6 @@ test("offline -> online end-to-end sync — correct records, no duplicates", asy
   expect(orderPayload.data.items).toHaveLength(1);
   expect(orderPayload.data.items[0].name).toBe("Biryani");
   expect(kotPayload.data.items).toHaveLength(1);
-  expect(tablePayload.data.status).toBe("OCCUPIED");
 
   // Restore
   setDb(null);

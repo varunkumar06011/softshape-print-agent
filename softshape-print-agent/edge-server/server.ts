@@ -35,9 +35,12 @@
 //   POST /api/edge/sync/push    — manually trigger sync push
 //   POST /api/edge/sync/retry   — retry dead-lettered records
 //   POST /api/edge/sync/backfill — re-enqueue missing transaction syncs
+//   GET  /api/edge/sync/metrics — per-cycle sync metrics (observability)
+//   GET  /api/edge/sync/alerts  — active sync alerts (dead-letter stuck, high failure rate)
 //   GET  /api/edge/sync/socket  — socket connection status
 //   GET  /api/edge/update-check — Runtime update status (Host polls this)
 //   GET  /api/edge/drivers      — list all drivers and their health
+//   POST /api/edge/close-day    — DEPRECATED (v23.9.5), retained for backward compat
 //   POST /api/edge/drivers/reload — hot-reload external plugins
 //   GET  /runtime/status        — Runtime status (§1.1)
 //   POST /runtime/restart       — restart Runtime (admin-only, §1.1)
@@ -47,7 +50,7 @@
 //   WS   /events                — Runtime event bus (§3)
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enqueueSync, getRecoveryStatus, updatePrintJobStatus, getPendingPrintJobs, getOrderSyncStatus, getPrintJobByEventId, cancelPrintJob, reprintPrintJob, getPrintJobsByOrder, insertSyncAudit, getSyncAuditRecords, createPrintJob, claimPrintJob, getKolkataDateString } from "./db.ts";
+import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enqueueSync, getRecoveryStatus, updatePrintJobStatus, getPendingPrintJobs, getOrderSyncStatus, getPrintJobByEventId, cancelPrintJob, reprintPrintJob, getPrintJobsByOrder, insertSyncAudit, getSyncAuditRecords, createPrintJob, claimPrintJob, getKolkataDateString, getSyncMetrics, getSyncAlerts } from "./db.ts";
 import os from "os";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getSessionToken, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { pullIncrementalChanges } from "./config.ts";
@@ -405,7 +408,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       const healthResp = {
         status: rmHealth.status,
         service: "softshape-edge-server",
-        version: "23.9.5",
+        version: "23.10.0",
         uptime: process.uptime(),
         runtimeState: rmHealth.runtimeState,
         configSyncState: rmHealth.configSyncState,
@@ -466,7 +469,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const healthResp = {
       status: "ok",
       service: "softshape-edge-server",
-      version: "23.9.5",
+      version: "23.10.0",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
@@ -1908,8 +1911,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       }
     });
     applySessionUpdate();
-
-    enqueueSync("table", tableId, "update");
+    // Table status sync removed — LAN-only (session update is transient).
     return jsonResponse({ success: true, id: tableId, revision: newTableRev });
   }
 
@@ -1967,8 +1969,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       // 3. Clear KOTs for this table
       db.query("DELETE FROM kot WHERE table_id = ?").run(tableId);
 
-      // 4. Enqueue table sync
-      enqueueSync("table", tableId, "update");
+      // 4. Table status sync removed — LAN-only (session kill is transient).
 
       return { tableRev };
     });
@@ -2157,6 +2158,20 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     return jsonResponse({ records: getSyncAuditRecords(limit) });
   }
 
+  // ── GET /api/edge/sync/metrics — per-cycle sync metrics (Gap 8) ─────────────
+  if (url.pathname === "/api/edge/sync/metrics" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const limit = Math.min(parseInt(url.searchParams.get("limit") || "100", 10), 500);
+    return jsonResponse({ metrics: getSyncMetrics(limit) });
+  }
+
+  // ── GET /api/edge/sync/alerts — active sync alerts (Gap 8) ──────────────────
+  if (url.pathname === "/api/edge/sync/alerts" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const alerts = getSyncAlerts();
+    return jsonResponse({ alerts, count: alerts.length });
+  }
+
   // ── POST /api/edge/sync/push — manually trigger a sync push ────────────────
   if (url.pathname === "/api/edge/sync/push" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
@@ -2164,9 +2179,11 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     return jsonResponse(result);
   }
 
-  // ── POST /api/edge/close-day — force sync + lock day's transactions ─────────
-  // Forces a full sync push, waits for confirmation, returns day summary.
-  // The frontend uses this to show a "Close Day" confirmation dialog.
+  // ── POST /api/edge/close-day — DEPRECATED ───────────────────────────────────
+  // This endpoint is DEPRECATED as of v23.9.5. It is not called from the
+  // cashier desktop app (CloseDayDialog is deprecated and not rendered).
+  // Retained for backward compatibility only — do not build new features
+  // on top of it. Use /api/edge/sync/backfill + /api/edge/sync/push instead.
   if (url.pathname === "/api/edge/close-day" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
 
@@ -2282,6 +2299,14 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
           } else {
             skippedSynced++;
           }
+        } else if (pendingRow.attempts >= 5) {
+          // Dead-lettered (synced=0, attempts>=5) — sync worker won't retry.
+          // Re-enqueue so it gets a fresh attempt.
+          if (!dryRun) {
+            enqueueSync("transaction", localTxnId, "insert");
+          }
+          enqueued++;
+          details.push({ orderId: order.id, localTxnId, grandTotal: settleData.grandTotal, reason: "was dead-lettered" });
         } else {
           skippedQueued++;
         }
@@ -2301,12 +2326,36 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     for (const row of walkinRows) {
       const localId = row.key.replace("walkin_txn:", "");
       const pendingRow = db.query(
-        `SELECT id, synced FROM sync_queue WHERE table_name = 'walkin_transaction' AND record_id = ? ORDER BY id DESC LIMIT 1`
+        `SELECT id, synced, attempts FROM sync_queue WHERE table_name = 'walkin_transaction' AND record_id = ? ORDER BY id DESC LIMIT 1`
       ).get(localId) as any;
 
       if (pendingRow) {
-        if (pendingRow.synced === 0) skippedQueued++;
-        else skippedSynced++;
+        if (pendingRow.synced === 0) {
+          if (pendingRow.attempts >= 5) {
+            // Dead-lettered walk-in — re-enqueue for fresh attempt
+            if (!dryRun) {
+              enqueueSync("walkin_transaction", localId, "insert");
+            }
+            walkinEnqueued++;
+            details.push({ localTxnId: localId, reason: "walk-in was dead-lettered" });
+          } else {
+            skippedQueued++;
+          }
+        } else {
+          // Synced — check if it was rejected/conflict/duplicate
+          const auditRow = db.query(
+            `SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'walkin_transaction' ORDER BY audited_at DESC LIMIT 1`
+          ).get(pendingRow.id) as any;
+          if (auditRow && ["rejected", "conflict", "duplicate"].includes(auditRow.outcome)) {
+            if (!dryRun) {
+              enqueueSync("walkin_transaction", localId, "insert");
+            }
+            walkinEnqueued++;
+            details.push({ localTxnId: localId, reason: `walk-in was ${auditRow.outcome}` });
+          } else {
+            skippedSynced++;
+          }
+        }
         continue;
       }
 
@@ -2422,7 +2471,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   // returns the download URL if an update exists. The Host handles the
   // download, binary swap, and restart.
   if (url.pathname === "/api/edge/update-check" && req.method === "GET") {
-    const currentVersion = "23.9.5";
+    const currentVersion = "23.10.0";
     const backendUrl = getBackendUrl();
     const sessionToken = getSessionToken();
 
@@ -2939,7 +2988,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     }
 
     const updatedRow = db.query('SELECT revision FROM "table" WHERE id = ?').get(tableId) as { revision?: number } | null;
-    enqueueSync("table", tableId, "update");
+    // Table status sync removed — LAN-only (status reset is transient).
 
     return jsonResponse({ success: true, id: tableId, revision: updatedRow?.revision ?? 1 });
   }
@@ -2971,7 +3020,8 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const restaurantId = getRestaurantId();
     db.query("UPDATE \"table\" SET status = 'REMOVED', workflow_status = 'Removed', revision = (SELECT revision FROM \"table\" WHERE id = ?) + 1 WHERE id = ? AND restaurant_id = ?")
       .run(tableId, tableId, restaurantId);
-    enqueueSync("table", tableId, "update");
+    // Table status sync removed — LAN-only (table removal is a structural change
+    // handled at the cloud side via admin panel, not via edge sync).
 
     return jsonResponse({ success: true, id: tableId });
   }
@@ -3043,7 +3093,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     for (const t of toDelete) {
       db.query("UPDATE \"table\" SET status = 'REMOVED', workflow_status = 'Removed', revision = revision + 1, updated_at = ? WHERE id = ?")
         .run(now, t.id);
-      enqueueSync("table", t.id, "update");
+      // Table status sync removed — LAN-only (bulk removal is a structural change).
     }
 
     return jsonResponse({ deleted: toDelete.length, skipped: skipIds.size });

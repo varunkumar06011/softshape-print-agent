@@ -19,7 +19,7 @@
 //   - Emit socket events for real-time dashboard updates
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, insertSyncAudit } from "./db.ts";
+import { getDb, insertSyncAudit, recordSyncMetric, getSyncAlerts } from "./db.ts";
 import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid, getDeviceId, saveSession, loadSession } from "./auth.ts";
 import { cloudFetch } from "./cloudFetch.ts";
 import { pullIncrementalChanges } from "./config.ts";
@@ -815,6 +815,7 @@ async function runSyncCycle(): Promise<void> {
 
   syncRunning = true;
   let skipBackoff = false;
+  const cycleStart = Date.now();
   try {
     const result = await pushSyncBatch();
 
@@ -831,6 +832,23 @@ async function runSyncCycle(): Promise<void> {
     } catch {
       // Non-fatal — checkpoint can fail if another connection is busy
     }
+
+    // Record sync metrics for observability and alerting (Gap 8)
+    const _db = getDb();
+    const _pendingAfter = (_db.query("SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0").get() as any)?.c || 0;
+    const _deadLetterAfter = (_db.query("SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0 AND attempts >= ?").get(MAX_ATTEMPTS) as any)?.c || 0;
+    recordSyncMetric({
+      cycleAt: cycleStart,
+      pushed: result.pushed,
+      accepted: result.accepted,
+      rejected: result.rejected,
+      deadLettered: _deadLetterAfter,
+      latencyMs: Date.now() - cycleStart,
+      ok: result.ok,
+      error: result.error,
+      pendingAfter: _pendingAfter,
+      deadLetterAfter: _deadLetterAfter,
+    });
 
     if (result.ok) {
       consecutiveFailures = 0;
@@ -865,6 +883,20 @@ async function runSyncCycle(): Promise<void> {
     console.error("[Sync] Worker cycle error:", err);
   } finally {
     syncRunning = false;
+  }
+
+  // Check for critical alerts and log them (Gap 8)
+  try {
+    const alerts = getSyncAlerts();
+    for (const alert of alerts) {
+      if (alert.severity === "critical") {
+        console.error(`[Sync Alert] ${alert.type}: ${alert.message}`);
+      } else {
+        console.warn(`[Sync Alert] ${alert.type}: ${alert.message}`);
+      }
+    }
+  } catch {
+    // Non-fatal — alerting should never break the sync loop
   }
 
   scheduleNextCycle(skipBackoff ? SYNC_INTERVAL_MS : getBackoffDelay());

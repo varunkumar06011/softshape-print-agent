@@ -562,6 +562,24 @@ function initSchema(database: Database) {
     );
     CREATE INDEX IF NOT EXISTS idx_sync_audit_outcome ON sync_audit(outcome);
 
+    -- Sync Metrics (per-cycle metrics for observability and alerting)
+    -- One row per sync push cycle. Used to track success rate, latency,
+    -- and detect degradation trends. Pruned to last 7 days automatically.
+    CREATE TABLE IF NOT EXISTS sync_metrics (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      cycle_at        INTEGER NOT NULL,          -- timestamp of cycle start
+      pushed          INTEGER NOT NULL DEFAULT 0,
+      accepted        INTEGER NOT NULL DEFAULT 0,
+      rejected        INTEGER NOT NULL DEFAULT 0,
+      dead_lettered   INTEGER NOT NULL DEFAULT 0,
+      latency_ms      INTEGER NOT NULL DEFAULT 0,
+      ok              INTEGER NOT NULL DEFAULT 0, -- 1=success, 0=failure
+      error           TEXT,
+      pending_after   INTEGER NOT NULL DEFAULT 0,
+      dead_letter_after INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_sync_metrics_cycle_at ON sync_metrics(cycle_at);
+
     -- Sync State (cloud to edge pull tracking)
     CREATE TABLE IF NOT EXISTS sync_state (
       key             TEXT PRIMARY KEY,
@@ -978,6 +996,122 @@ export function getSyncAuditRecords(limit = 100): Array<{
     `SELECT id, queue_id, table_name, record_id, operation, outcome, message, audited_at
      FROM sync_audit ORDER BY audited_at DESC LIMIT ?`,
   ).all(limit) as any[];
+}
+
+// ─── Sync Metrics (Gap 8: observability + alerting) ──────────────────────────
+
+export function recordSyncMetric(metric: {
+  cycleAt: number;
+  pushed: number;
+  accepted: number;
+  rejected: number;
+  deadLettered: number;
+  latencyMs: number;
+  ok: boolean;
+  error?: string;
+  pendingAfter: number;
+  deadLetterAfter: number;
+}): void {
+  const db = getDb();
+  db.query(
+    `INSERT INTO sync_metrics
+      (cycle_at, pushed, accepted, rejected, dead_lettered, latency_ms, ok, error, pending_after, dead_letter_after)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    metric.cycleAt,
+    metric.pushed,
+    metric.accepted,
+    metric.rejected,
+    metric.deadLettered,
+    metric.latencyMs,
+    metric.ok ? 1 : 0,
+    metric.error || null,
+    metric.pendingAfter,
+    metric.deadLetterAfter,
+  );
+
+  // Prune metrics older than 7 days to keep the table small
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  db.query("DELETE FROM sync_metrics WHERE cycle_at < ?").run(cutoff);
+}
+
+export function getSyncMetrics(limit = 100): Array<{
+  id: number; cycle_at: number; pushed: number; accepted: number; rejected: number;
+  dead_lettered: number; latency_ms: number; ok: number; error: string | null;
+  pending_after: number; dead_letter_after: number;
+}> {
+  const db = getDb();
+  return db.query(
+    `SELECT id, cycle_at, pushed, accepted, rejected, dead_lettered, latency_ms, ok, error, pending_after, dead_letter_after
+     FROM sync_metrics ORDER BY cycle_at DESC LIMIT ?`,
+  ).all(limit) as any[];
+}
+
+export function getSyncAlerts(): Array<{
+  type: string;
+  severity: string;
+  message: string;
+  since: number;
+  count: number;
+}> {
+  const db = getDb();
+  const alerts: Array<{ type: string; severity: string; message: string; since: number; count: number }> = [];
+  const now = Date.now();
+  const oneHourAgo = now - 60 * 60 * 1000;
+
+  // Alert 1: Dead-lettered records accumulating for > 1 hour
+  const deadLetterStuck = db.query(
+    `SELECT COUNT(*) as c, MIN(created_at) as oldest
+     FROM sync_queue
+     WHERE synced = 0 AND attempts >= 5 AND created_at < ?`,
+  ).get(oneHourAgo) as any;
+  if (deadLetterStuck?.c > 0) {
+    alerts.push({
+      type: "dead_letter_stuck",
+      severity: "critical",
+      message: `${deadLetterStuck.c} dead-lettered sync record(s) stuck for over 1 hour — manual intervention needed`,
+      since: deadLetterStuck.oldest,
+      count: deadLetterStuck.c,
+    });
+  }
+
+  // Alert 2: High failure rate in last 10 cycles (> 50%)
+  const recentMetrics = db.query(
+    `SELECT ok FROM sync_metrics ORDER BY cycle_at DESC LIMIT 10`,
+  ).all() as any[];
+  if (recentMetrics.length >= 5) {
+    const failures = recentMetrics.filter((m) => m.ok === 0).length;
+    const failureRate = failures / recentMetrics.length;
+    if (failureRate > 0.5) {
+      alerts.push({
+        type: "high_failure_rate",
+        severity: "warning",
+        message: `${failures}/${recentMetrics.length} recent sync cycles failed (${Math.round(failureRate * 100)}% failure rate)`,
+        since: now,
+        count: failures,
+      });
+    }
+  }
+
+  // Alert 3: Pending queue growing (pending > 50 for > 30 min)
+  const pendingGrowth = db.query(
+    `SELECT pending_after, cycle_at FROM sync_metrics
+     WHERE cycle_at > ? ORDER BY cycle_at DESC LIMIT 10`,
+  ).get(now - 30 * 60 * 1000) as any;
+  const recentPending = db.query(
+    `SELECT pending_after FROM sync_metrics ORDER BY cycle_at DESC LIMIT 1`,
+  ).get() as any;
+  if (recentPending?.pending_after > 50) {
+    alerts.push({
+      type: "pending_queue_growing",
+      severity: "warning",
+      message: `${recentPending.pending_after} records pending sync — queue may be stuck`,
+      since: now,
+      count: recentPending.pending_after,
+    });
+  }
+
+  return alerts;
 }
 
 export function getOrderSyncStatus(orderId: string): { synced: boolean; pending: number; deadLettered: number } {

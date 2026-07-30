@@ -949,9 +949,8 @@ export async function createOrder(
     // 7. Enqueue sync records for cloud push
     enqueueSync("order", orderId, "insert");
     enqueueSync("kot", kotId, "insert");
-    if (!input.isExtraTable) {
-      enqueueSync("table", tableId, "update");
-    }
+    // Table status sync removed — table status is LAN-only (broadcast via lanBroadcast).
+    // Cloud does not need transient table status (OCCUPIED/AVAILABLE/etc).
 
     // 8. Persist print intents in the same transaction (atomicity guarantee)
     persistPrintIntentsInTx(printIntents, restaurantId, orderId, kotId, kotNumber, tableId, captainName);
@@ -1326,9 +1325,7 @@ export async function updateOrderItems(
     // 7. Enqueue sync records
     enqueueSync("order", orderId, "update");
     enqueueSync("kot", kotId, "insert");
-    if (!input.isExtraTable) {
-      enqueueSync("table", effectiveTableId, "update");
-    }
+    // Table status sync removed — LAN-only.
     for (const oiId of newOrderItemIds) {
       enqueueSync("order_item", oiId, "insert");
     }
@@ -1459,11 +1456,10 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
   // status, and table status are atomic. If any step fails, none are applied.
   const tx = db.transaction(() => {
     // 1. Update cancelled_quantity, quantity, and removed_from_bill on the order item.
-    //    Without decrementing quantity, reads.ts returns the original quantity for
-    //    partial cancels (cancelled_quantity < quantity passes the filter), causing
-    //    the frontend to overcharge. Setting removed_from_bill=1 on full cancels
-    //    is belt-and-suspenders (reads.ts already filters via cancelled_quantity < quantity)
-    //    but matches the cloud backend.
+    //    quantity is decremented on partial cancel so that reads.ts `quantity > 0`
+    //    correctly identifies remaining active items (matching cloud backend's
+    //    `quantity: { gt: 0 }` filter). Setting removed_from_bill=1 on full cancels
+    //    is belt-and-suspenders but matches the cloud backend.
     if (isFullCancel) {
       db.query("UPDATE order_item SET cancelled_quantity = ?, removed_from_bill = 1, quantity = 0 WHERE id = ?")
         .run(newCancelledQty, orderItem.id);
@@ -1491,7 +1487,7 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
 
     // 4. Check if all items on this order are now fully cancelled
     const remainingItems = db.query(
-      "SELECT COUNT(*) as cnt FROM order_item WHERE order_id = ? AND (cancelled_quantity IS NULL OR cancelled_quantity < quantity)"
+      "SELECT COUNT(*) as cnt FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0"
     ).get(orderId) as { cnt: number };
 
     const allCancelled = remainingItems.cnt === 0;
@@ -1519,9 +1515,7 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
     // 6. Enqueue sync records
     enqueueSync("order_item", orderItemId, "update");
     enqueueSync("order", orderId, "update");
-    if (!input.isExtraTable) {
-      enqueueSync("table", order.table_id, "update");
-    }
+    // Table status sync removed — LAN-only.
     for (const kotItemId of cancelledKotItemIds) {
       enqueueSync("kot_item", kotItemId, "update");
     }
@@ -1637,7 +1631,7 @@ export async function reprintKot(input: ReprintKotInput): Promise<{ success: boo
   }
 
   // Get all order items
-  const orderItems = db.query("SELECT * FROM order_item WHERE order_id = ? AND (cancelled_quantity IS NULL OR cancelled_quantity < quantity)").all(orderId) as any[];
+  const orderItems = db.query("SELECT * FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0").all(orderId) as any[];
 
   const formattedTableNumber = formatTableNumber(table);
   const restaurantName = outlet.receipt_header || outlet.name;
@@ -1657,7 +1651,7 @@ export async function reprintKot(input: ReprintKotInput): Promise<{ success: boo
     );
     return {
       name: oi.name,
-      quantity: oi.quantity - (oi.cancelled_quantity || 0),
+      quantity: oi.quantity,
       price: Number(oi.price),
       notes: oi.notes,
       menuType: oi.menu_type,
@@ -1810,9 +1804,7 @@ export async function requestBillingEdge(
     }
 
     enqueueSync("order", orderId, "update");
-    if (!meta?.isExtraTable) {
-      enqueueSync("table", order.table_id, "update");
-    }
+    // Table status sync removed — LAN-only.
 
     return { newOrderRev, newTableRev };
   });
@@ -1976,17 +1968,17 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
        FROM order_item oi
        LEFT JOIN menu_item mi ON oi.menu_item_id = mi.id
        WHERE oi.order_id = ?
-         AND (oi.cancelled_quantity IS NULL OR oi.cancelled_quantity < oi.quantity)
-         AND (oi.removed_from_bill IS NULL OR oi.removed_from_bill = 0)`
+         AND oi.removed_from_bill = 0
+         AND oi.quantity > 0`
     ).all(orderId) as any[];
 
     const serviceChargePercent = outlet.service_charge_percent || 0;
 
     billItems = orderItems.map(oi => ({
       name: oi.name,
-      quantity: oi.quantity - (oi.cancelled_quantity || 0),
+      quantity: oi.quantity,
       price: Number(oi.price),
-      amount: Number(oi.price) * (oi.quantity - (oi.cancelled_quantity || 0)),
+      amount: Number(oi.price) * oi.quantity,
       menuType: (oi.menu_type === "LIQUOR" ? "LIQUOR" : "FOOD") as "FOOD" | "LIQUOR",
       gstEnabled: oi.menu_gst_enabled !== 0,
       notes: oi.notes || null,
@@ -2289,9 +2281,7 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
     // Enqueue sync — always enqueue a transaction record so the cloud
     // receives the settlement payment and creates a cloud Transaction.
     enqueueSync("order", orderId, "update");
-    if (!input.isExtraTable) {
-      enqueueSync("table", order.table_id, "update");
-    }
+    // Table status sync removed — LAN-only.
     enqueueSync("transaction", localTxnId, "insert");
 
     return { newOrderRev, newTableRev };
@@ -2324,7 +2314,7 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
 
   // Fetch order items so the transaction object has complete data for the
   // cashier UI (items list, itemCount) — matches listTransactionsEdge output.
-  const settleItems = db.query("SELECT name, quantity, cancelled_quantity, price, menu_type FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0 AND (cancelled_quantity IS NULL OR cancelled_quantity < quantity)").all(orderId) as any[];
+  const settleItems = db.query("SELECT name, quantity, cancelled_quantity, price, menu_type FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0").all(orderId) as any[];
 
   // Build a local transaction object so the cashier UI can display it
   // immediately without synthesizing its own.
@@ -2350,7 +2340,7 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
     tableNumber: updatedTable.number ?? null,
     sectionTag: updatedTable.section_tag || null,
     itemCount: settleItems.length,
-    items: settleItems.map(i => ({ name: i.name, quantity: i.quantity - Number(i.cancelled_quantity || 0), price: i.price })),
+    items: settleItems.map(i => ({ name: i.name, quantity: i.quantity, price: i.price })),
   };
 
   const result = {
@@ -2424,8 +2414,7 @@ export async function swapTableEdge(
     db.query(`UPDATE "table" SET status = ?, workflow_status = ?, captain_id = ?, guests = ?, session_started_at = ?, current_bill = ?, kot_history = ?, discount = ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
       .run(sourceTable.status, sourceTable.workflow_status, sourceTable.captain_id, sourceTable.guests, sourceTable.session_started_at, sourceTable.current_bill, sourceTable.kot_history, sourceTable.discount, newTargetTableRev, meta?.requestId || null, now, targetTableId);
 
-    enqueueSync("table", sourceTableId, "update");
-    enqueueSync("table", targetTableId, "update");
+    // Table status sync removed — LAN-only (swap is a transient operation).
     return { newSourceTableRev, newTargetTableRev, newOrderRev };
   });
 
@@ -2528,7 +2517,7 @@ export async function transferItemsEdge(
       const item = db.query("SELECT * FROM order_item WHERE id = ? AND order_id = ?").get(itemId, sourceOrder.id) as any;
       if (!item) continue;
 
-      const effectiveQty = item.quantity - (item.cancelled_quantity || 0);
+      const effectiveQty = item.quantity;
       if (effectiveQty <= 0) continue;
 
       // Create new order item on target order with the effective quantity
@@ -2614,7 +2603,7 @@ export async function transferItemsEdge(
 
     // Determine if source order is now empty (all items transferred)
     const remainingSourceItems = db.query(
-      "SELECT id FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0 AND (cancelled_quantity IS NULL OR cancelled_quantity < quantity)"
+      "SELECT id FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0"
     ).all(sourceOrder.id) as any[];
     const sourceIsEmpty = remainingSourceItems.length === 0;
 
@@ -2642,8 +2631,7 @@ export async function transferItemsEdge(
 
     enqueueSync("order", sourceOrder.id, "update");
     enqueueSync("order", targetOrder.id, "update");
-    enqueueSync("table", sourceTableId, "update");
-    enqueueSync("table", targetTableId, "update");
+    // Table status sync removed — LAN-only (transfer is a transient operation).
     return { newSourceOrderRev, newTargetOrderRev, newSourceTableRev, newTargetTableRev };
   });
 
@@ -2735,7 +2723,7 @@ export async function editBillEdge(
       for (const itemId of removedItemIds) {
         const item = db.query("SELECT * FROM order_item WHERE id = ? AND order_id = ?").get(itemId, orderId) as any;
         if (!item) continue;
-        const effectiveQty = item.quantity - (item.cancelled_quantity || 0);
+        const effectiveQty = item.quantity;
         billDelta -= Number(item.price) * effectiveQty;
         db.query("UPDATE order_item SET removed_from_bill = 1, removed_by = ?, removed_at = ? WHERE id = ? AND order_id = ?")
           .run(editedBy || "Cashier", now, itemId, orderId);
@@ -2810,7 +2798,7 @@ export async function editBillEdge(
       newTableRev = nextTableRevision(order.table_id);
       db.query(`UPDATE "table" SET current_bill = MAX(0, current_bill + ?), revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
         .run(billDelta, newTableRev, meta?.requestId || null, now, order.table_id);
-      enqueueSync("table", order.table_id, "update");
+      // Table status sync removed — LAN-only (current_bill is derived from order items).
     }
 
     // Increment order revision + update timestamp
@@ -2971,7 +2959,7 @@ export async function updateOrderStatusEdge(
       newTableRev = nextTableRevision(order.table_id);
       db.query(`UPDATE "table" SET workflow_status = ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
         .run(workflowStatus, newTableRev, meta?.requestId || null, now, order.table_id);
-      enqueueSync("table", order.table_id, "update");
+      // Table status sync removed — LAN-only (workflow_status is transient).
     }
 
     enqueueSync("order", orderId, "update");
@@ -3181,7 +3169,7 @@ export async function listTransactionsEdge(
     }
 
     // Get items for this order
-    const items = db.query("SELECT name, quantity, cancelled_quantity, price, menu_type FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0 AND (cancelled_quantity IS NULL OR cancelled_quantity < quantity)").all(order.id) as any[];
+    const items = db.query("SELECT name, quantity, cancelled_quantity, price, menu_type FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0").all(order.id) as any[];
 
     txns.push({
       id: `edge-txn-${order.id}`,
@@ -3199,7 +3187,7 @@ export async function listTransactionsEdge(
       roundOff: Number(paymentData.roundOff ?? 0),
       tipAmount: Number(paymentData.tipAmount ?? 0),
       itemCount: items.length,
-      items: items.map(i => ({ name: i.name, quantity: i.quantity - Number(i.cancelled_quantity || 0), price: i.price })),
+      items: items.map(i => ({ name: i.name, quantity: i.quantity, price: i.price })),
       captainId: order.captain_id || "CASHIER",
       captainName: "Head Cashier",
       method: paymentData.paymentMethod || "CASH",
@@ -3369,12 +3357,12 @@ export async function listItemsSoldEdge(
   const itemMap = new Map<string, { name: string; quantity: number; revenue: number; type: string; orderCount: number }>();
 
   for (const order of settledOrders) {
-    const items = db.query("SELECT name, quantity, cancelled_quantity, price, menu_type FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0 AND (cancelled_quantity IS NULL OR cancelled_quantity < quantity)").all(order.id) as any[];
+    const items = db.query("SELECT name, quantity, cancelled_quantity, price, menu_type FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0").all(order.id) as any[];
 
     for (const item of items) {
       const name = String(item.name || "Unknown").trim();
       const key = name.toLowerCase().replace(/\s+/g, " ").trim();
-      const quantity = Number(item.quantity || 0) - Number(item.cancelled_quantity || 0);
+      const quantity = Number(item.quantity || 0);
       const price = Number(item.price || 0);
       const revenue = Math.round(price * quantity * 100) / 100;
 

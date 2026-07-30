@@ -46,10 +46,13 @@ Port 3101 is used by default to avoid conflicts with Restroworks POS which occup
 ### Option A: Standalone executable
 
 ```bash
-bun build --compile server.ts --outfile edge-server.exe
+bun build --compile server.ts --outfile edge-server.exe --target=bun-windows-x64-baseline
 ```
 
 This produces a standalone `edge-server.exe` (~50MB) with Bun runtime + SQLite embedded. No Node.js installation needed on the restaurant PC.
+
+> **Important:** Always use `--target=bun-windows-x64-baseline` to ensure compatibility
+> with CPUs that lack AVX2 support (e.g. Intel Pentium G-series, Core 2 Duo, older Celerons).
 
 ### Option B: Tauri sidecar
 
