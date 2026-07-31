@@ -11,7 +11,7 @@
 // Total: 15-40ms from button press to printer starting.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, getNextKotNumber, enqueueSync, getKolkataDateString, createPrintJob, updatePrintJobStatus, getPendingPrintJobs, claimPrintJob, reclaimStalePrintingJobs, getPrintJobByEventId, lookupCommand, recordCommand, nextTableRevision, nextOrderRevision } from "./db.ts";
+import { getDb, getNextKotNumber, enqueueSync, getKolkataDateString, createPrintJob, updatePrintJobStatus, getPendingPrintJobs, claimPrintJob, reclaimStalePrintingJobs, getPrintJobByEventId, lookupCommand, recordCommand, nextTableRevision, nextOrderRevision, upsertTransactionRecord } from "./db.ts";
 import { buildFoodKOT, buildLiquorKOT, buildCancelKOT, buildFinalBill, type PrintItem, type OrderData, type BillData } from "./escpos.ts";
 import { resolvePrinterName, printToPrinter } from "./printer.ts";
 import { lanBroadcast } from "./lanBroadcast.ts";
@@ -1591,9 +1591,31 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
     printerConfig
   );
 
+  // Persist the cancel KOT print job to the durable print_job queue BEFORE
+  // attempting to print, then dispatch. This mirrors createOrder/updateOrderItems:
+  // if the print service is momentarily unavailable (printer busy, Rust process
+  // restarting, etc.), the job stays in 'queued'/'retrying' status and the
+  // background dispatch loop retries it automatically. Without this, the old
+  // fire-and-forget printSingleWithLanFallback call would silently lose the
+  // cancel slip forever on any transient print failure.
   let printResult: any = null;
   if (!localPrinted) {
-    printResult = await printSingleWithLanFallback(printerName || null, escposData, "CANCEL_KOT");
+    const cancelEventId = `CANCEL_KOT-${input.requestId || Date.now()}`;
+    const cancelGroup: PrintGroup = { printerName: printerName || null, escposData, type: "CANCEL_KOT" };
+    createPrintJob({
+      eventId: cancelEventId,
+      restaurantId,
+      orderId,
+      kotId: null,
+      kotNumber: null,
+      tableId: order.table_id,
+      printerName: cancelGroup.printerName,
+      jobType: "CANCEL_KOT",
+      escposData,
+      itemSummary: [{ name: orderItem.name, quantity: qtyToCancel }],
+      captainName: cancelledBy || null,
+    });
+    printResult = await awaitDispatchBounded(cancelEventId, cancelGroup, input.requestId, 5000);
   }
 
   const result = { success: true, printResult, revision: newOrderRev, tableRevision: newTableRev };
@@ -2034,6 +2056,31 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
   // isReprint: true if the bill number was already assigned before this call
   const isReprint = !!order.bill_number;
 
+  // Group identical items (by name + price + notes) so the printed bill shows
+  // one line per product with summed quantity, instead of separate lines for
+  // each KOT submission of the same item.
+  const groupedBillItems = (() => {
+    const map = new Map<string, { name: string; quantity: number; price: number; amount: number; menuType: "FOOD" | "LIQUOR"; notes: string | null }>();
+    for (const item of billItems) {
+      const key = `${item.name}::${item.price}::${item.notes ?? ""}`;
+      const existing = map.get(key);
+      if (existing) {
+        existing.quantity += item.quantity;
+        existing.amount += item.amount;
+      } else {
+        map.set(key, {
+          name: item.name,
+          quantity: item.quantity,
+          price: item.price,
+          amount: item.amount,
+          menuType: item.menuType,
+          notes: item.notes ?? null,
+        });
+      }
+    }
+    return Array.from(map.values());
+  })();
+
   // Build BillData and render via renderFinalBill (same renderer as cloud + local print)
   const billData: BillData = {
     billNumber,
@@ -2042,7 +2089,7 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
     kotNumbers,
     tableNumber: String(formattedTableNumber),
     captain: order.captain_id || "N/A",
-    items: billItems.map(({ gstEnabled, ...rest }) => rest),
+    items: groupedBillItems,
     subtotal,
     discount,
     serviceCharge: scPercent > 0 ? { percent: scPercent, amount: serviceChargeAmount } : undefined,
@@ -2051,8 +2098,8 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
     roundOff,
     section: table.section_name || "Main Hall",
     sectionTag: sectionTag || undefined,
-    itemCount: billItems.length,
-    qtyCount: billItems.reduce((s, i) => s + i.quantity, 0),
+    itemCount: groupedBillItems.length,
+    qtyCount: groupedBillItems.reduce((s, i) => s + i.quantity, 0),
     isReprint,
     ...(outlet.gstin ? { gstIn: outlet.gstin } : {}),
     restaurant: {
@@ -2278,6 +2325,12 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
     db.query("INSERT INTO edge_config (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?")
       .run(paymentKey, paymentData, now, paymentData, now);
 
+    // Durable copy: also persist into transaction_record so the sync worker
+    // can reconstruct the cloud Transaction even if edge_config is cleaned,
+    // migrated, or the settle:* key is lost. This is the source of truth for
+    // sync durability; edge_config remains for reprint lookups.
+    upsertTransactionRecord(localTxnId, restaurantId, orderId, "settle", paymentData);
+
     // Enqueue sync — always enqueue a transaction record so the cloud
     // receives the settlement payment and creates a cloud Transaction.
     enqueueSync("order", orderId, "update");
@@ -2404,6 +2457,19 @@ export async function swapTableEdge(
       db.query("UPDATE order_record SET table_id = ?, updated_at = ?, revision = ?, last_command_id = ? WHERE id = ?")
         .run(targetTableId, now, newOrderRev, meta?.requestId || null, activeOrder.id);
       enqueueSync("order", activeOrder.id, "update");
+    }
+
+    // Move KOT records from source → target (mirrors cloud backend tx.kot.updateMany).
+    // Without this, the kots relation stays on the source table after swap, causing
+    // the frontend to fall back to the stale kot_history JSON snapshot on the target
+    // — which doesn't reflect item cancellations, so cancelled items re-render as active.
+    const sourceKotIds = db.query("SELECT id FROM kot WHERE table_id = ?").all(sourceTableId) as any[];
+    if (sourceKotIds.length > 0) {
+      db.query("UPDATE kot SET table_id = ? WHERE table_id = ?")
+        .run(targetTableId, sourceTableId);
+      for (const k of sourceKotIds) {
+        enqueueSync("kot", k.id, "update");
+      }
     }
 
     // Swap table statuses, captain, guests, kot history, current bill + increment revisions
@@ -3103,6 +3169,10 @@ export async function saveTransactionEdge(
   const txnKey = `walkin_txn:${localId}`;
   db.query("INSERT INTO edge_config (key, value, updated_at) VALUES (?, ?, ?)")
     .run(txnKey, JSON.stringify(fullTxnData), now);
+
+  // Durable copy: also persist into transaction_record so the sync worker
+  // can reconstruct the cloud Transaction even if edge_config is cleaned.
+  upsertTransactionRecord(localId, restaurantId, txnData.orderId || null, "walkin", fullTxnData);
 
   enqueueSync("walkin_transaction", localId, "insert");
 

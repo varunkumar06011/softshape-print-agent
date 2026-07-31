@@ -32,14 +32,15 @@ export function getKolkataDateString(date = new Date()): string {
   return corrected.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
 }
 
-const CURRENT_SCHEMA_VERSION = 4;
+const CURRENT_SCHEMA_VERSION = 5;
 
 // Schema versions that can be migrated in place (via runMigrations) without
 // wiping the database. Any version not in this set triggers the existing
 // backup + rebuild path. v2 → v3 adds revision columns and the command_log
 // table via idempotent ALTER TABLE / CREATE TABLE IF NOT EXISTS, so it is
-// safe to apply to a live production DB without data loss.
-const SAFE_INPLACE_MIGRATION_FROM = new Set<number>([2, 3]);
+// safe to apply to a live production DB without data loss. v4 → v5 adds the
+// transaction_record table (CREATE TABLE IF NOT EXISTS) — also idempotent.
+const SAFE_INPLACE_MIGRATION_FROM = new Set<number>([2, 3, 4]);
 
 let db: Database | null = null;
 let recoveryStatus: RecoveryResult = { recovered: false, corruptPath: null, message: "" };
@@ -690,6 +691,27 @@ function initSchema(database: Database) {
     );
     CREATE INDEX IF NOT EXISTS idx_expenditure_date ON expenditure(date);
     CREATE INDEX IF NOT EXISTS idx_expenditure_synced ON expenditure(cloud_synced) WHERE cloud_synced = 0;
+
+    -- Transaction Record (durable local copy of every settlement + walk-in txn)
+    -- Stores the full payment payload that the sync worker needs to create the
+    -- cloud Transaction row. This is the durable source of truth for sync;
+    -- edge_config (settle:<id> / walkin_txn:<id>) is kept only for backward
+    -- compatibility and reprint lookups. If a row is missing here, the sync
+    -- worker cannot reconstruct the transaction and the reconciliation worker
+    -- will re-enqueue it from the parent order_record.
+    CREATE TABLE IF NOT EXISTS transaction_record (
+      id              TEXT PRIMARY KEY,           -- localTxnId (settle) or localId (walk-in)
+      restaurant_id   TEXT NOT NULL,
+      order_id        TEXT,                        -- null for walk-in transactions
+      kind            TEXT NOT NULL,               -- 'settle' | 'walkin'
+      payload         TEXT NOT NULL,               -- full JSON payment payload
+      cloud_synced    INTEGER DEFAULT 0,
+      created_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+      synced_at       INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_txn_record_restaurant ON transaction_record(restaurant_id);
+    CREATE INDEX IF NOT EXISTS idx_txn_record_order ON transaction_record(order_id);
+    CREATE INDEX IF NOT EXISTS idx_txn_record_synced ON transaction_record(cloud_synced) WHERE cloud_synced = 0;
   `);
 }
 
@@ -874,6 +896,43 @@ export function enqueueSync(tableName: string, recordId: string, operation: stri
     .run(tableName, recordId);
   db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)")
     .run(tableName, recordId, operation, Date.now());
+}
+
+// ── Transaction Record: durable local copy of settlement/walk-in payloads ────
+// The sync worker reads from here first (falling back to edge_config for rows
+// written by older app versions). This decouples sync durability from the
+// generic edge_config key/value store, which can be cleaned/migrated without
+// losing the ability to reconstruct cloud Transaction rows.
+
+export function upsertTransactionRecord(
+  id: string,
+  restaurantId: string,
+  orderId: string | null,
+  kind: "settle" | "walkin",
+  payload: any,
+): void {
+  const db = getDb();
+  const payloadStr = typeof payload === "string" ? payload : JSON.stringify(payload);
+  const now = Date.now();
+  db.query(
+    "INSERT INTO transaction_record (id, restaurant_id, order_id, kind, payload, cloud_synced, created_at) VALUES (?, ?, ?, ?, ?, 0, ?) ON CONFLICT(id) DO UPDATE SET payload = ?, restaurant_id = ?, order_id = ?, cloud_synced = 0",
+  ).run(id, restaurantId, orderId, kind, payloadStr, now, payloadStr, restaurantId, orderId);
+}
+
+export function getTransactionRecord(id: string): any | null {
+  const db = getDb();
+  const row = db.query("SELECT payload FROM transaction_record WHERE id = ?").get(id) as { payload: string } | null;
+  if (!row || !row.payload) return null;
+  try {
+    return JSON.parse(row.payload);
+  } catch {
+    return null;
+  }
+}
+
+export function markTransactionRecordSynced(id: string): void {
+  const db = getDb();
+  db.query("UPDATE transaction_record SET cloud_synced = 1, synced_at = ? WHERE id = ?").run(Date.now(), id);
 }
 
 // ── Command log: durable idempotency + audit for edge business commands ──────

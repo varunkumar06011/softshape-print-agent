@@ -19,7 +19,7 @@
 //   - Emit socket events for real-time dashboard updates
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, insertSyncAudit, recordSyncMetric, getSyncAlerts } from "./db.ts";
+import { getDb, insertSyncAudit, recordSyncMetric, getSyncAlerts, getTransactionRecord, markTransactionRecordSynced } from "./db.ts";
 import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid, getDeviceId, saveSession, loadSession } from "./auth.ts";
 import { cloudFetch } from "./cloudFetch.ts";
 import { pullIncrementalChanges } from "./config.ts";
@@ -70,9 +70,17 @@ function collectBatch(): SyncQueueRow[] {
   // Simple FIFO — oldest first. Records that have failed (attempts >= MAX_ATTEMPTS)
   // are pushed to the end of the queue so they don't block other records,
   // but they stay in the queue and keep retrying.
+  //
+  // DEAD_LETTER rows (last_error LIKE 'DEAD_LETTER:%') are excluded from the
+  // normal sync cycle. They are surfaced in the recovery UI and only retried
+  // via the explicit retryDeadLetters() endpoint or the reconciliation worker
+  // (which resets their attempts). Without this exclusion the worker keeps
+  // re-selecting permanently broken records every cycle, wasting bandwidth
+  // and making the pending count climb without progress.
   return db.query(`
     SELECT * FROM sync_queue
     WHERE synced = 0
+      AND (last_error IS NULL OR last_error NOT LIKE 'DEAD_LETTER:%')
     ORDER BY
       CASE WHEN attempts >= ? THEN 1 ELSE 0 END,
       created_at ASC, id ASC
@@ -298,8 +306,11 @@ function loadRecordData(tableName: string, recordId: string): any | null {
     }
 
     case "transaction": {
-      // Payment confirmations are stored in edge_config with key `payment:${transactionId}`
-      // Settle records use `settle:${localTxnId}` — check both prefixes
+      // Durable source: transaction_record table (preferred).
+      // Fallback: edge_config keys `payment:${transactionId}` / `settle:${localTxnId}`
+      // (kept for rows written by older app versions before transaction_record).
+      const durable = getTransactionRecord(recordId);
+      if (durable) return durable;
       const row = db.query("SELECT value FROM edge_config WHERE key IN (?, ?)").get(`payment:${recordId}`, `settle:${recordId}`) as any;
       if (!row || !row.value) return null;
       try {
@@ -310,7 +321,10 @@ function loadRecordData(tableName: string, recordId: string): any | null {
     }
 
     case "walkin_transaction": {
-      // Walk-in transactions are stored in edge_config with key `walkin_txn:${localId}`
+      // Durable source: transaction_record table (preferred).
+      // Fallback: edge_config key `walkin_txn:${localId}`.
+      const durable = getTransactionRecord(recordId);
+      if (durable) return durable;
       const row = db.query("SELECT value FROM edge_config WHERE key = ?").get(`walkin_txn:${recordId}`) as any;
       if (!row || !row.value) return null;
       try {
@@ -363,6 +377,10 @@ function markSynced(queueIds: number[]): void {
       db.query("UPDATE kot SET cloud_synced = 1 WHERE id = ?").run(row.record_id);
     } else if (row.table_name === "kot_item") {
       db.query("UPDATE kot_item SET cloud_synced = 1 WHERE id = ?").run(row.record_id);
+    } else if (row.table_name === "transaction" || row.table_name === "walkin_transaction") {
+      // Mark the durable transaction_record as synced so the reconciliation
+      // worker knows it reached the cloud and doesn't re-enqueue it.
+      markTransactionRecordSynced(row.record_id);
     }
   }
 
@@ -506,61 +524,69 @@ async function ensureCloudSession(): Promise<boolean> {
   if (_cloudRegistrationAttempted) return false;
   _cloudRegistrationAttempted = true;
 
-  const backendUrl = getBackendUrl();
-  const restaurantId = getRestaurantId();
-  if (!backendUrl || !restaurantId) return false;
+  // DEPRECATED: Offline onboarding (register-offline) has been retired.
+  // Restaurants must register via the 13-step web wizard, then link the
+  // desktop app via /edge-setup (which uses the authenticated /api/edge/register).
+  // If a local-onboard token is detected, the user needs to re-link via /edge-setup.
+  console.warn("[Sync] Local onboarding token detected — offline registration is deprecated. Please re-link this device via the web onboarding wizard and /edge-setup.");
+  return false;
 
-  // Load outlet + owner data from local SQLite to send to the cloud
-  const db = getDb();
-  const outlet = db.query("SELECT * FROM outlet WHERE id = ?").get(restaurantId) as any;
-  if (!outlet) {
-    console.warn("[Sync] No outlet found in local DB for cloud registration");
-    return false;
-  }
-
-  const owner = db.query("SELECT name, pin FROM users WHERE outlet_id = ? AND role = 'OWNER' LIMIT 1").get(restaurantId) as any;
-
-  console.log("[Sync] Local onboarding token detected — attempting cloud registration...");
-  try {
-    const res = await fetch(`${backendUrl}/api/edge/register-offline`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        restaurantId,
-        deviceId: getDeviceId(),
-        restaurantName: outlet.name,
-        restaurantType: outlet.restaurant_type,
-        restaurantCode: outlet.restaurant_code,
-        slug: outlet.slug,
-        owner: owner ? { name: owner.name, pin: owner.pin } : undefined,
-      }),
-      signal: AbortSignal.timeout(10000),
-    });
-
-    if (!res.ok) {
-      const errBody = await res.json().catch(() => ({}));
-      console.warn(`[Sync] Cloud registration failed: HTTP ${res.status} — ${errBody.error || ''}`);
-      _cloudRegistrationAttempted = false; // allow retry next cycle
-      return false;
-    }
-
-    const data = await res.json() as { sessionToken: string; restaurantName: string; restaurantCode: string };
-    console.log(`[Sync] Cloud registration successful — got real JWT for ${data.restaurantName}`);
-
-    // Update the stored session with the real JWT
-    saveSession({
-      ...session,
-      sessionToken: data.sessionToken,
-      restaurantName: data.restaurantName,
-      restaurantCode: data.restaurantCode,
-    });
-
-    return true;
-  } catch (err) {
-    console.warn("[Sync] Cloud registration error:", err);
-    _cloudRegistrationAttempted = false; // allow retry next cycle
-    return false;
-  }
+  // ── DEPRECATED register-offline call (preserved for reference) ──────────
+  // const backendUrl = getBackendUrl();
+  // const restaurantId = getRestaurantId();
+  // if (!backendUrl || !restaurantId) return false;
+  //
+  // // Load outlet + owner data from local SQLite to send to the cloud
+  // const db = getDb();
+  // const outlet = db.query("SELECT * FROM outlet WHERE id = ?").get(restaurantId) as any;
+  // if (!outlet) {
+  //   console.warn("[Sync] No outlet found in local DB for cloud registration");
+  //   return false;
+  // }
+  //
+  // const owner = db.query("SELECT name, pin FROM users WHERE outlet_id = ? AND role = 'OWNER' LIMIT 1").get(restaurantId) as any;
+  //
+  // console.log("[Sync] Local onboarding token detected — attempting cloud registration...");
+  // try {
+  //   const res = await fetch(`${backendUrl}/api/edge/register-offline`, {
+  //     method: "POST",
+  //     headers: { "Content-Type": "application/json" },
+  //     body: JSON.stringify({
+  //       restaurantId,
+  //       deviceId: getDeviceId(),
+  //       restaurantName: outlet.name,
+  //       restaurantType: outlet.restaurant_type,
+  //       restaurantCode: outlet.restaurant_code,
+  //       slug: outlet.slug,
+  //       owner: owner ? { name: owner.name, pin: owner.pin } : undefined,
+  //     }),
+  //     signal: AbortSignal.timeout(10000),
+  //   });
+  //
+  //   if (!res.ok) {
+  //     const errBody = await res.json().catch(() => ({}));
+  //     console.warn(`[Sync] Cloud registration failed: HTTP ${res.status} — ${errBody.error || ''}`);
+  //     _cloudRegistrationAttempted = false; // allow retry next cycle
+  //     return false;
+  //   }
+  //
+  //   const data = await res.json() as { sessionToken: string; restaurantName: string; restaurantCode: string };
+  //   console.log(`[Sync] Cloud registration successful — got real JWT for ${data.restaurantName}`);
+  //
+  //   // Update the stored session with the real JWT
+  //   saveSession({
+  //     ...session,
+  //     sessionToken: data.sessionToken,
+  //     restaurantName: data.restaurantName,
+  //     restaurantCode: data.restaurantCode,
+  //   });
+  //
+  //   return true;
+  // } catch (err) {
+  //   console.warn("[Sync] Cloud registration error:", err);
+  //   _cloudRegistrationAttempted = false; // allow retry next cycle
+  //   return false;
+  // }
 }
 
 export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; accepted: number; rejected: number; error?: string }> {
@@ -878,6 +904,22 @@ async function runSyncCycle(): Promise<void> {
         console.warn("[Sync] Config pull failed:", (pullErr as Error)?.message || pullErr);
       }
     }
+
+    // Periodically reconcile transactions: re-enqueue any settled order or
+    // walk-in transaction whose sync record is missing, dead-lettered, or
+    // permanently rejected. This is the guarantee that every transaction
+    // reaches the cloud admin panel — "sync at all cost".
+    if (now - lastReconcileAt >= RECONCILE_INTERVAL_MS) {
+      lastReconcileAt = now;
+      try {
+        const recon = reconcileTransactions();
+        if (recon.enqueued > 0 || recon.reset > 0 || recon.backfilled > 0) {
+          console.log(`[Sync] Reconciliation: ${recon.enqueued} re-enqueued, ${recon.reset} dead-letter resets, ${recon.backfilled} backfilled from legacy edge_config`);
+        }
+      } catch (reconErr) {
+        console.warn("[Sync] Reconciliation failed:", (reconErr as Error)?.message || reconErr);
+      }
+    }
   } catch (err) {
     consecutiveFailures++;
     console.error("[Sync] Worker cycle error:", err);
@@ -913,6 +955,19 @@ export function startSyncWorker(): void {
 
   const initialDelay = consecutiveFailures > 0 ? getBackoffDelay() : 5_000;
   console.log(`[Sync] Worker started — initial delay: ${initialDelay}ms, base interval: ${SYNC_INTERVAL_MS}ms`);
+
+  // Run reconciliation immediately on startup so transactions settled while
+  // the edge was offline (or before this version) are re-enqueued before the
+  // first normal sync cycle. Non-blocking — errors don't stop the worker.
+  try {
+    const recon = reconcileTransactions();
+    if (recon.enqueued > 0 || recon.reset > 0 || recon.backfilled > 0) {
+      console.log(`[Sync] Startup reconciliation: ${recon.enqueued} re-enqueued, ${recon.reset} dead-letter resets, ${recon.backfilled} backfilled`);
+    }
+  } catch (err) {
+    console.warn("[Sync] Startup reconciliation failed:", (err as Error)?.message || err);
+  }
+
   scheduleNextCycle(initialDelay);
 }
 
@@ -1013,4 +1068,183 @@ export function retrySingleDeadLetter(queueId: number): { success: boolean } {
   const db = getDb();
   const result = db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL WHERE id = ? AND synced = 0 AND attempts >= ?").run(queueId, MAX_ATTEMPTS);
   return { success: (result.changes || 0) > 0 };
+}
+
+// ─── Reconciliation worker — guarantees transactions reach the cloud ──────────
+//
+// Scans every locally settled order and every walk-in transaction_record, and
+// re-enqueues a `transaction` / `walkin_transaction` sync row whenever:
+//   - the record is missing from sync_queue entirely, or
+//   - the only queue row is dead-lettered (attempts >= MAX_ATTEMPTS), or
+//   - the only queue row was permanently rejected/conflicted/duplicated by the
+//     cloud (we still re-enqueue because a rejected transaction means the
+//     admin panel will never see it — better to retry than to silently lose
+//     revenue data).
+//
+// For orders settled before transaction_record existed (older app versions),
+// we backfill the transaction_record row from the legacy edge_config
+// `settle:<localTxnId>` key so the sync worker can reconstruct the payload.
+//
+// Runs on startup and every RECONCILE_INTERVAL_MS inside the sync cycle.
+// This is the safety net that makes "sync at all cost" true: even if the
+// original enqueue was lost, the queue row was dequeued as a duplicate, or
+// the worker dead-lettered the record, the reconciliation pass will put it
+// back in the queue.
+
+const RECONCILE_INTERVAL_MS = 5 * 60_000; // every 5 minutes
+let lastReconcileAt = 0;
+
+export function reconcileTransactions(): { enqueued: number; reset: number; backfilled: number } {
+  const db = getDb();
+  let enqueued = 0;
+  let reset = 0;
+  let backfilled = 0;
+
+  // ── 1. Settled orders → transaction sync ──────────────────────────────────
+  // A settled order must have a transaction_record + a queue row that is either
+  // pending or synced-applied. If the queue row is missing, dead-lettered, or
+  // permanently rejected, we re-enqueue.
+  const settledOrders = db.query(
+    `SELECT id, restaurant_id
+     FROM order_record
+     WHERE status = 'SETTLED'
+       AND NOT EXISTS (SELECT 1 FROM edge_config WHERE key = 'txn_deleted:' || order_record.id)`,
+  ).all() as Array<{ id: string; restaurant_id: string }>;
+
+  for (const order of settledOrders) {
+    // Find the transaction_record for this order. If missing (older app
+    // version), try to backfill from edge_config settle:* key.
+    let txnRow = db.query("SELECT id, payload FROM transaction_record WHERE order_id = ? AND kind = 'settle' ORDER BY created_at DESC LIMIT 1").get(order.id) as { id: string; payload: string } | null;
+
+    if (!txnRow) {
+      // Backfill from legacy edge_config settle:* key.
+      const settleRow = db.query(
+        "SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ? LIMIT 1",
+      ).get(order.id) as { value: string } | null;
+      if (!settleRow || !settleRow.value) continue;
+      let settleData: any;
+      try { settleData = JSON.parse(settleRow.value); } catch { continue; }
+      const localTxnId = settleData.localTxnId;
+      if (!localTxnId) continue;
+      // Persist into transaction_record so future sync cycles can read it.
+      try {
+        db.query(
+          "INSERT INTO transaction_record (id, restaurant_id, order_id, kind, payload, cloud_synced, created_at) VALUES (?, ?, ?, 'settle', ?, 0, ?) ON CONFLICT(id) DO NOTHING",
+        ).run(localTxnId, order.restaurant_id, order.id, settleRow.value, Date.now());
+        backfilled++;
+        txnRow = { id: localTxnId, payload: settleRow.value };
+      } catch {
+        continue;
+      }
+    }
+
+    const localTxnId = txnRow.id;
+    const pendingRow = db.query(
+      "SELECT id, synced, attempts, last_error FROM sync_queue WHERE table_name = 'transaction' AND record_id = ? ORDER BY id DESC LIMIT 1",
+    ).get(localTxnId) as { id: number; synced: number; attempts: number; last_error: string | null } | null;
+
+    if (!pendingRow) {
+      // Missing from queue — re-enqueue.
+      db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('transaction', ?, 'insert', ?)")
+        .run(localTxnId, Date.now());
+      enqueued++;
+      continue;
+    }
+
+    if (pendingRow.synced === 1) {
+      // Dequeued. Check if it was permanently rejected — if so, re-enqueue
+      // because the admin panel will never see the revenue otherwise.
+      const auditRow = db.query(
+        "SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'transaction' ORDER BY audited_at DESC LIMIT 1",
+      ).get(pendingRow.id) as { outcome: string } | null;
+      if (auditRow && ["rejected", "conflict", "duplicate"].includes(auditRow.outcome)) {
+        db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('transaction', ?, 'insert', ?)")
+          .run(localTxnId, Date.now());
+        enqueued++;
+      }
+      continue;
+    }
+
+    // synced = 0 — still in queue. If dead-lettered, reset attempts so the
+    // normal worker (which now excludes DEAD_LETTER rows) picks it up again.
+    if (pendingRow.attempts >= MAX_ATTEMPTS) {
+      db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL WHERE id = ?").run(pendingRow.id);
+      reset++;
+    }
+  }
+
+  // ── 2. Walk-in transactions → walkin_transaction sync ─────────────────────
+  const walkinRows = db.query(
+    "SELECT id, restaurant_id FROM transaction_record WHERE kind = 'walkin'",
+  ).all() as Array<{ id: string; restaurant_id: string }>;
+
+  for (const row of walkinRows) {
+    const localId = row.id;
+    const pendingRow = db.query(
+      "SELECT id, synced, attempts FROM sync_queue WHERE table_name = 'walkin_transaction' AND record_id = ? ORDER BY id DESC LIMIT 1",
+    ).get(localId) as { id: number; synced: number; attempts: number } | null;
+
+    if (!pendingRow) {
+      db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('walkin_transaction', ?, 'insert', ?)")
+        .run(localId, Date.now());
+      enqueued++;
+      continue;
+    }
+
+    if (pendingRow.synced === 1) {
+      const auditRow = db.query(
+        "SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'walkin_transaction' ORDER BY audited_at DESC LIMIT 1",
+      ).get(pendingRow.id) as { outcome: string } | null;
+      if (auditRow && ["rejected", "conflict", "duplicate"].includes(auditRow.outcome)) {
+        db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('walkin_transaction', ?, 'insert', ?)")
+          .run(localId, Date.now());
+        enqueued++;
+      }
+      continue;
+    }
+
+    if (pendingRow.attempts >= MAX_ATTEMPTS) {
+      db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL WHERE id = ?").run(pendingRow.id);
+      reset++;
+    }
+  }
+
+  // ── 3. Legacy walk-in rows only in edge_config (no transaction_record) ────
+  const legacyWalkin = db.query("SELECT key, value FROM edge_config WHERE key LIKE 'walkin_txn:%'").all() as Array<{ key: string; value: string }>;
+  for (const row of legacyWalkin) {
+    const localId = row.key.replace("walkin_txn:", "");
+    const exists = db.query("SELECT 1 FROM transaction_record WHERE id = ?").get(localId);
+    if (exists) continue;
+    let data: any;
+    try { data = JSON.parse(row.value); } catch { continue; }
+    try {
+      db.query(
+        "INSERT INTO transaction_record (id, restaurant_id, order_id, kind, payload, cloud_synced, created_at) VALUES (?, ?, ?, 'walkin', ?, 0, ?) ON CONFLICT(id) DO NOTHING",
+      ).run(localId, data.restaurantId, data.orderId || null, row.value, Date.now());
+      backfilled++;
+      // Re-enqueue if missing.
+      const pendingRow = db.query(
+        "SELECT id, synced, attempts FROM sync_queue WHERE table_name = 'walkin_transaction' AND record_id = ? ORDER BY id DESC LIMIT 1",
+      ).get(localId) as { id: number; synced: number; attempts: number } | null;
+      if (!pendingRow) {
+        db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('walkin_transaction', ?, 'insert', ?)")
+          .run(localId, Date.now());
+        enqueued++;
+      } else if (pendingRow.synced === 1) {
+        const auditRow = db.query(
+          "SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'walkin_transaction' ORDER BY audited_at DESC LIMIT 1",
+        ).get(pendingRow.id) as { outcome: string } | null;
+        if (auditRow && ["rejected", "conflict", "duplicate"].includes(auditRow.outcome)) {
+          db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('walkin_transaction', ?, 'insert', ?)")
+            .run(localId, Date.now());
+          enqueued++;
+        }
+      } else if (pendingRow.attempts >= MAX_ATTEMPTS) {
+        db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL WHERE id = ?").run(pendingRow.id);
+        reset++;
+      }
+    } catch { /* ignore */ }
+  }
+
+  return { enqueued, reset, backfilled };
 }
