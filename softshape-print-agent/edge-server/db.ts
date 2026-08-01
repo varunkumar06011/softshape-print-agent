@@ -32,7 +32,7 @@ export function getKolkataDateString(date = new Date()): string {
   return corrected.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
 }
 
-const CURRENT_SCHEMA_VERSION = 5;
+const CURRENT_SCHEMA_VERSION = 6;
 
 // Schema versions that can be migrated in place (via runMigrations) without
 // wiping the database. Any version not in this set triggers the existing
@@ -40,7 +40,10 @@ const CURRENT_SCHEMA_VERSION = 5;
 // table via idempotent ALTER TABLE / CREATE TABLE IF NOT EXISTS, so it is
 // safe to apply to a live production DB without data loss. v4 → v5 adds the
 // transaction_record table (CREATE TABLE IF NOT EXISTS) — also idempotent.
-const SAFE_INPLACE_MIGRATION_FROM = new Set<number>([2, 3, 4]);
+// v5 → v6 recreates the kot table with a date-scoped unique constraint
+// (UNIQUE(restaurant_id, kot_number, counter_date)) and backfills
+// counter_date from created_at so KOT numbers can restart at 1 daily.
+const SAFE_INPLACE_MIGRATION_FROM = new Set<number>([2, 3, 4, 5]);
 
 let db: Database | null = null;
 let recoveryStatus: RecoveryResult = { recovered: false, corruptPath: null, message: "" };
@@ -490,15 +493,19 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_order_item_synced ON order_item(cloud_synced) WHERE cloud_synced = 0;
 
     -- KOTs (Kitchen Order Tickets)
+    -- counter_date scopes kot_number uniqueness per IST business day so that
+    -- KOT numbers can restart at 1 each morning without colliding with
+    -- previous days' KOTs.
     CREATE TABLE IF NOT EXISTS kot (
       id              TEXT PRIMARY KEY,
       restaurant_id   TEXT NOT NULL,
       table_id        TEXT NOT NULL,
       order_id        TEXT NOT NULL,
       kot_number      INTEGER NOT NULL,
+      counter_date    TEXT NOT NULL DEFAULT '',
       created_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
       cloud_synced    INTEGER DEFAULT 0,
-      UNIQUE(restaurant_id, kot_number)
+      UNIQUE(restaurant_id, kot_number, counter_date)
     );
     CREATE INDEX IF NOT EXISTS idx_kot_restaurant_table ON kot(restaurant_id, table_id);
     CREATE INDEX IF NOT EXISTS idx_kot_restaurant_order ON kot(restaurant_id, order_id);
@@ -674,23 +681,66 @@ function initSchema(database: Database) {
 
     -- Expenditures (cash payments for staff/maintenance/other)
     CREATE TABLE IF NOT EXISTS expenditure (
-      id              TEXT PRIMARY KEY,
-      restaurant_id   TEXT NOT NULL,
-      amount          REAL NOT NULL,
-      paid_to_type    TEXT,
-      paid_to_name    TEXT,
-      category        TEXT,
-      narration       TEXT,
-      approver        TEXT,
-      created_by      TEXT,
-      expenditure_no  INTEGER,
-      date            TEXT NOT NULL,
-      created_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
-      voided          INTEGER DEFAULT 0,
-      cloud_synced    INTEGER DEFAULT 0
+      id                TEXT PRIMARY KEY,
+      restaurant_id     TEXT NOT NULL,
+      amount            REAL NOT NULL,
+      paid_to_type      TEXT,
+      paid_to_name      TEXT,
+      category          TEXT,
+      narration         TEXT,
+      approver          TEXT,
+      created_by        TEXT,
+      expenditure_no    INTEGER,
+      date              TEXT NOT NULL,
+      created_at        INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+      voided            INTEGER DEFAULT 0,
+      cloud_synced      INTEGER DEFAULT 0,
+      employee_id       TEXT,                 -- FK to employee.id (STAFF type)
+      ledger_category_id TEXT,                -- FK to ledger_category.id (OTHER type)
+      entry_type        TEXT DEFAULT 'EXPENSE' -- ASSET | LIABILITY | GROCERY | EXPENSE | LIABILITY_PAYMENT
     );
     CREATE INDEX IF NOT EXISTS idx_expenditure_date ON expenditure(date);
     CREATE INDEX IF NOT EXISTS idx_expenditure_synced ON expenditure(cloud_synced) WHERE cloud_synced = 0;
+    -- idx_expenditure_employee and idx_expenditure_ledger are created in
+    -- runMigrations (after ALTER TABLE adds the columns for v5 DBs). Creating
+    -- them here crashes on v5 databases where employee_id/ledger_category_id
+    -- don't exist yet, because initSchema runs BEFORE runMigrations.
+
+    -- Employees (staff without login accounts — created from expenditure module)
+    -- Mirrors the cloud Employee table. Locally-created employees (cloud_synced=0)
+    -- are pushed to cloud via the sync worker; cloud-created employees are pulled
+    -- via the config sync and have cloud_synced=1.
+    CREATE TABLE IF NOT EXISTS employee (
+      id              TEXT PRIMARY KEY,
+      restaurant_id   TEXT NOT NULL,
+      name            TEXT NOT NULL,
+      role            TEXT,              -- null = no role assigned (admin assigns later)
+      is_active       INTEGER DEFAULT 1,
+      created_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+      cloud_synced    INTEGER DEFAULT 0,
+      synced_at       INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_employee_outlet ON employee(restaurant_id);
+    CREATE INDEX IF NOT EXISTS idx_employee_active ON employee(is_active) WHERE is_active = 1;
+    CREATE INDEX IF NOT EXISTS idx_employee_synced ON employee(cloud_synced) WHERE cloud_synced = 0;
+
+    -- Ledger Categories (expense/asset/liability categories — user-creatable)
+    -- Mirrors the cloud LedgerCategory table. Locally-created categories
+    -- (cloud_synced=0) are pushed to cloud via the sync worker; cloud-created
+    -- categories are pulled via the config sync and have cloud_synced=1.
+    CREATE TABLE IF NOT EXISTS ledger_category (
+      id              TEXT PRIMARY KEY,
+      restaurant_id   TEXT NOT NULL,
+      name            TEXT NOT NULL,
+      entry_type      TEXT NOT NULL DEFAULT 'EXPENSE',
+      is_active       INTEGER DEFAULT 1,
+      created_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+      cloud_synced    INTEGER DEFAULT 0,
+      synced_at       INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_ledger_category_outlet ON ledger_category(restaurant_id);
+    CREATE INDEX IF NOT EXISTS idx_ledger_category_active ON ledger_category(is_active) WHERE is_active = 1;
+    CREATE INDEX IF NOT EXISTS idx_ledger_category_synced ON ledger_category(cloud_synced) WHERE cloud_synced = 0;
 
     -- Transaction Record (durable local copy of every settlement + walk-in txn)
     -- Stores the full payment payload that the sync worker needs to create the
@@ -856,6 +906,58 @@ function runMigrations(database: Database) {
     database.exec(`ALTER TABLE outlet_migrate_tmp RENAME TO outlet;`);
     console.warn("[DB] outlet table recreated with nullable organization_id");
   }
+
+  // ── v6: kot table — add counter_date + date-scoped uniqueness ──────────────
+  // Recreate the kot table so the unique constraint becomes
+  // UNIQUE(restaurant_id, kot_number, counter_date) instead of
+  // UNIQUE(restaurant_id, kot_number). This allows KOT numbers to restart at 1
+  // each IST day without colliding with previous days' KOTs.
+  // counter_date is backfilled from created_at (epoch ms) using IST offset
+  // (UTC+5:30 = +19800 seconds).
+  if (!hasColumn("kot", "counter_date")) {
+    database.exec(`
+      CREATE TABLE kot_migrate_tmp (
+        id              TEXT PRIMARY KEY,
+        restaurant_id   TEXT NOT NULL,
+        table_id        TEXT NOT NULL,
+        order_id        TEXT NOT NULL,
+        kot_number      INTEGER NOT NULL,
+        counter_date    TEXT NOT NULL DEFAULT '',
+        created_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        cloud_synced    INTEGER DEFAULT 0,
+        UNIQUE(restaurant_id, kot_number, counter_date)
+      );
+    `);
+    database.exec(`
+      INSERT INTO kot_migrate_tmp (id, restaurant_id, table_id, order_id, kot_number, counter_date, created_at, cloud_synced)
+      SELECT id, restaurant_id, table_id, order_id, kot_number,
+             date((created_at / 1000) + 19800, 'unixepoch') AS counter_date,
+             created_at, cloud_synced
+      FROM kot;
+    `);
+    database.exec(`DROP TABLE kot;`);
+    database.exec(`ALTER TABLE kot_migrate_tmp RENAME TO kot;`);
+    database.exec(`CREATE INDEX IF NOT EXISTS idx_kot_restaurant_table ON kot(restaurant_id, table_id)`);
+    database.exec(`CREATE INDEX IF NOT EXISTS idx_kot_restaurant_order ON kot(restaurant_id, order_id)`);
+    database.exec(`CREATE INDEX IF NOT EXISTS idx_kot_synced ON kot(cloud_synced) WHERE cloud_synced = 0`);
+    console.warn("[DB] kot table recreated with counter_date column and date-scoped uniqueness");
+  }
+
+  // ── v7: expenditure FK columns — employee_id, ledger_category_id, entry_type ──
+  // Added so edge-synced expenditures carry the same linkage as cloud-created
+  // ones (payroll for STAFF, ledger category for OTHER). Backward compatible:
+  // existing rows default to NULL employee_id/ledger_category_id and 'EXPENSE'.
+  if (!hasColumn("expenditure", "employee_id")) {
+    database.exec(`ALTER TABLE expenditure ADD COLUMN employee_id TEXT`);
+  }
+  if (!hasColumn("expenditure", "ledger_category_id")) {
+    database.exec(`ALTER TABLE expenditure ADD COLUMN ledger_category_id TEXT`);
+  }
+  if (!hasColumn("expenditure", "entry_type")) {
+    database.exec(`ALTER TABLE expenditure ADD COLUMN entry_type TEXT DEFAULT 'EXPENSE'`);
+  }
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_expenditure_employee ON expenditure(employee_id) WHERE employee_id IS NOT NULL`);
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_expenditure_ledger ON expenditure(ledger_category_id) WHERE ledger_category_id IS NOT NULL`);
 }
 
 // ── Prepared statement helpers ───────────────────────────────────────────────
@@ -1175,11 +1277,36 @@ export function getSyncAlerts(): Array<{
 
 export function getOrderSyncStatus(orderId: string): { synced: boolean; pending: number; deadLettered: number } {
   const db = getDb();
-  const rows = db.query(
+
+  // ── Order-related sync rows (order, order_item, kot, kot_item) ──────────────
+  // NOTE: only the 'order' row actually matches record_id = orderId; order_item,
+  // kot, and kot_item rows store their own IDs in record_id, so they won't match
+  // here. This is a known limitation — the order row is the one that matters for
+  // confirming the order itself reached the cloud.
+  const orderRows = db.query(
     `SELECT synced, attempts FROM sync_queue WHERE table_name IN ('order', 'order_item', 'kot', 'kot_item') AND record_id = ?`,
   ).all(orderId) as any[];
 
-  if (rows.length === 0) {
+  // ── Transaction sync rows linked to this order ──────────────────────────────
+  // Transactions are enqueued under their localTxnId (not the orderId), so we
+  // look them up via the transaction_record table which has an order_id column.
+  // Without this check, the frontend considers the settlement synced as soon as
+  // the order row is confirmed — even if the payment/transaction is still
+  // pending, failing, or dead-lettered in the sync queue. That causes the
+  // frontend to drop its tracking record prematurely, and if the transaction
+  // subsequently fails permanently, the payment never reaches the cloud admin
+  // panel.
+  const txnRows = db.query(
+    `SELECT sq.synced, sq.attempts
+     FROM sync_queue sq
+     JOIN transaction_record tr ON sq.record_id = tr.id
+     WHERE sq.table_name IN ('transaction', 'walkin_transaction')
+       AND tr.order_id = ?`,
+  ).all(orderId) as any[];
+
+  const allRows = [...orderRows, ...txnRows];
+
+  if (allRows.length === 0) {
     // No sync_queue rows — check if the order exists at all.
     // If it doesn't exist, the order was never created (wrong ID or not yet processed).
     // If it exists with no pending sync entries, it was either already synced and
@@ -1188,9 +1315,17 @@ export function getOrderSyncStatus(orderId: string): { synced: boolean; pending:
     if (!order) {
       return { synced: false, pending: 0, deadLettered: 0 };
     }
-    // Order exists — if cloud_synced is 1, it was confirmed synced.
-    // Otherwise, it may not have been queued yet (race condition) — treat as pending.
+    // Order exists — if cloud_synced is 1, the order was confirmed synced.
+    // But also verify any transaction_record for this order is synced, otherwise
+    // the settlement payment hasn't reached the cloud yet.
     if (order.cloud_synced === 1) {
+      const txnSynced = db.query(
+        `SELECT 1 FROM transaction_record WHERE order_id = ? AND cloud_synced = 0 LIMIT 1`,
+      ).get(orderId) as any;
+      if (txnSynced) {
+        // Order is synced but a transaction is still pending — don't report synced.
+        return { synced: false, pending: 1, deadLettered: 0 };
+      }
       return { synced: true, pending: 0, deadLettered: 0 };
     }
     return { synced: false, pending: 1, deadLettered: 0 };
@@ -1198,7 +1333,7 @@ export function getOrderSyncStatus(orderId: string): { synced: boolean; pending:
 
   let pending = 0;
   let deadLettered = 0;
-  for (const row of rows) {
+  for (const row of allRows) {
     if (row.synced === 1) continue;
     if (row.attempts >= 5) deadLettered++;
     else pending++;
@@ -1212,20 +1347,12 @@ export function getNextKotNumber(restaurantId: string): number {
   const db = getDb();
   const today = getKolkataDateString();
 
-  // Upsert daily counter
+  // Upsert daily counter — a new row is created each IST day, so the counter
+  // naturally resets to 0 and the first KOT of the day becomes #1.
+  // The kot table uses UNIQUE(restaurant_id, kot_number, counter_date) so
+  // today's #1 cannot collide with a previous day's #1.
   db.query("INSERT INTO daily_counter (id, restaurant_id, counter_date, kot_count) VALUES (?, ?, ?, 0) ON CONFLICT(restaurant_id, counter_date) DO NOTHING")
     .run(crypto.randomUUID(), restaurantId, today);
-
-  // Sync: ensure daily counter is at least as high as the global max kot_number.
-  // The kot table has UNIQUE(restaurant_id, kot_number) which is NOT scoped per day,
-  // but daily_counter resets each morning. Without this sync, today's counter
-  // could generate a number that collides with a KOT from a previous day.
-  const maxRow = db.query("SELECT MAX(kot_number) AS max_kot FROM kot WHERE restaurant_id = ?").get(restaurantId) as { max_kot: number | null } | undefined;
-  const globalMax = maxRow?.max_kot ?? 0;
-  if (globalMax > 0) {
-    db.query("UPDATE daily_counter SET kot_count = MAX(kot_count, ?) WHERE restaurant_id = ? AND counter_date = ?")
-      .run(globalMax, restaurantId, today);
-  }
 
   // Atomically increment kot_count and return the new value
   const row = db.query("UPDATE daily_counter SET kot_count = kot_count + 1 WHERE restaurant_id = ? AND counter_date = ? RETURNING kot_count")

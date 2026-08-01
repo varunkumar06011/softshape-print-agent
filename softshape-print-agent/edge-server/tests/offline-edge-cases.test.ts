@@ -79,8 +79,10 @@ function createTestDb(): Database {
     CREATE TABLE IF NOT EXISTS kot (
       id TEXT PRIMARY KEY, restaurant_id TEXT NOT NULL,
       table_id TEXT NOT NULL, order_id TEXT NOT NULL,
-      kot_number INTEGER NOT NULL, created_at INTEGER NOT NULL,
-      cloud_synced INTEGER DEFAULT 0
+      kot_number INTEGER NOT NULL, counter_date TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL,
+      cloud_synced INTEGER DEFAULT 0,
+      UNIQUE(restaurant_id, kot_number, counter_date)
     );
 
     CREATE TABLE IF NOT EXISTS kot_item (
@@ -471,8 +473,8 @@ test("offline -> online end-to-end sync — correct records, no duplicates", asy
     .run(orderId, 'table1', RESTAURANT_ID, now, now);
   testDb.query(`INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, menu_type, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`)
     .run(orderItemId, orderId, 'menu1', 'Biryani', 250, 1, 'FOOD');
-  testDb.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, created_at, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, 0)`)
-    .run(kotId, RESTAURANT_ID, 'table1', orderId, 1, now);
+  testDb.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, counter_date, created_at, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`)
+    .run(kotId, RESTAURANT_ID, 'table1', orderId, 1, '2025-01-01', now);
   testDb.query(`INSERT INTO kot_item (id, kot_id, order_item_id, menu_item_id, name, quantity, price, status, created_at, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, 'SENT', ?, 0)`)
     .run(kotItemId, kotId, orderItemId, 'menu1', 'Biryani', 1, 250, now);
   testDb.query(`UPDATE "table" SET status = 'OCCUPIED', workflow_status = 'Preparing', current_bill = 250, updated_at = ? WHERE id = ?`).run(now, 'table1');

@@ -310,6 +310,7 @@ export interface Outlet {
 
 export interface GetStaffResponse {
   staff: StaffMember[];
+  outletId: string | null;
 }
 
 export interface StaffMember {

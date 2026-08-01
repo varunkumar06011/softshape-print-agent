@@ -838,6 +838,7 @@ export async function createOrder(
   const orderId = crypto.randomUUID();
   const kotId = crypto.randomUUID();
   const kotNumber = typeof preReservedKotNumber === 'number' && preReservedKotNumber > 0 ? preReservedKotNumber : getNextKotNumber(restaurantId);
+  const kotCounterDate = getKolkataDateString();
 
   // ── Build print groups BEFORE transaction (pure computation) ───────────────
   // Print intents are persisted inside the transaction to guarantee atomicity.
@@ -912,9 +913,9 @@ export async function createOrder(
     }
 
     // 3. Create KOT
-    db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, created_at, cloud_synced)
-      VALUES (?, ?, ?, ?, ?, ?, 0)
-    `).run(kotId, restaurantId, tableId, orderId, kotNumber, now);
+    db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, counter_date, created_at, cloud_synced)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+    `).run(kotId, restaurantId, tableId, orderId, kotNumber, kotCounterDate, now);
 
     // 4. Create KOT items
     const orderItems = db.query("SELECT * FROM order_item WHERE order_id = ?").all(orderId) as any[];
@@ -968,10 +969,10 @@ export async function createOrder(
     const txResult = tx();
     newTableRev = (txResult as any)?.newTableRev ?? 1;
   } catch (err: any) {
-    // UNIQUE constraint violation — could be kot.UNIQUE(restaurant_id, kot_number) or order_record.UNIQUE(last_request_id)
+    // UNIQUE constraint violation — could be kot.UNIQUE(restaurant_id, kot_number, counter_date) or order_record.UNIQUE(last_request_id)
     if (err.message && err.message.includes("UNIQUE")) {
       const isKotConstraint = err.message.includes("kot") || err.message.includes("kot_number");
-      const constraintName = isKotConstraint ? "kot.UNIQUE(restaurant_id, kot_number)" : "order_record.UNIQUE(last_request_id)";
+      const constraintName = isKotConstraint ? "kot.UNIQUE(restaurant_id, kot_number, counter_date)" : "order_record.UNIQUE(last_request_id)";
       console.error(`[createOrder] UNIQUE constraint violation: ${constraintName}`, {
         tableId,
         requestId,
@@ -1202,6 +1203,7 @@ export async function updateOrderItems(
   // ── Generate new KOT for just the new items ─────────────────────────────────
   const kotId = crypto.randomUUID();
   const kotNumber = typeof preReservedKotNumber === 'number' && preReservedKotNumber > 0 ? preReservedKotNumber : getNextKotNumber(restaurantId);
+  const kotCounterDate = getKolkataDateString();
 
   // ── Build print groups BEFORE transaction (pure computation) ───────────────
   const formattedTableNumber = input.isExtraTable && input.tableNumber
@@ -1273,9 +1275,9 @@ export async function updateOrderItems(
     }
 
     // 2. Create new KOT for the new items
-    db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, created_at, cloud_synced)
-      VALUES (?, ?, ?, ?, ?, ?, 0)
-    `).run(kotId, restaurantId, effectiveTableId, orderId, kotNumber, now);
+    db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, counter_date, created_at, cloud_synced)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+    `).run(kotId, restaurantId, effectiveTableId, orderId, kotNumber, kotCounterDate, now);
 
     // 3. Create KOT items for just the new items (using resolved prices)
     for (let i = 0; i < resolvedItems.length; i++) {
@@ -1344,7 +1346,7 @@ export async function updateOrderItems(
   } catch (err: any) {
     if (err.message && err.message.includes("UNIQUE")) {
       const isKotConstraint = err.message.includes("kot") || err.message.includes("kot_number");
-      const constraintName = isKotConstraint ? "kot.UNIQUE(restaurant_id, kot_number)" : "order_record.UNIQUE(last_request_id)";
+      const constraintName = isKotConstraint ? "kot.UNIQUE(restaurant_id, kot_number, counter_date)" : "order_record.UNIQUE(last_request_id)";
       console.error(`[updateOrderItems] UNIQUE constraint violation: ${constraintName}`, {
         orderId,
         requestId,
@@ -2624,8 +2626,9 @@ export async function transferItemsEdge(
       if (sourceKotItems.length > 0) {
         const newKotId = crypto.randomUUID();
         const newKotNumber = getNextKotNumber(restaurantId);
-        db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, created_at, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, 0)`)
-          .run(newKotId, restaurantId, targetTableId, targetOrder.id, newKotNumber, now);
+        const newKotCounterDate = getKolkataDateString();
+        db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, counter_date, created_at, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`)
+          .run(newKotId, restaurantId, targetTableId, targetOrder.id, newKotNumber, newKotCounterDate, now);
 
         const newKotItemsForHistory: any[] = [];
         for (const ski of sourceKotItems) {
@@ -2819,9 +2822,10 @@ export async function editBillEdge(
       // Bug 3: Generate a new KOT for the cashier-added items
       addedKotId = crypto.randomUUID();
       addedKotNumber = getNextKotNumber(restaurantId);
-      db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, created_at, cloud_synced)
-        VALUES (?, ?, ?, ?, ?, ?, 0)
-      `).run(addedKotId, restaurantId, order.table_id, orderId, addedKotNumber, now);
+      const addedKotCounterDate = getKolkataDateString();
+      db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, counter_date, created_at, cloud_synced)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+      `).run(addedKotId, restaurantId, order.table_id, orderId, addedKotNumber, addedKotCounterDate, now);
 
       for (const item of resolvedAddedItems) {
         const newItemId = crypto.randomUUID();

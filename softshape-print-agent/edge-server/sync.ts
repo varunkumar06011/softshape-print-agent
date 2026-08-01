@@ -350,6 +350,31 @@ function loadRecordData(tableName: string, recordId: string): any | null {
         expenditureNo: row.expenditure_no,
         date: row.date,
         voided: !!row.voided,
+        employeeId: row.employee_id || null,
+        ledgerCategoryId: row.ledger_category_id || null,
+        entryType: row.entry_type || "EXPENSE",
+      };
+    }
+
+    case "employee": {
+      const row = db.query("SELECT * FROM employee WHERE id = ?").get(recordId) as any;
+      if (!row) return null;
+      return {
+        id: row.id,
+        restaurantId: row.restaurant_id,
+        name: row.name,
+        role: row.role || null,
+      };
+    }
+
+    case "ledger_category": {
+      const row = db.query("SELECT * FROM ledger_category WHERE id = ?").get(recordId) as any;
+      if (!row) return null;
+      return {
+        id: row.id,
+        restaurantId: row.restaurant_id,
+        name: row.name,
+        entryType: row.entry_type,
       };
     }
 
@@ -381,6 +406,10 @@ function markSynced(queueIds: number[]): void {
       // Mark the durable transaction_record as synced so the reconciliation
       // worker knows it reached the cloud and doesn't re-enqueue it.
       markTransactionRecordSynced(row.record_id);
+    } else if (row.table_name === "employee") {
+      db.query("UPDATE employee SET cloud_synced = 1, synced_at = ? WHERE id = ?").run(Date.now(), row.record_id);
+    } else if (row.table_name === "ledger_category") {
+      db.query("UPDATE ledger_category SET cloud_synced = 1, synced_at = ? WHERE id = ?").run(Date.now(), row.record_id);
     }
   }
 
@@ -1144,7 +1173,24 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
     ).get(localTxnId) as { id: number; synced: number; attempts: number; last_error: string | null } | null;
 
     if (!pendingRow) {
-      // Missing from queue — re-enqueue.
+      // Missing from queue. Check if it was already dequeued by markSynced
+      // (which DELETEs the queue row AND sets cloud_synced=1 on transaction_record).
+      // If cloud_synced=1 and the last audit outcome was "duplicate", the cloud
+      // already has this transaction — re-enqueuing would cause an infinite cycle
+      // (push → duplicate → dequeue → reconcile → re-enqueue → push → ...).
+      // For "rejected"/"conflict" we still re-enqueue because the admin panel
+      // won't see the revenue otherwise.
+      const txnSynced = db.query("SELECT cloud_synced FROM transaction_record WHERE id = ?").get(localTxnId) as { cloud_synced: number } | null;
+      if (txnSynced?.cloud_synced === 1) {
+        const auditRow = db.query(
+          "SELECT outcome FROM sync_audit WHERE table_name = 'transaction' AND record_id = ? ORDER BY audited_at DESC LIMIT 1",
+        ).get(localTxnId) as { outcome: string } | null;
+        if (auditRow?.outcome === "duplicate") {
+          // Cloud already has this transaction — skip to avoid infinite re-enqueue cycle.
+          continue;
+        }
+      }
+      // Never been pushed, or was rejected/conflict — re-enqueue.
       db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('transaction', ?, 'insert', ?)")
         .run(localTxnId, Date.now());
       enqueued++;
@@ -1154,10 +1200,12 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
     if (pendingRow.synced === 1) {
       // Dequeued. Check if it was permanently rejected — if so, re-enqueue
       // because the admin panel will never see the revenue otherwise.
+      // "duplicate" is excluded: the cloud already has the transaction, so
+      // re-enqueuing would create an infinite cycle.
       const auditRow = db.query(
         "SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'transaction' ORDER BY audited_at DESC LIMIT 1",
       ).get(pendingRow.id) as { outcome: string } | null;
-      if (auditRow && ["rejected", "conflict", "duplicate"].includes(auditRow.outcome)) {
+      if (auditRow && ["rejected", "conflict"].includes(auditRow.outcome)) {
         db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('transaction', ?, 'insert', ?)")
           .run(localTxnId, Date.now());
         enqueued++;
@@ -1185,6 +1233,17 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
     ).get(localId) as { id: number; synced: number; attempts: number } | null;
 
     if (!pendingRow) {
+      // Missing from queue. Same logic as settled orders: if cloud_synced=1
+      // and last audit outcome was "duplicate", skip to avoid infinite cycle.
+      const txnSynced = db.query("SELECT cloud_synced FROM transaction_record WHERE id = ?").get(localId) as { cloud_synced: number } | null;
+      if (txnSynced?.cloud_synced === 1) {
+        const auditRow = db.query(
+          "SELECT outcome FROM sync_audit WHERE table_name = 'walkin_transaction' AND record_id = ? ORDER BY audited_at DESC LIMIT 1",
+        ).get(localId) as { outcome: string } | null;
+        if (auditRow?.outcome === "duplicate") {
+          continue;
+        }
+      }
       db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('walkin_transaction', ?, 'insert', ?)")
         .run(localId, Date.now());
       enqueued++;
@@ -1195,7 +1254,7 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
       const auditRow = db.query(
         "SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'walkin_transaction' ORDER BY audited_at DESC LIMIT 1",
       ).get(pendingRow.id) as { outcome: string } | null;
-      if (auditRow && ["rejected", "conflict", "duplicate"].includes(auditRow.outcome)) {
+      if (auditRow && ["rejected", "conflict"].includes(auditRow.outcome)) {
         db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('walkin_transaction', ?, 'insert', ?)")
           .run(localId, Date.now());
         enqueued++;
@@ -1227,14 +1286,29 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
         "SELECT id, synced, attempts FROM sync_queue WHERE table_name = 'walkin_transaction' AND record_id = ? ORDER BY id DESC LIMIT 1",
       ).get(localId) as { id: number; synced: number; attempts: number } | null;
       if (!pendingRow) {
-        db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('walkin_transaction', ?, 'insert', ?)")
-          .run(localId, Date.now());
-        enqueued++;
+        // Same duplicate guard as above.
+        const txnSynced = db.query("SELECT cloud_synced FROM transaction_record WHERE id = ?").get(localId) as { cloud_synced: number } | null;
+        if (txnSynced?.cloud_synced === 1) {
+          const auditRow = db.query(
+            "SELECT outcome FROM sync_audit WHERE table_name = 'walkin_transaction' AND record_id = ? ORDER BY audited_at DESC LIMIT 1",
+          ).get(localId) as { outcome: string } | null;
+          if (auditRow?.outcome === "duplicate") {
+            // skip — cloud already has it
+          } else {
+            db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('walkin_transaction', ?, 'insert', ?)")
+              .run(localId, Date.now());
+            enqueued++;
+          }
+        } else {
+          db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('walkin_transaction', ?, 'insert', ?)")
+            .run(localId, Date.now());
+          enqueued++;
+        }
       } else if (pendingRow.synced === 1) {
         const auditRow = db.query(
           "SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'walkin_transaction' ORDER BY audited_at DESC LIMIT 1",
         ).get(pendingRow.id) as { outcome: string } | null;
-        if (auditRow && ["rejected", "conflict", "duplicate"].includes(auditRow.outcome)) {
+        if (auditRow && ["rejected", "conflict"].includes(auditRow.outcome)) {
           db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('walkin_transaction', ?, 'insert', ?)")
             .run(localId, Date.now());
           enqueued++;

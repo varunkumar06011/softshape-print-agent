@@ -37,6 +37,8 @@ interface ConfigResponse {
   venuePrices?: any[];
   venueAvailability?: any[];
   users?: any[];
+  ledgerCategories?: any[];
+  employees?: any[];
   counts?: Record<string, number>;
 }
 
@@ -66,6 +68,8 @@ function computeLocalConfigChecksum(db: ReturnType<typeof getDb>, restaurantIds:
     { name: "venue_price", quoted: false },
     { name: "venue_menu_item_availability", quoted: false },
     { name: "users", quoted: false },
+    { name: "ledger_category", quoted: false },
+    { name: "employee", quoted: false },
   ];
 
   const placeholders = restaurantIds.map(() => "?").join(",");
@@ -209,6 +213,8 @@ function verifyCounts(
     { cloudKey: "venuePrices", table: "venue_price", scopeColumn: "restaurant_id" },
     { cloudKey: "venueAvailability", table: "venue_menu_item_availability", scopeColumn: "restaurant_id" },
     { cloudKey: "users", table: "users", scopeColumn: "outlet_id" },
+    { cloudKey: "ledgerCategories", table: "ledger_category", scopeColumn: "restaurant_id" },
+    { cloudKey: "employees", table: "employee", scopeColumn: "restaurant_id" },
   ];
 
   for (const { cloudKey, table, quoted, scopeColumn } of tableMap) {
@@ -317,6 +323,7 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
       "venues", "floors", "sections", "tables",
       "categories", "menuItems", "menuVariants", "menuAddons",
       "venuePrices", "venueAvailability", "users",
+      "ledgerCategories", "employees",
     ];
     for (const field of arrayFields) {
       const val = config[field];
@@ -371,6 +378,9 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
     db.query(`DELETE FROM price_profile WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM tax_profile WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM users WHERE outlet_id = ?`).run(rid);
+    // Ledger categories and employees are purged in their upsert sections below
+    // (after users). Only cloud-sourced rows (cloud_synced = 1) are purged so
+    // locally-created records that haven't synced yet are preserved.
 
     runtimeLog.info("[config] Purge complete — starting upserts", { restaurantId, deviceId: getDeviceId() });
 
@@ -591,6 +601,40 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
         u.id, u.name, u.pin || null, u.role,
         u.isActive !== false ? 1 : 0, u.outletId || restaurantId,
         JSON.stringify(u.permissions || {})
+      );
+      totalRows++;
+    }
+
+    // ── Ledger Categories (expense/asset/liability categories) ─────────────
+    // Purge only cloud-sourced rows (cloud_synced = 1) — preserve locally-created
+    // categories (cloud_synced = 0) that haven't synced to cloud yet, otherwise
+    // a config refresh would silently delete cashier-created categories.
+    db.query(`DELETE FROM ledger_category WHERE restaurant_id = ? AND cloud_synced = 1`).run(rid);
+    for (const lc of config.ledgerCategories ?? []) {
+      db.query(`INSERT INTO ledger_category (id, restaurant_id, name, entry_type, is_active, synced_at)
+        VALUES (?, ?, ?, ?, ?, unixepoch() * 1000)
+        ON CONFLICT(id) DO UPDATE SET name=excluded.name, entry_type=excluded.entry_type,
+        is_active=excluded.is_active, synced_at=unixepoch() * 1000
+      `).run(
+        lc.id, lc.restaurantId || restaurantId, lc.name,
+        lc.entryType || "EXPENSE", lc.isActive !== false ? 1 : 0
+      );
+      totalRows++;
+    }
+
+    // ── Employees (staff without login accounts) ───────────────────────────
+    // Purge only cloud-sourced rows (cloud_synced = 1) — preserve locally-created
+    // employees (cloud_synced = 0) that haven't synced to cloud yet, otherwise
+    // a config refresh would silently delete cashier-created staff.
+    db.query(`DELETE FROM employee WHERE restaurant_id = ? AND cloud_synced = 1`).run(rid);
+    for (const e of config.employees ?? []) {
+      db.query(`INSERT INTO employee (id, restaurant_id, name, role, is_active, created_at, cloud_synced, synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, 1, unixepoch() * 1000)
+        ON CONFLICT(id) DO UPDATE SET name=excluded.name, role=excluded.role,
+        is_active=excluded.is_active, cloud_synced=1, synced_at=unixepoch() * 1000
+      `).run(
+        e.id, e.restaurantId || restaurantId, e.name,
+        e.role || null, e.isActive !== false ? 1 : 0, Date.now()
       );
       totalRows++;
     }
@@ -1097,6 +1141,30 @@ function applyChange(db: any, change: any): boolean {
       );
       return true;
 
+    // ── Ledger Category ──────────────────────────────────────────────────────
+    case "ledger_category":
+      db.query(`INSERT INTO ledger_category (id, restaurant_id, name, entry_type, is_active, synced_at)
+        VALUES (?, ?, ?, ?, ?, unixepoch() * 1000)
+        ON CONFLICT(id) DO UPDATE SET name=excluded.name, entry_type=excluded.entry_type,
+        is_active=excluded.is_active, synced_at=unixepoch() * 1000
+      `).run(
+        row.id, row.restaurantId, row.name,
+        row.entryType || "EXPENSE", row.isActive !== false ? 1 : 0
+      );
+      return true;
+
+    // ── Employee ─────────────────────────────────────────────────────────────
+    case "employee":
+      db.query(`INSERT INTO employee (id, restaurant_id, name, role, is_active, created_at, cloud_synced, synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, 1, unixepoch() * 1000)
+        ON CONFLICT(id) DO UPDATE SET name=excluded.name, role=excluded.role,
+        is_active=excluded.is_active, cloud_synced=1, synced_at=unixepoch() * 1000
+      `).run(
+        row.id, row.restaurantId, row.name,
+        row.role || null, row.isActive !== false ? 1 : 0, Date.now()
+      );
+      return true;
+
     default:
       runtimeLog.warn("[Config] Unknown table for incremental sync", { table });
       return false;
@@ -1120,6 +1188,8 @@ const TABLE_NAME_MAP: Record<string, string> = {
   venue_price: "venue_price",
   venue_menu_item_availability: "venue_menu_item_availability",
   user: "users",
+  ledger_category: "ledger_category",
+  employee: "employee",
 };
 
 // ── Apply a batch of changes (used by socket real-time push) ─────────────────

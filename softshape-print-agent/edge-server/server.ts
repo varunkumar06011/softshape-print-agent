@@ -408,7 +408,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       const healthResp = {
         status: rmHealth.status,
         service: "softshape-edge-server",
-        version: "23.11.0",
+        version: "23.11.1",
         uptime: process.uptime(),
         runtimeState: rmHealth.runtimeState,
         configSyncState: rmHealth.configSyncState,
@@ -469,7 +469,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const healthResp = {
       status: "ok",
       service: "softshape-edge-server",
-      version: "23.11.0",
+      version: "23.11.1",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
@@ -1573,11 +1573,18 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     ).all(restaurantId, date) as any[];
     const expenditureAmount = expenditures.reduce((sum, e) => sum + Number(e.amount || 0), 0);
 
+    // Merge saved overrides (card amount, denominations) from edge_config
+    let savedOverrides: any = null;
+    try {
+      const savedRaw = getConfig(`x_report:${date}`);
+      if (savedRaw) savedOverrides = JSON.parse(savedRaw);
+    } catch {}
+
     return jsonResponse({
       reportDate: date,
       totalSales: round2(totalSales),
       cashAmount: round2(cashAmount),
-      cardAmount: round2(cardAmount),
+      cardAmount: savedOverrides?.cardAmount != null ? round2(Number(savedOverrides.cardAmount)) : round2(cardAmount),
       upiAmount: round2(upiAmount),
       otherAmount: round2(otherAmount),
       tipsAmount: round2(tipsAmount),
@@ -1587,7 +1594,40 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         paidToName: e.paid_to_name, category: e.category, narration: e.narration,
         approver: e.approver, expenditureNo: e.expenditure_no,
       })),
+      notes500: savedOverrides?.notes500 ?? 0,
+      notes200: savedOverrides?.notes200 ?? 0,
+      notes100: savedOverrides?.notes100 ?? 0,
+      notes50: savedOverrides?.notes50 ?? 0,
+      notes20: savedOverrides?.notes20 ?? 0,
+      notes10: savedOverrides?.notes10 ?? 0,
     }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── POST /api/edge/x-report — save cashier overrides to local SQLite ────────
+  // Persists card amount override + denomination counts so they survive reload.
+  if (url.pathname === "/api/edge/x-report" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    let body: any; try { body = JSON.parse(await req.text()); } catch { return errorResponse("Invalid JSON", 400); }
+
+    const date = body.reportDate || getKolkataDateString();
+    // Only persist cardAmount when explicitly provided as a number — otherwise
+    // the GET endpoint falls back to the live-computed card amount from orders.
+    const payload: any = {
+      notes500: Math.max(0, Math.floor(Number(body.notes500) || 0)),
+      notes200: Math.max(0, Math.floor(Number(body.notes200) || 0)),
+      notes100: Math.max(0, Math.floor(Number(body.notes100) || 0)),
+      notes50: Math.max(0, Math.floor(Number(body.notes50) || 0)),
+      notes20: Math.max(0, Math.floor(Number(body.notes20) || 0)),
+      notes10: Math.max(0, Math.floor(Number(body.notes10) || 0)),
+      savedAt: Date.now(),
+    };
+    if (typeof body.cardAmount === 'number') {
+      payload.cardAmount = Number(body.cardAmount) || 0;
+    }
+    setConfig(`x_report:${date}`, JSON.stringify(payload));
+    return jsonResponse({ ok: true, reportDate: date, ...payload }, 200, { "Cache-Control": "no-store" });
   }
 
   // ── POST /api/edge/x-report/print ───────────────────────────────────────────
@@ -1667,16 +1707,53 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const date = body.date || getKolkataDateString();
     const now = Date.now();
 
+    // Resolve employeeId for STAFF expenditures.
+    // The frontend sends employeeId when an existing staff is selected, or
+    // createEmployeeIfMissing=true when a new name is typed. We need the
+    // employeeId to link the expenditure to the employee record (for payroll).
+    let resolvedEmployeeId: string | null = null;
+    if (body.paidToType === "STAFF") {
+      if (body.employeeId) {
+        resolvedEmployeeId = body.employeeId;
+      } else if (body.createEmployeeIfMissing && body.paidToName) {
+        const trimmedName = String(body.paidToName).trim();
+        // Check both users and employee tables (case-insensitive) to avoid duplicates
+        const existingUser = db.query(
+          "SELECT id FROM users WHERE outlet_id = ? AND lower(name) = lower(?) AND is_active = 1"
+        ).get(restaurantId, trimmedName) as any;
+        const existingEmployee = db.query(
+          "SELECT id FROM employee WHERE restaurant_id = ? AND lower(name) = lower(?) AND is_active = 1"
+        ).get(restaurantId, trimmedName) as any;
+
+        if (existingEmployee) {
+          resolvedEmployeeId = existingEmployee.id;
+        } else if (existingUser) {
+          // Staff is a login user (no employee record) — no employeeId to link
+          resolvedEmployeeId = null;
+        } else {
+          // Create new employee record + enqueue sync to cloud
+          resolvedEmployeeId = `edge-emp-${restaurantId}-${now}`;
+          db.query(
+            "INSERT INTO employee (id, restaurant_id, name, role, is_active, created_at, cloud_synced) VALUES (?, ?, ?, NULL, 1, ?, 0)"
+          ).run(resolvedEmployeeId, restaurantId, trimmedName, now);
+          enqueueSync("employee", resolvedEmployeeId, "insert");
+        }
+      }
+    }
+
     // Get next expenditure number for this restaurant+date
     const counter = db.query(
       "SELECT COALESCE(MAX(expenditure_no), 0) + 1 as next_no FROM expenditure WHERE restaurant_id = ? AND date = ?"
     ).get(restaurantId, date) as any;
 
     db.query(
-      "INSERT INTO expenditure (id, restaurant_id, amount, paid_to_type, paid_to_name, category, narration, approver, created_by, expenditure_no, date, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO expenditure (id, restaurant_id, amount, paid_to_type, paid_to_name, category, narration, approver, created_by, expenditure_no, date, created_at, employee_id, ledger_category_id, entry_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ).run(id, restaurantId, Number(body.amount), body.paidToType, body.paidToName,
           body.category, body.narration, body.approver, body.createdBy,
-          counter.next_no, date, now);
+          counter.next_no, date, now,
+          resolvedEmployeeId,
+          body.paidToType === "OTHER" ? (body.ledgerCategoryId || null) : null,
+          body.entryType || "EXPENSE");
 
     enqueueSync("expenditure", id, "insert");
 
@@ -1733,10 +1810,46 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
 
     const db = getDb();
-    const staff = db.query(
+    // Query both users (login accounts) and employee (staff without logins)
+    // tables, then merge and de-duplicate by name (case-insensitive) — same
+    // pattern as the cloud paid-to-options endpoint.
+    const users = db.query(
       "SELECT id, name, role FROM users WHERE outlet_id = ? AND is_active = 1 ORDER BY name"
     ).all(restaurantId) as any[];
+    const employees = db.query(
+      "SELECT id, name, role FROM employee WHERE restaurant_id = ? AND is_active = 1 ORDER BY name"
+    ).all(restaurantId) as any[];
 
+    const mergedMap = new Map<string, { id: string; name: string; role: string | null; employeeId: string | null }>();
+    // Add Employee records first (they have the employeeId for payroll)
+    for (const emp of employees) {
+      const key = emp.name.toLowerCase().trim();
+      if (!mergedMap.has(key)) {
+        mergedMap.set(key, {
+          id: emp.id,
+          name: emp.name,
+          role: emp.role || null,
+          employeeId: emp.id,
+        });
+      }
+    }
+    // Merge User records — User.role wins if a match exists
+    for (const u of users) {
+      const key = u.name.toLowerCase().trim();
+      const existing = mergedMap.get(key);
+      if (existing) {
+        existing.role = u.role || existing.role;
+      } else {
+        mergedMap.set(key, {
+          id: u.id,
+          name: u.name,
+          role: u.role,
+          employeeId: null,
+        });
+      }
+    }
+
+    const staff = Array.from(mergedMap.values()).sort((a, b) => a.name.localeCompare(b.name));
     return jsonResponse({ staff }, 200, { "Cache-Control": "no-store" });
   }
 
@@ -1780,6 +1893,77 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const printed = printResult?.ok === true;
     const pending = printResult?.ok === null || printResult?.pending === true;
     return jsonResponse({ success: true, eventId, printed, pending, printError: printResult?.error || null });
+  }
+
+  // ── GET /api/edge/ledger-categories?entryType=EXPENSE ───────────────────────
+  // List active ledger categories for the expenditure module's "Other" tab.
+  if (url.pathname === "/api/edge/ledger-categories" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const entryType = url.searchParams.get("entryType") || undefined;
+    const db = getDb();
+    let rows: any[];
+    if (entryType) {
+      rows = db.query(
+        "SELECT id, restaurant_id, name, entry_type, is_active FROM ledger_category WHERE restaurant_id = ? AND entry_type = ? AND is_active = 1 ORDER BY name"
+      ).all(restaurantId, entryType) as any[];
+    } else {
+      rows = db.query(
+        "SELECT id, restaurant_id, name, entry_type, is_active FROM ledger_category WHERE restaurant_id = ? AND is_active = 1 ORDER BY name"
+      ).all(restaurantId) as any[];
+    }
+
+    return jsonResponse(rows.map((c) => ({
+      id: c.id,
+      restaurantId: c.restaurant_id,
+      name: c.name,
+      entryType: c.entry_type,
+      isActive: !!c.is_active,
+    })), 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── POST /api/edge/ledger-categories ────────────────────────────────────────
+  // Create a new ledger category locally + enqueue sync to cloud.
+  if (url.pathname === "/api/edge/ledger-categories" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    let body: any; try { body = JSON.parse(await req.text()); } catch { return errorResponse("Invalid JSON", 400); }
+
+    const name = (body.name || "").trim().replace(/\s+/g, " ");
+    if (!name) return errorResponse("name is required", 400);
+    const VALID_ENTRY_TYPES = ["ASSET", "LIABILITY", "GROCERY", "EXPENSE", "LIABILITY_PAYMENT"];
+    const entryType = VALID_ENTRY_TYPES.includes(body.entryType) ? body.entryType : "EXPENSE";
+
+    const db = getDb();
+    // De-duplicate: check for existing category with same name + entryType (case-insensitive)
+    const existing = db.query(
+      "SELECT id, is_active FROM ledger_category WHERE restaurant_id = ? AND entry_type = ? AND lower(name) = lower(?)"
+    ).get(restaurantId, entryType, name) as any;
+
+    if (existing) {
+      if (!existing.is_active) {
+        // Reactivate
+        db.query("UPDATE ledger_category SET is_active = 1 WHERE id = ?").run(existing.id);
+      }
+      const row = db.query("SELECT id, restaurant_id, name, entry_type, is_active FROM ledger_category WHERE id = ?").get(existing.id) as any;
+      return jsonResponse({
+        id: row.id, restaurantId: row.restaurant_id, name: row.name,
+        entryType: row.entry_type, isActive: !!row.is_active,
+      });
+    }
+
+    const categoryId = `edge-lcat-${restaurantId}-${Date.now()}`;
+    db.query(
+      "INSERT INTO ledger_category (id, restaurant_id, name, entry_type, is_active, created_at, cloud_synced) VALUES (?, ?, ?, ?, 1, ?, 0)"
+    ).run(categoryId, restaurantId, name, entryType, Date.now());
+    enqueueSync("ledger_category", categoryId, "insert");
+
+    return jsonResponse({
+      id: categoryId, restaurantId, name, entryType, isActive: true,
+    }, 200);
   }
 
   // ── GET /api/edge/tables — sections with nested tables + active orders ────
@@ -2071,14 +2255,21 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   }
 
   // ── GET /api/edge/staff — list active staff for PIN login screen ───────────
+  // Optional ?role=CAPTAIN|CASHIER|MANAGER filters by role (case-insensitive).
+  // Without ?role, returns all active staff (backward compatible).
   if (url.pathname === "/api/edge/staff" && req.method === "GET") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const db = getDb();
     const restaurantId = getRestaurantId();
-    const staff = db.query(
-      "SELECT id, name, role FROM users WHERE outlet_id = ? AND is_active = 1 ORDER BY name ASC"
-    ).all(restaurantId) as { id: string; name: string; role: string }[];
-    return jsonResponse({ staff });
+    const roleParam = url.searchParams.get("role");
+    const staff = roleParam
+      ? db.query(
+          "SELECT id, name, role FROM users WHERE outlet_id = ? AND is_active = 1 AND UPPER(role) = ? ORDER BY name ASC"
+        ).all(restaurantId, roleParam.toUpperCase()) as { id: string; name: string; role: string }[]
+      : db.query(
+          "SELECT id, name, role FROM users WHERE outlet_id = ? AND is_active = 1 ORDER BY name ASC"
+        ).all(restaurantId) as { id: string; name: string; role: string }[];
+    return jsonResponse({ staff, outletId: restaurantId });
   }
 
   // ── POST /api/edge/auth/pin — verify staff PIN (offline device-unlock) ─────
@@ -2290,12 +2481,15 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
             `SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'transaction' ORDER BY audited_at DESC LIMIT 1`
           ).get(pendingRow.id) as any;
 
-          if (auditRow && ["rejected", "conflict", "duplicate"].includes(auditRow.outcome)) {
+          if (auditRow && ["rejected", "conflict"].includes(auditRow.outcome)) {
             if (!dryRun) {
               enqueueSync("transaction", localTxnId, "insert");
             }
             enqueued++;
             details.push({ orderId: order.id, localTxnId, grandTotal: settleData.grandTotal, reason: `was ${auditRow.outcome}` });
+          } else if (auditRow?.outcome === "duplicate") {
+            // Cloud already has this transaction — skip to avoid infinite re-enqueue cycle.
+            skippedSynced++;
           } else {
             skippedSynced++;
           }
@@ -2346,12 +2540,15 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
           const auditRow = db.query(
             `SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'walkin_transaction' ORDER BY audited_at DESC LIMIT 1`
           ).get(pendingRow.id) as any;
-          if (auditRow && ["rejected", "conflict", "duplicate"].includes(auditRow.outcome)) {
+          if (auditRow && ["rejected", "conflict"].includes(auditRow.outcome)) {
             if (!dryRun) {
               enqueueSync("walkin_transaction", localId, "insert");
             }
             walkinEnqueued++;
             details.push({ localTxnId: localId, reason: `walk-in was ${auditRow.outcome}` });
+          } else if (auditRow?.outcome === "duplicate") {
+            // Cloud already has this transaction — skip to avoid infinite re-enqueue cycle.
+            skippedSynced++;
           } else {
             skippedSynced++;
           }
@@ -2471,7 +2668,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   // returns the download URL if an update exists. The Host handles the
   // download, binary swap, and restart.
   if (url.pathname === "/api/edge/update-check" && req.method === "GET") {
-    const currentVersion = "23.11.0";
+    const currentVersion = "23.11.1";
     const backendUrl = getBackendUrl();
     const sessionToken = getSessionToken();
 
