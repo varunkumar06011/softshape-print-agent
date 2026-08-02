@@ -125,12 +125,20 @@ function listSettledOrders(db: Database, restaurantId: string): any[] {
   ).all(restaurantId) as any[];
 }
 
-// Helper: simulate enqueueSync
+// Helper: simulate enqueueSync, preserving an in-flight row so a newer
+// local update cannot be removed by the older request's acknowledgment.
 function enqueueSync(db: Database, tableName: string, recordId: string, operation: string): void {
-  db.query(`DELETE FROM sync_queue WHERE table_name = ? AND record_id = ? AND synced = 0`)
-    .run(tableName, recordId);
-  db.query(`INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)`)
-    .run(tableName, recordId, operation, Date.now());
+  const now = Date.now();
+  const updated = db.query(
+    `UPDATE sync_queue
+     SET operation = ?, created_at = ?, attempts = 0, last_error = NULL
+     WHERE table_name = ? AND record_id = ? AND synced = 0
+       AND COALESCE(last_error, '') != 'IN_FLIGHT'`,
+  ).run(operation, now, tableName, recordId);
+  if ((updated.changes || 0) === 0) {
+    db.query(`INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)`)
+      .run(tableName, recordId, operation, now);
+  }
 }
 
 describe('Transaction delete propagation (cloud → edge)', () => {
@@ -288,6 +296,24 @@ describe('Sync queue backfill logic', () => {
     expect(newRow.synced).toBe(0);
   });
 
+  it('should preserve a pending row while an older push is in flight', () => {
+    enqueueSync(db, 'transaction', 'txn-1', 'insert');
+    const firstRow = db.query(
+      `SELECT id FROM sync_queue WHERE table_name = 'transaction' AND record_id = 'txn-1' AND synced = 0`,
+    ).get() as any;
+    db.query(`UPDATE sync_queue SET last_error = 'IN_FLIGHT' WHERE id = ?`).run(firstRow.id);
+
+    enqueueSync(db, 'transaction', 'txn-1', 'update');
+
+    const rows = db.query(
+      `SELECT id, operation, last_error FROM sync_queue WHERE table_name = 'transaction' AND record_id = 'txn-1' AND synced = 0 ORDER BY id`,
+    ).all() as any[];
+    expect(rows).toHaveLength(2);
+    expect(rows[0].id).toBe(firstRow.id);
+    expect(rows[0].last_error).toBe('IN_FLIGHT');
+    expect(rows[1].operation).toBe('update');
+  });
+
   it('should skip orders that already have pending sync_queue entries', () => {
     insertSettledOrder(db, 'order-1', 'rest-1', 'txn-1', 250);
     enqueueSync(db, 'transaction', 'txn-1', 'insert');
@@ -303,7 +329,7 @@ describe('Sync queue backfill logic', () => {
     // Should NOT re-enqueue (dedup logic)
     enqueueSync(db, 'transaction', 'txn-1', 'insert');
 
-    // Should still have only 1 pending entry (dedup removes old one, inserts new)
+    // Should still have only 1 pending entry (the existing row is updated)
     const rows = db.query(
       `SELECT id FROM sync_queue WHERE table_name = 'transaction' AND record_id = 'txn-1' AND synced = 0`,
     ).all() as any[];

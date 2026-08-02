@@ -194,6 +194,7 @@ export class Supervisor {
       const child = spawn({
         cmd: [config.exe, ...(config.args || [])],
         env: { ...process.env, ...config.env },
+        stdin: "pipe",
         stdout: "pipe",
         stderr: "pipe",
       });

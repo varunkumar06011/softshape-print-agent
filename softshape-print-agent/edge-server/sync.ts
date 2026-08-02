@@ -67,20 +67,13 @@ interface SyncPayloadItem {
 
 function collectBatch(): SyncQueueRow[] {
   const db = getDb();
-  // Simple FIFO — oldest first. Records that have failed (attempts >= MAX_ATTEMPTS)
-  // are pushed to the end of the queue so they don't block other records,
-  // but they stay in the queue and keep retrying.
-  //
-  // DEAD_LETTER rows (last_error LIKE 'DEAD_LETTER:%') are excluded from the
-  // normal sync cycle. They are surfaced in the recovery UI and only retried
-  // via the explicit retryDeadLetters() endpoint or the reconciliation worker
-  // (which resets their attempts). Without this exclusion the worker keeps
-  // re-selecting permanently broken records every cycle, wasting bandwidth
-  // and making the pending count climb without progress.
+  // Simple FIFO — oldest first. Exhausted rows remain eligible for retry and
+  // are moved behind fresh rows so a transient outage can never permanently
+  // strand a valid record. The DEAD_LETTER prefix is an observability marker,
+  // not a terminal state; reconciliation also resets it periodically.
   return db.query(`
     SELECT * FROM sync_queue
     WHERE synced = 0
-      AND (last_error IS NULL OR last_error NOT LIKE 'DEAD_LETTER:%')
     ORDER BY
       CASE WHEN attempts >= ? THEN 1 ELSE 0 END,
       created_at ASC, id ASC
@@ -147,7 +140,7 @@ function loadRecordData(tableName: string, recordId: string): any | null {
         guests: table.guests,
         sessionStartedAt: table.session_started_at,
         currentBill: Number(table.current_bill),
-        kotHistory: typeof table.kot_history === "string" ? JSON.parse(table.kot_history) : [],
+        kotHistory: (() => { try { return typeof table.kot_history === "string" ? JSON.parse(table.kot_history) : []; } catch { return []; } })(),
         discount: table.discount ? Number(table.discount) : null,
         sectionTag: table.section_tag,
         revision: table.revision ?? 1,
@@ -392,8 +385,16 @@ function markSynced(queueIds: number[]): void {
 
   // Before deleting, set cloud_synced = 1 on the source records so
   // getOrderSyncStatus can confirm sync even after queue rows are cleaned up.
-  const rows = db.query(`SELECT table_name, record_id FROM sync_queue WHERE id IN (${placeholders})`).all(...queueIds) as any[];
+  const rows = db.query(`SELECT id, table_name, record_id FROM sync_queue WHERE id IN (${placeholders})`).all(...queueIds) as any[];
   for (const row of rows) {
+    // A newer local update may have created another pending row while this
+    // request was in flight. Keep the source marked unsynced until that newer
+    // row is acknowledged too.
+    const newerPending = db.query(
+      "SELECT 1 FROM sync_queue WHERE table_name = ? AND record_id = ? AND synced = 0 AND id != ? LIMIT 1",
+    ).get(row.table_name, row.record_id, row.id);
+    if (newerPending) continue;
+
     if (row.table_name === "order") {
       db.query("UPDATE order_record SET cloud_synced = 1 WHERE id = ?").run(row.record_id);
     } else if (row.table_name === "order_item") {
@@ -406,6 +407,8 @@ function markSynced(queueIds: number[]): void {
       // Mark the durable transaction_record as synced so the reconciliation
       // worker knows it reached the cloud and doesn't re-enqueue it.
       markTransactionRecordSynced(row.record_id);
+    } else if (row.table_name === "expenditure") {
+      db.query("UPDATE expenditure SET cloud_synced = 1 WHERE id = ?").run(row.record_id);
     } else if (row.table_name === "employee") {
       db.query("UPDATE employee SET cloud_synced = 1, synced_at = ? WHERE id = ?").run(Date.now(), row.record_id);
     } else if (row.table_name === "ledger_category") {
@@ -424,6 +427,17 @@ function incrementAttempts(queueIds: number[], error: string): void {
   const placeholders = queueIds.map(() => "?").join(",");
   db.query(`UPDATE sync_queue SET attempts = attempts + 1, last_error = ? WHERE id IN (${placeholders})`)
     .run(error, ...queueIds);
+}
+
+function claimBatch(queueIds: number[]): void {
+  if (queueIds.length === 0) return;
+  const db = getDb();
+  const placeholders = queueIds.map(() => "?").join(",");
+  // Mark rows while the request is in flight. enqueueSync() preserves these
+  // rows and inserts a second row for a newer local update, preventing an old
+  // acknowledgment from deleting the newer update's retry entry.
+  db.query(`UPDATE sync_queue SET last_error = 'IN_FLIGHT' WHERE id IN (${placeholders}) AND synced = 0`)
+    .run(...queueIds);
 }
 
 // ─── Dead-letter exhausted records (attempts >= MAX_ATTEMPTS) ────────────────
@@ -643,7 +657,18 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
   // Build payload with full record data
   const payload: SyncPayloadItem[] = [];
   for (const row of batch) {
-    const data = loadRecordData(row.table_name, row.record_id);
+    let data: any;
+    try {
+      data = loadRecordData(row.table_name, row.record_id);
+    } catch (err: any) {
+      // loadRecordData threw (e.g. corrupted JSON field, missing column).
+      // Increment attempts so the record eventually gets dead-lettered and
+      // surfaced in the recovery UI, instead of crashing every sync cycle
+      // and blocking all other records in the batch.
+      console.error(`[Sync] loadRecordData threw for ${row.table_name}/${row.record_id} (queueId=${row.id}): ${err.message || err}`);
+      incrementAttempts([row.id], `loadRecordData error: ${err.message || err}`);
+      continue;
+    }
     if (data) {
       payload.push({
         queueId: row.id,
@@ -669,6 +694,11 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
     lastSyncResult = { ok: true, pushed: 0, accepted: 0, rejected: 0 };
     return lastSyncResult;
   }
+
+  // Claim the exact rows being sent. If a local update arrives while the
+  // request is in flight, enqueueSync() will create a new pending row rather
+  // than allowing this acknowledgment to erase the newer update.
+  claimBatch(payload.map((p) => p.queueId));
 
   // Build lookup from queueId → payload item for audit logging
   // (defined here so it's in scope for both the 401 retry path and the normal path)
@@ -726,7 +756,7 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
             const retryDequeueIds: number[] = [];
             if (retryResult.rejected && retryResult.rejected.length > 0) {
               for (const rej of retryResult.rejected) {
-                if (rej.outcome === "rejected" || rej.outcome === "conflict" || rej.outcome === "duplicate") {
+                if (rej.outcome === "rejected" || rej.outcome === "permanent" || rej.outcome === "conflict" || rej.outcome === "duplicate") {
                   retryDequeueIds.push(rej.queueId);
                   const item = payloadMap.get(rej.queueId);
                   if (item) insertSyncAudit(rej.queueId, item.tableName, item.recordId, item.operation, rej.outcome, rej.error);
@@ -782,14 +812,16 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
 
     // Handle rejected records based on their outcome:
     // - "error": transient failure — increment attempts for retry
-    // - "rejected"/"conflict"/"duplicate": permanent — write audit row, then dequeue
-    //   (the cloud has seen this record and decided not to apply it)
+    // - "rejected"/"conflict"/"duplicate": legacy permanent outcomes;
+    //   audit and dequeue for backward compatibility
+    // - "permanent": validated, non-retryable business/data outcome; audit and
+    //   dequeue without allowing reconciliation to recreate it
     // - missing outcome: treat as error for backward compatibility
     const retryIds: number[] = [];
     const dequeueIds: number[] = [];
     if (result.rejected && result.rejected.length > 0) {
       for (const rej of result.rejected) {
-        if (rej.outcome === "rejected" || rej.outcome === "conflict" || rej.outcome === "duplicate") {
+        if (rej.outcome === "rejected" || rej.outcome === "conflict" || rej.outcome === "duplicate" || rej.outcome === "permanent") {
           dequeueIds.push(rej.queueId);
           // Persist audit record before dequeuing
           const item = payloadMap.get(rej.queueId);
@@ -1037,6 +1069,13 @@ export function getSyncStatus(): {
 // ─── Manual sync trigger (for /api/edge/sync/push endpoint) ──────────────────
 
 export async function manualSyncPush(): Promise<{ ok: boolean; pushed: number; accepted: number; rejected: number; error?: string }> {
+  // Guard against concurrent push — if the normal sync cycle is already
+  // running, skip the manual push. The normal cycle will push the batch
+  // that was just re-enqueued by the reconciliation trigger. This prevents
+  // duplicate batch selection and double-incrementing attempts.
+  if (syncRunning) {
+    return { ok: true, pushed: 0, accepted: 0, rejected: 0, error: "Sync cycle already in progress — batch will be pushed shortly" };
+  }
   return pushSyncBatch();
 }
 
@@ -1318,6 +1357,98 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
         reset++;
       }
     } catch { /* ignore */ }
+  }
+
+  // ── 4. Re-enqueue rejected/conflicted records for ALL table types ────────
+  // The transaction reconciliation above (sections 1-2) re-enqueues
+  // "rejected"/"conflict" outcomes for transaction/walkin_transaction.
+  // But other record types (expenditure, employee, ledger_category, order,
+  // kot, etc.) that were permanently rejected by the cloud are dequeued via
+  // markSynced() and have no re-enqueue path. The record is gone from
+  // sync_queue and will never reach the admin panel.
+  //
+  // This step scans sync_audit for "rejected"/"conflict" outcomes on
+  // non-transaction table types, checks that:
+  //   1. The record still exists in its local source table (not deleted)
+  //   2. There is no pending queue row for it (not already re-enqueued)
+  //   3. The last audit outcome is "rejected" or "conflict" (not "duplicate")
+  // and re-enqueues a fresh sync_queue row so the normal worker retries it.
+  //
+  // This handles scenarios like:
+  //   - upsertExpenditure returning "rejected" because no cloud user was
+  //     found yet (the user sync may not have arrived). Once the user syncs,
+  //     the expenditure will succeed on retry.
+  //   - upsertEmployee returning "rejected" for a transient cloud error that
+  //     was misclassified as a permanent rejection.
+  const rejectedAuditRows = db.query(
+    `SELECT sa.table_name, sa.record_id, sa.operation
+     FROM sync_audit sa
+     INNER JOIN (
+       SELECT table_name, record_id, MAX(audited_at) as latest_at
+       FROM sync_audit
+       WHERE outcome IN ('rejected', 'conflict')
+         AND table_name NOT IN ('transaction', 'walkin_transaction')
+       GROUP BY table_name, record_id
+     ) latest ON sa.table_name = latest.table_name
+              AND sa.record_id = latest.record_id
+              AND sa.audited_at = latest.latest_at
+     WHERE NOT EXISTS (
+       SELECT 1 FROM sync_queue sq
+       WHERE sq.table_name = sa.table_name
+         AND sq.record_id = sa.record_id
+         AND sq.synced = 0
+     )`,
+  ).all() as Array<{ table_name: string; record_id: string; operation: string }>;
+
+  for (const row of rejectedAuditRows) {
+    // Verify the record still exists in its source table before re-enqueuing.
+    // If it was deleted locally, there's nothing to sync.
+    let exists = false;
+    try {
+      switch (row.table_name) {
+        case "order":      exists = !!db.query("SELECT 1 FROM order_record WHERE id = ?").get(row.record_id); break;
+        case "order_item": exists = !!db.query("SELECT 1 FROM order_item WHERE id = ?").get(row.record_id); break;
+        case "kot":        exists = !!db.query("SELECT 1 FROM kot WHERE id = ?").get(row.record_id); break;
+        case "kot_item":   exists = !!db.query("SELECT 1 FROM kot_item WHERE id = ?").get(row.record_id); break;
+        case "expenditure": exists = !!db.query("SELECT 1 FROM expenditure WHERE id = ?").get(row.record_id); break;
+        case "employee":   exists = !!db.query("SELECT 1 FROM employee WHERE id = ?").get(row.record_id); break;
+        case "ledger_category": exists = !!db.query("SELECT 1 FROM ledger_category WHERE id = ?").get(row.record_id); break;
+        default: continue; // unknown table type — skip
+      }
+    } catch { continue; }
+    if (!exists) continue;
+
+    db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)")
+      .run(row.table_name, row.record_id, row.operation || "insert", Date.now());
+    enqueued++;
+  }
+
+  // ── 5. General dead-letter reset for all record types ─────────────────────
+  // Records that failed 5 attempts get the DEAD_LETTER: prefix and are
+  // excluded from collectBatch(). Without a reset, they stay permanently
+  // stuck — even after the underlying issue (network outage, cloud 500,
+  // transient error) resolves.
+  //
+  // This step resets ALL dead-lettered rows (any table_name) so the normal
+  // sync worker picks them up again. It runs every RECONCILE_INTERVAL_MS (5
+  // minutes), giving the underlying issue time to resolve while ensuring no
+  // record is permanently stuck.
+  const deadLetterReset = db.query(
+    `UPDATE sync_queue SET attempts = 0, last_error = NULL
+     WHERE synced = 0 AND last_error LIKE 'DEAD_LETTER:%'`,
+  ).run();
+  reset += deadLetterReset.changes || 0;
+
+  // ── 6. Prune sync_audit to prevent unbounded growth ──────────────────────
+  // The reconciliation steps above re-enqueue rejected/conflicted records,
+  // which creates new audit rows on each retry. Without pruning, the table
+  // grows indefinitely and the reconciliation query (self-join on sync_audit)
+  // slows down over time. Keep 30 days of audit history for debugging.
+  try {
+    const auditCutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    db.query("DELETE FROM sync_audit WHERE audited_at < ?").run(auditCutoff);
+  } catch {
+    // Non-fatal — pruning should never break reconciliation
   }
 
   return { enqueued, reset, backfilled };

@@ -123,18 +123,59 @@ function pruneOldBackups(): void {
 function pruneOldOrders(db: Database): void {
   const cutoff = Date.now() - ORDER_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 
-  // Count before pruning (only synced orders — never delete unsynced data)
-  const before = db.query("SELECT COUNT(*) as count FROM order_record WHERE created_at < ? AND cloud_synced = 1").get(cutoff) as any;
+  // Count before pruning. Never remove a synced order while any related
+  // settlement is still unsynced: the transaction retry path may need the
+  // order to exist in the cloud before it can be acknowledged.
+  const protectedOrderClause = `
+    AND NOT EXISTS (
+      SELECT 1 FROM transaction_record tr
+      WHERE tr.order_id = order_record.id AND tr.cloud_synced = 0
+    )`;
+  const before = db.query(
+    `SELECT COUNT(*) as count FROM order_record
+     WHERE created_at < ? AND cloud_synced = 1${protectedOrderClause}`,
+  ).get(cutoff) as any;
   if (before.count === 0) return;
 
-  // Delete old order items first (FK)
-  db.query("DELETE FROM order_item WHERE order_id IN (SELECT id FROM order_record WHERE created_at < ? AND cloud_synced = 1)").run(cutoff);
+  // Delete old order items first (FK), excluding orders with unsynced
+  // transaction records.
+  db.query(
+    `DELETE FROM order_item WHERE order_id IN (
+       SELECT o.id FROM order_record o
+       WHERE o.created_at < ? AND o.cloud_synced = 1
+         AND NOT EXISTS (
+           SELECT 1 FROM transaction_record tr
+           WHERE tr.order_id = o.id AND tr.cloud_synced = 0
+         )
+     )`,
+  ).run(cutoff);
   // Delete old KOT items first (FK)
-  db.query("DELETE FROM kot_item WHERE kot_id IN (SELECT k.id FROM kot k JOIN order_record o ON k.order_id = o.id WHERE o.created_at < ? AND o.cloud_synced = 1)").run(cutoff);
+  db.query(
+    `DELETE FROM kot_item WHERE kot_id IN (
+       SELECT k.id FROM kot k JOIN order_record o ON k.order_id = o.id
+       WHERE o.created_at < ? AND o.cloud_synced = 1
+         AND NOT EXISTS (
+           SELECT 1 FROM transaction_record tr
+           WHERE tr.order_id = o.id AND tr.cloud_synced = 0
+         )
+     )`,
+  ).run(cutoff);
   // Delete old KOTs
-  db.query("DELETE FROM kot WHERE order_id IN (SELECT id FROM order_record WHERE created_at < ? AND cloud_synced = 1)").run(cutoff);
+  db.query(
+    `DELETE FROM kot WHERE order_id IN (
+       SELECT o.id FROM order_record o
+       WHERE o.created_at < ? AND o.cloud_synced = 1
+         AND NOT EXISTS (
+           SELECT 1 FROM transaction_record tr
+           WHERE tr.order_id = o.id AND tr.cloud_synced = 0
+         )
+     )`,
+  ).run(cutoff);
   // Delete old orders
-  db.query("DELETE FROM order_record WHERE created_at < ? AND cloud_synced = 1").run(cutoff);
+  db.query(
+    `DELETE FROM order_record
+     WHERE created_at < ? AND cloud_synced = 1${protectedOrderClause}`,
+  ).run(cutoff);
 
   // Also prune synced sync_queue entries older than retention
   // (synced rows are now deleted immediately in markSynced(), but this

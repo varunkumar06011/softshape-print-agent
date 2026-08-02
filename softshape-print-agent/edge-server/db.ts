@@ -990,14 +990,18 @@ export function setSyncState(key: string, value: string): void {
 
 export function enqueueSync(tableName: string, recordId: string, operation: string): void {
   const db = getDb();
-  // Dedup: remove any existing pending entry for the same record so the queue
-  // holds only the latest operation per (table_name, record_id). Without this,
-  // repeated updates to the same table/order create one queue row per operation,
-  // causing the queue to grow linearly with POS activity instead of unique records.
-  db.query("DELETE FROM sync_queue WHERE table_name = ? AND record_id = ? AND synced = 0")
-    .run(tableName, recordId);
-  db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)")
-    .run(tableName, recordId, operation, Date.now());
+  // Dedup without deleting the existing row. A sync push may already have
+  // selected that row; preserving its queue ID keeps the acknowledgment and
+  // retry state valid if a new local update arrives while the request is in
+  // flight. The source row is always re-read when the batch is built.
+  const now = Date.now();
+  const updated = db.query(
+    "UPDATE sync_queue SET operation = ?, created_at = ?, attempts = 0, last_error = NULL WHERE table_name = ? AND record_id = ? AND synced = 0 AND COALESCE(last_error, '') != 'IN_FLIGHT'",
+  ).run(operation, now, tableName, recordId);
+  if ((updated.changes || 0) === 0) {
+    db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)")
+      .run(tableName, recordId, operation, now);
+  }
 }
 
 // ── Transaction Record: durable local copy of settlement/walk-in payloads ────

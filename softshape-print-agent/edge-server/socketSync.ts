@@ -75,7 +75,7 @@ export function startSocketSync(): void {
     socket!.emit("edge:register", {
       restaurantId,
       sessionToken: token,
-      edgeVersion: "23.11.2",
+      edgeVersion: "23.12.0",
       capabilities: ["print"],
     });
   });
@@ -98,11 +98,16 @@ export function startSocketSync(): void {
     console.log(`[SocketSync] Reconnected after ${attempt} attempts`);
     connectionAttempts = 0;
 
-    // Re-register after reconnect
+    // Re-register after reconnect with the CURRENT session token (not the
+    // stale closure-captured one). If the JWT was refreshed while the socket
+    // was disconnected, the old token would be expired and the cloud would
+    // reject the re-registration. Always read the latest token from the
+    // session store.
+    const freshToken = getSessionToken();
     socket!.emit("edge:register", {
       restaurantId,
-      sessionToken: token,
-      edgeVersion: "23.11.2",
+      sessionToken: freshToken || token,
+      edgeVersion: "23.12.0",
       capabilities: ["print"],
     });
   });
@@ -141,6 +146,24 @@ export function startSocketSync(): void {
       console.log(`[SocketSync] Full resync complete: ${result.tablesLoaded || 0} rows loaded`);
     } catch (err) {
       console.error("[SocketSync] Full resync failed:", err);
+    }
+  });
+
+  // Cloud → edge: trigger reconciliation + immediate sync push.
+  // Emitted by the admin panel's "Recover Missing" button via the cloud
+  // endpoint POST /api/transactions/trigger-edge-reconcile. This allows
+  // the admin to trigger recovery from any browser without needing direct
+  // HTTP access to the edge server.
+  socket.on("edge:trigger_reconcile", async () => {
+    console.log("[SocketSync] Reconcile trigger received from cloud");
+    try {
+      const { reconcileTransactions, manualSyncPush } = await import("./sync.ts");
+      const recon = reconcileTransactions();
+      console.log(`[SocketSync] Reconciliation: ${recon.enqueued} re-enqueued, ${recon.reset} dead-letter resets, ${recon.backfilled} backfilled`);
+      const pushResult = await manualSyncPush();
+      console.log(`[SocketSync] Manual push: ok=${pushResult.ok}, pushed=${pushResult.pushed}, accepted=${pushResult.accepted}`);
+    } catch (err) {
+      console.error("[SocketSync] Trigger reconcile failed:", err);
     }
   });
 
