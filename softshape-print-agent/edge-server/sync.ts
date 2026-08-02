@@ -75,7 +75,13 @@ function collectBatch(): SyncQueueRow[] {
     SELECT * FROM sync_queue
     WHERE synced = 0
     ORDER BY
-      CASE WHEN attempts >= ? THEN 1 ELSE 0 END,
+      -- Payment records are business-critical and must not wait behind
+      -- repeatedly duplicated KOT/config rows.
+      CASE
+        WHEN table_name IN ('transaction', 'walkin_transaction') THEN 0
+        WHEN attempts >= ? THEN 1
+        ELSE 2
+      END,
       created_at ASC, id ASC
     LIMIT ?
   `).all(MAX_ATTEMPTS, MAX_BATCH_SIZE) as SyncQueueRow[];
@@ -444,11 +450,18 @@ function claimBatch(queueIds: number[]): void {
 
 function deadLetterExhausted(): void {
   const db = getDb();
-  db.query(`UPDATE sync_queue SET last_error = COALESCE(last_error, 'Max attempts reached') WHERE synced = 0 AND attempts >= ? AND last_error NOT LIKE 'DEAD_LETTER%'`)
-    .run(MAX_ATTEMPTS);
-  // Mark them with DEAD_LETTER prefix so they don't get retried
-  db.query(`UPDATE sync_queue SET last_error = 'DEAD_LETTER: ' || COALESCE(last_error, 'exhausted') WHERE synced = 0 AND attempts >= ? AND last_error NOT LIKE 'DEAD_LETTER%'`)
-    .run(MAX_ATTEMPTS);
+  // Keep a clear reason when a process died after claiming a row. IN_FLIGHT is
+  // only a crash-recovery marker, never a useful permanent error message.
+  db.query(`
+    UPDATE sync_queue
+    SET last_error = 'DEAD_LETTER: ' || CASE
+      WHEN last_error IS NULL OR last_error = 'IN_FLIGHT' THEN 'max attempts reached'
+      ELSE last_error
+    END
+    WHERE synced = 0
+      AND attempts >= ?
+      AND last_error NOT LIKE 'DEAD_LETTER:%'
+  `).run(MAX_ATTEMPTS);
 }
 
 // ─── Main sync push ──────────────────────────────────────────────────────────

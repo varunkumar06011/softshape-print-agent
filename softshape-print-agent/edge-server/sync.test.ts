@@ -296,6 +296,28 @@ describe('Sync queue backfill logic', () => {
     expect(newRow.synced).toBe(0);
   });
 
+  it('should prioritize transactions ahead of exhausted KOT rows', () => {
+    enqueueSync(db, 'kot', 'kot-1', 'insert');
+    enqueueSync(db, 'transaction', 'txn-1', 'insert');
+    db.query(`UPDATE sync_queue SET attempts = 6, last_error = 'DEAD_LETTER: previous failure' WHERE table_name = 'transaction'`).run();
+    db.query(`UPDATE sync_queue SET created_at = 1 WHERE table_name = 'kot'`).run();
+
+    const first = db.query(`
+      SELECT table_name FROM sync_queue
+      WHERE synced = 0
+      ORDER BY
+        CASE
+          WHEN table_name IN ('transaction', 'walkin_transaction') THEN 0
+          WHEN attempts >= ? THEN 1
+          ELSE 2
+        END,
+        created_at ASC, id ASC
+      LIMIT 1
+    `).get(5) as any;
+
+    expect(first.table_name).toBe('transaction');
+  });
+
   it('should preserve a pending row while an older push is in flight', () => {
     enqueueSync(db, 'transaction', 'txn-1', 'insert');
     const firstRow = db.query(
