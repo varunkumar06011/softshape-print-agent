@@ -176,19 +176,35 @@ export function getDb(): Database {
     console.log(`[DB] In-place migration: on-disk=${onDiskVersion} → target=${CURRENT_SCHEMA_VERSION}. Running migrations without rebuild.`);
   }
 
+  console.log("[DB] Running initSchema...");
   initSchema(db);
+  console.log("[DB] initSchema complete, running migrations...");
   runMigrations(db);
+  console.log("[DB] Migrations complete.");
 
   // Enable incremental auto_vacuum so daily maintenance can reclaim free pages
   // from deleted rows without a full VACUUM lock. For existing DBs where
-  // auto_vacuum is off (0), set it to INCREMENTAL (2) and run a one-time VACUUM.
+  // auto_vacuum is off (0), set it to INCREMENTAL (2) and schedule a background
+  // VACUUM. We do NOT run VACUUM synchronously here because it rewrites the
+  // entire database file and can block startup for minutes on large DBs.
   try {
     const av = db.query("PRAGMA auto_vacuum").get() as { auto_vacuum?: number } | undefined;
     if (Number(av?.auto_vacuum || 0) !== 2) {
-      console.log("[DB] Enabling incremental auto_vacuum (one-time VACUUM)...");
+      console.log("[DB] Enabling incremental auto_vacuum (VACUUM deferred to background)...");
       db.exec("PRAGMA auto_vacuum = INCREMENTAL");
-      db.exec("VACUUM");
-      console.log("[DB] Incremental auto_vacuum enabled");
+      // Schedule VACUUM after 30 seconds so it doesn't block startup.
+      // VACUUM requires no active write transactions, so we run it in a
+      // setTimeout after the server is fully initialized.
+      setTimeout(() => {
+        try {
+          if (db) {
+            db.exec("VACUUM");
+            console.log("[DB] Background VACUUM complete — incremental auto_vacuum enabled");
+          }
+        } catch (vacuumErr) {
+          console.warn("[DB] Background VACUUM failed (non-fatal):", vacuumErr);
+        }
+      }, 30_000);
     }
   } catch (err) {
     console.warn("[DB] Could not enable incremental auto_vacuum:", err);
@@ -198,6 +214,7 @@ export function getDb(): Database {
     db.exec(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
   }
 
+  console.log("[DB] getDb() complete, returning database instance.");
   return db;
 }
 
@@ -390,7 +407,9 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_menu_item_category ON menu_item(category_id);
     CREATE INDEX IF NOT EXISTS idx_menu_item_restaurant ON menu_item(restaurant_id);
     CREATE INDEX IF NOT EXISTS idx_menu_item_available ON menu_item(restaurant_id, is_available, is_deleted);
-    CREATE INDEX IF NOT EXISTS idx_menu_item_combo ON menu_item(restaurant_id, is_combo);
+    -- NOTE: idx_menu_item_combo is created in runMigrations() after is_combo
+    -- column is added via ALTER TABLE (v8 migration). Creating it here would
+    -- fail on pre-v8 DBs where the column doesn't exist yet.
 
     -- Menu Item Variants
     CREATE TABLE IF NOT EXISTS menu_item_variant (
@@ -575,7 +594,10 @@ function initSchema(database: Database) {
       dead_lettered_at INTEGER              -- timestamp when state last became 'dead_letter'; NULL otherwise
     );
     CREATE INDEX IF NOT EXISTS idx_sync_queue_pending ON sync_queue(synced) WHERE synced = 0;
-    CREATE INDEX IF NOT EXISTS idx_sync_queue_state ON sync_queue(state) WHERE state != 'pending';
+    -- NOTE: idx_sync_queue_state is created in runMigrations() after the state
+    -- column is added via ALTER TABLE. Creating it here would fail on v6 DBs
+    -- where the column doesn't exist yet, causing exec() to abort and skip all
+    -- subsequent CREATE TABLE statements (including transaction_record).
 
     -- Sync Audit (permanent rejections and conflicts from cloud sync)
     -- When the cloud permanently rejects or flags a conflict on a sync item,
@@ -1582,7 +1604,7 @@ export function reclaimStalePrintingJobs(): number {
   const deadLetterResult = db.query(
     `UPDATE print_job SET status = 'dead_letter', failed_at = ?, updated_at = ?
      WHERE status = 'retrying' AND attempts >= ?`,
-  ).run(now, PRINT_JOB_MAX_ATTEMPTS);
+  ).run(now, now, PRINT_JOB_MAX_ATTEMPTS);
   if (deadLetterResult.changes > 0) {
     console.warn(`[PrintQueue] ${deadLetterResult.changes} job(s) moved to dead_letter after ${PRINT_JOB_MAX_ATTEMPTS} attempts`);
   }
