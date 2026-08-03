@@ -32,7 +32,7 @@ export function getKolkataDateString(date = new Date()): string {
   return corrected.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
 }
 
-const CURRENT_SCHEMA_VERSION = 6;
+const CURRENT_SCHEMA_VERSION = 7;
 
 // Schema versions that can be migrated in place (via runMigrations) without
 // wiping the database. Any version not in this set triggers the existing
@@ -43,7 +43,9 @@ const CURRENT_SCHEMA_VERSION = 6;
 // v5 → v6 recreates the kot table with a date-scoped unique constraint
 // (UNIQUE(restaurant_id, kot_number, counter_date)) and backfills
 // counter_date from created_at so KOT numbers can restart at 1 daily.
-const SAFE_INPLACE_MIGRATION_FROM = new Set<number>([2, 3, 4, 5]);
+// v6 → v7 adds the `state` column to sync_queue (pending|waiting_dependency|
+// in_flight|dead_letter|synced) replacing last_error string prefixes.
+const SAFE_INPLACE_MIGRATION_FROM = new Set<number>([2, 3, 4, 5, 6]);
 
 let db: Database | null = null;
 let recoveryStatus: RecoveryResult = { recovered: false, corruptPath: null, message: "" };
@@ -568,9 +570,12 @@ function initSchema(database: Database) {
       created_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
       attempts        INTEGER DEFAULT 0,
       last_error      TEXT,
-      synced          INTEGER DEFAULT 0
+      synced          INTEGER DEFAULT 0,
+      state           TEXT DEFAULT 'pending',  -- pending|waiting_dependency|in_flight|dead_letter|synced
+      dead_lettered_at INTEGER              -- timestamp when state last became 'dead_letter'; NULL otherwise
     );
     CREATE INDEX IF NOT EXISTS idx_sync_queue_pending ON sync_queue(synced) WHERE synced = 0;
+    CREATE INDEX IF NOT EXISTS idx_sync_queue_state ON sync_queue(state) WHERE state != 'pending';
 
     -- Sync Audit (permanent rejections and conflicts from cloud sync)
     -- When the cloud permanently rejects or flags a conflict on a sync item,
@@ -672,6 +677,21 @@ function initSchema(database: Database) {
     );
     CREATE INDEX IF NOT EXISTS idx_users_outlet ON users(outlet_id);
     CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active) WHERE is_active = 1;
+
+    -- Staff tokens (user-bound, short-lived, issued on offline PIN login).
+    -- Separate from the device-wide runtime token so that cashier-specific
+    -- authorization (e.g. menuAdd permission) can be enforced on edge writes.
+    CREATE TABLE IF NOT EXISTS staff_tokens (
+      token        TEXT PRIMARY KEY,
+      user_id      TEXT NOT NULL,
+      role         TEXT NOT NULL,
+      outlet_id    TEXT NOT NULL,
+      permissions  TEXT,             -- JSON
+      expires_at   INTEGER NOT NULL, -- unix epoch seconds
+      created_at   INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+    CREATE INDEX IF NOT EXISTS idx_staff_tokens_user ON staff_tokens(user_id);
+    CREATE INDEX IF NOT EXISTS idx_staff_tokens_expires ON staff_tokens(expires_at);
 
     -- Command Log (durable idempotency + audit for every edge business command)
     -- One row per applied/rejected command. Replay of the same (restaurant_id,
@@ -977,6 +997,35 @@ function runMigrations(database: Database) {
   database.exec(`CREATE INDEX IF NOT EXISTS idx_expenditure_employee ON expenditure(employee_id) WHERE employee_id IS NOT NULL`);
   database.exec(`CREATE INDEX IF NOT EXISTS idx_expenditure_ledger ON expenditure(ledger_category_id) WHERE ledger_category_id IS NOT NULL`);
 
+  // ── v7: sync_queue.state column ──────────────────────────────────────────────
+  // Adds a first-class `state` column (pending|waiting_dependency|in_flight|
+  // dead_letter|synced) replacing the previous convention of encoding state into
+  // last_error string prefixes ('IN_FLIGHT', 'DEAD_LETTER:', 'WAITING_DEPENDENCY:').
+  // Backfills state from last_error for existing rows. New rows default to 'pending'.
+  //
+  // IN_FLIGHT rows are reset to 'pending' (NOT 'in_flight') because a restart
+  // means the push was interrupted — the record is no longer actually in flight.
+  // Setting state='in_flight' would strand it forever since collectBatch() only
+  // selects state='pending'. Resetting to 'pending' lets the next cycle re-push.
+  //
+  // dead_lettered_at tracks when a row last entered dead_letter state, so the
+  // reconciliation auto-reset can skip records that have been dead-lettered for
+  // a long time (leaving them for manual intervention + alerting) while still
+  // auto-retrying recently dead-lettered records that likely failed due to a
+  // transient issue (network outage, cloud 500) that has since resolved.
+  if (!hasColumn("sync_queue", "state")) {
+    database.exec(`ALTER TABLE sync_queue ADD COLUMN state TEXT DEFAULT 'pending'`);
+    database.exec(`UPDATE sync_queue SET state = 'pending', last_error = NULL WHERE last_error = 'IN_FLIGHT'`);
+    database.exec(`UPDATE sync_queue SET state = 'dead_letter' WHERE last_error LIKE 'DEAD_LETTER:%'`);
+    database.exec(`CREATE INDEX IF NOT EXISTS idx_sync_queue_state ON sync_queue(state) WHERE state != 'pending'`);
+  }
+  if (!hasColumn("sync_queue", "dead_lettered_at")) {
+    database.exec(`ALTER TABLE sync_queue ADD COLUMN dead_lettered_at INTEGER`);
+    // Backfill: existing dead_letter rows get dead_lettered_at = now so the
+    // auto-reset gate (30 min) applies going forward. Without this, pre-migration
+    // dead-letters would have NULL and be reset immediately (losing the gate).
+    database.exec(`UPDATE sync_queue SET dead_lettered_at = ${Date.now()} WHERE state = 'dead_letter' AND dead_lettered_at IS NULL`);
+  }
   // ── v8: Combos feature — is_combo / show_in_menu on menu_item ──────────────
   // Added so the edge server can mirror cloud combo behavior: combos are billed
   // as a single line but printed as one KOT line per component, and items with
@@ -1024,9 +1073,21 @@ export function enqueueSync(tableName: string, recordId: string, operation: stri
   // selected that row; preserving its queue ID keeps the acknowledgment and
   // retry state valid if a new local update arrives while the request is in
   // flight. The source row is always re-read when the batch is built.
+  //
+  // State reset: a new local update means the record changed, so any non-pending
+  // state (waiting_dependency, dead_letter) is stale and must be flipped back to
+  // 'pending' so collectBatch() picks it up. Without this, a record stuck in
+  // waiting_dependency or dead_letter would never be re-collected even after a
+  // fresh local update — silently swallowing the change.
+  //
+  // In-flight rows are skipped (state = 'in_flight') to avoid clobbering a push
+  // that is currently being acknowledged. enqueueSync() for an in-flight record
+  // will fall through to the INSERT below, creating a second pending row — this
+  // is intentional and preserves the newer update without invalidating the
+  // in-flight acknowledgment.
   const now = Date.now();
   const updated = db.query(
-    "UPDATE sync_queue SET operation = ?, created_at = ?, attempts = 0, last_error = NULL WHERE table_name = ? AND record_id = ? AND synced = 0 AND COALESCE(last_error, '') != 'IN_FLIGHT'",
+    "UPDATE sync_queue SET operation = ?, created_at = ?, attempts = 0, last_error = NULL, state = 'pending' WHERE table_name = ? AND record_id = ? AND synced = 0 AND state != 'in_flight'",
   ).run(operation, now, tableName, recordId);
   if ((updated.changes || 0) === 0) {
     db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)")
@@ -1255,10 +1316,14 @@ export function getSyncAlerts(): Array<{
   const oneHourAgo = now - 60 * 60 * 1000;
 
   // Alert 1: Dead-lettered records accumulating for > 1 hour
+  // Uses dead_lettered_at (when the record entered dead_letter state) rather
+  // than created_at (when it was enqueued) for an accurate "stuck" measurement.
+  // The reconciliation auto-reset only resets dead-letters < 30 min old, so
+  // records dead-lettered > 1 hour ago are genuinely stuck and need attention.
   const deadLetterStuck = db.query(
-    `SELECT COUNT(*) as c, MIN(created_at) as oldest
+    `SELECT COUNT(*) as c, MIN(dead_lettered_at) as oldest
      FROM sync_queue
-     WHERE synced = 0 AND attempts >= 5 AND created_at < ?`,
+     WHERE synced = 0 AND state = 'dead_letter' AND dead_lettered_at IS NOT NULL AND dead_lettered_at < ?`,
   ).get(oneHourAgo) as any;
   if (deadLetterStuck?.c > 0) {
     alerts.push({
@@ -1303,6 +1368,40 @@ export function getSyncAlerts(): Array<{
       message: `${recentPending.pending_after} records pending sync — queue may be stuck`,
       since: now,
       count: recentPending.pending_after,
+    });
+  }
+
+  // Alert 4: Permanent failures involving revenue in last 1 hour
+  const permanentRevenueFailures = db.query(
+    `SELECT COUNT(*) as c, MIN(audited_at) as oldest
+     FROM sync_audit
+     WHERE outcome = 'permanent'
+       AND table_name IN ('transaction', 'walkin_transaction')
+       AND audited_at > ?`,
+  ).get(oneHourAgo) as any;
+  if (permanentRevenueFailures?.c > 0) {
+    alerts.push({
+      type: "permanent_revenue_failure",
+      severity: "critical",
+      message: `${permanentRevenueFailures.c} transaction(s) permanently rejected by cloud — revenue may be missing from admin panel. Check sync_audit for details.`,
+      since: permanentRevenueFailures.oldest,
+      count: permanentRevenueFailures.c,
+    });
+  }
+
+  // Alert 5: waiting_dependency records stuck > 30 minutes (MANDATORY — no silent infinite waiting)
+  const stuckWaiting = db.query(
+    `SELECT COUNT(*) as c, MIN(created_at) as oldest
+     FROM sync_queue
+     WHERE synced = 0 AND state = 'waiting_dependency' AND created_at < ?`,
+  ).get(now - 30 * 60 * 1000) as any;
+  if (stuckWaiting?.c > 0) {
+    alerts.push({
+      type: "waiting_dependency_stuck",
+      severity: "critical",
+      message: `${stuckWaiting.c} transaction(s) waiting for order sync for over 30 minutes — possible stuck order or data inconsistency`,
+      since: stuckWaiting.oldest,
+      count: stuckWaiting.c,
     });
   }
 

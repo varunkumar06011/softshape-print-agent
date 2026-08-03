@@ -26,6 +26,37 @@ let lastPeriodicBackupAt = 0;
 const PERIODIC_BACKUP_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_PERIODIC_BACKUPS = 48; // 48 × 30min = 24h of periodic backups
 
+// ── Forced backup (before shutdown / update swap) ────────────────────────────
+// Bypasses the 30-minute throttle so a fresh snapshot always exists right
+// before the Runtime stops. Capped to MAX_FORCED_BACKUPS so frequent shutdowns
+// don't pile up between daily prune cycles.
+
+const MAX_FORCED_BACKUPS = 5;
+
+export function forceBackupNow(db: Database, label: string = "forced"): string | null {
+  try {
+    if (!existsSync(BACKUP_DIR)) {
+      mkdirSync(BACKUP_DIR, { recursive: true });
+    }
+    const ts = Date.now();
+    const backupPath = join(BACKUP_DIR, `edge-${label}-${ts}.db`);
+    db.query(`VACUUM INTO '${backupPath}'`).run();
+    console.log(`[Backup] Forced backup created: ${backupPath}`);
+
+    // Prune same-label forced backups (keep most recent MAX_FORCED_BACKUPS)
+    const forced = readdirSync(BACKUP_DIR)
+      .filter(f => f.startsWith(`edge-${label}-`) && f.endsWith(".db"))
+      .sort((a, b) => b.localeCompare(a)); // newest first (timestamp in name)
+    for (let i = MAX_FORCED_BACKUPS; i < forced.length; i++) {
+      try { unlinkSync(join(BACKUP_DIR, forced[i])); } catch { /* skip */ }
+    }
+    return backupPath;
+  } catch (err) {
+    console.warn(`[Backup] Forced backup ("${label}") failed (non-fatal):`, err);
+    return null;
+  }
+}
+
 export function runPeriodicBackup(db: Database): void {
   const now = Date.now();
   if (now - lastPeriodicBackupAt < PERIODIC_BACKUP_INTERVAL_MS) return;

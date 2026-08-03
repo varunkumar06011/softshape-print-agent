@@ -490,6 +490,55 @@ fn download_update(url: &str, dest: &PathBuf) -> bool {
     }
 }
 
+// ── Graceful Runtime shutdown ─────────────────────────────────────────────────
+// Asks the Runtime to shut down via its HTTP API so it can run the pre-shutdown
+// backup and close the SQLite DB cleanly (flushing WAL). Falls back to a hard
+// kill if the Runtime doesn't exit within GRACEFUL_SHUTDOWN_TIMEOUT_SECS — this
+// matters because the binary swap below requires the exe to no longer be loaded.
+
+const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 8;
+
+fn graceful_shutdown_runtime(child: &mut Child) {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    // 1. POST /runtime/shutdown — the Runtime responds 200 immediately and
+    //    exits a few ms later after running its shutdown handler.
+    let addr = format!("127.0.0.1:{}", RUNTIME_PORT);
+    if let Ok(mut stream) = TcpStream::connect_timeout(
+        &addr.parse().unwrap_or_else(|_| "127.0.0.1:3101".parse().unwrap()),
+        Duration::from_secs(2),
+    ) {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let req = "POST /runtime/shutdown HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(req.as_bytes());
+        // Drain whatever it sends back so the request completes.
+        let mut buf = [0u8; 128];
+        let _ = stream.read(&mut buf);
+    }
+
+    // 2. Wait up to the timeout for the Runtime to exit on its own.
+    let deadline = Instant::now() + Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECS);
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                log("Runtime exited gracefully after /runtime/shutdown");
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+            Err(_) => break,
+        }
+    }
+
+    // 3. Fallback: hard-kill if it didn't exit in time.
+    log(&format!(
+        "Runtime did not exit within {}s — hard-killing",
+        GRACEFUL_SHUTDOWN_TIMEOUT_SECS
+    ));
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn perform_runtime_update(
     runtime_exe: &PathBuf,
     update: UpdateInfo,
@@ -507,10 +556,10 @@ fn perform_runtime_update(
         return false;
     }
 
-    // 2. Stop the current Runtime
+    // 2. Stop the current Runtime gracefully — lets it run the pre-shutdown
+    //    backup and close the SQLite DB cleanly before the binary swap.
     log("Stopping Runtime for update swap");
-    let _ = child.kill();
-    let _ = child.wait();
+    graceful_shutdown_runtime(child);
 
     // 3. Backup old binary
     let _ = fs::remove_file(&backup_path);

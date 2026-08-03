@@ -56,7 +56,8 @@ import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, g
 import { pullIncrementalChanges } from "./config.ts";
 import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders } from "./reads.ts";
-import { startSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
+import { startSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter, checkQueueInvariants } from "./sync.ts";
+import { runBackfill } from "./backfill.ts";
 import { startSocketSync, getSocketStatus, startHeartbeat } from "./socketSync.ts";
 import { acquireInstanceLock, startHeartbeatLoop, forceReleaseLock, getLockStatus } from "./instanceLock.ts";
 import { cloudFetch } from "./cloudFetch.ts";
@@ -71,7 +72,7 @@ import { BarcodeDriver } from "./drivers/barcode/index.ts";
 import { ScaleDriver } from "./drivers/scale/index.ts";
 import { DisplayDriver } from "./drivers/display/index.ts";
 import { loadPlugins, reloadPlugins, getLoadedPlugins } from "./drivers/pluginLoader.ts";
-import { getOrCreateRuntimeToken, validateRuntimeToken, rotateRuntimeToken, PUBLIC_PATHS } from "./contract/auth.ts";
+import { getOrCreateRuntimeToken, validateRuntimeToken, rotateRuntimeToken, PUBLIC_PATHS, issueStaffToken, validateStaffToken, revokeStaffToken, staffHasPermission } from "./contract/auth.ts";
 import { registerEventClient, handleEventMessage, unregisterEventClient, emitEvent, getEventClientCount, getAuthenticatedClientCount } from "./eventBus.ts";
 import { EVENT_NAMES } from "./contract/events.ts";
 import { runtimeLog } from "./contract/logger.ts";
@@ -295,6 +296,45 @@ function invalidateSetupNonce(): void {
   db.query("DELETE FROM edge_config WHERE key = ?").run("setup_nonce");
 }
 
+// ── Helpers used by report endpoints ──────────────────────────────────────────
+
+function round2(n: number): number {
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+function getBillPrinterName(): string | null {
+  try {
+    const db = getDb();
+    const mappingRow = db.query("SELECT value FROM edge_config WHERE key = 'printer_mapping'").get() as { value?: string } | undefined;
+    if (mappingRow?.value) {
+      const mapping = JSON.parse(mappingRow.value);
+      if (mapping?.bill) return mapping.bill;
+    }
+
+    const outlet = getOutletSettings();
+    const pc = outlet?.printerConfig || {};
+    return resolvePrinterName(null, "BILL_PRINTER", null, pc) || null;
+  } catch { return null; }
+}
+
+// Returns table IDs that belong to the given venue, or null when no venue
+// filter is requested (caller should skip filtering in that case).
+function getVenueTableIds(db: any, venueId: string | null): string[] | null {
+  if (!venueId) return null;
+  const rows = db.query(
+    `SELECT t.id FROM "table" t JOIN section s ON t.section_id = s.id WHERE s.venue_id = ?`
+  ).all(venueId) as any[];
+  return rows.map(r => r.id);
+}
+
+// Builds a SQL fragment + params for filtering by a set of table IDs.
+// Returns empty strings/arrays when tableIds is null (no filter).
+function tableIdFilter(tableIds: string[] | null, column = "table_id"): { clause: string; params: string[] } {
+  if (!tableIds || tableIds.length === 0) return { clause: " AND 1=0", params: [] };
+  const placeholders = tableIds.map(() => "?").join(",");
+  return { clause: ` AND ${column} IN (${placeholders})`, params: tableIds };
+}
+
 // ── Route handlers ────────────────────────────────────────────────────────────
 
 async function handleRequest(req: Request, url: URL, server: any): Promise<Response> {
@@ -408,7 +448,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       const healthResp = {
         status: rmHealth.status,
         service: "softshape-edge-server",
-        version: "23.12.1",
+        version: "23.14.0",
         uptime: process.uptime(),
         runtimeState: rmHealth.runtimeState,
         configSyncState: rmHealth.configSyncState,
@@ -469,7 +509,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const healthResp = {
       status: "ok",
       service: "softshape-edge-server",
-      version: "23.12.1",
+      version: "23.14.0",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
@@ -1516,18 +1556,581 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     return jsonResponse({ startDate, endDate, captains: result }, 200, { "Cache-Control": "no-store" });
   }
 
-  // ── Helper: round to 2 decimal places ──────────────────────────────────────
-  function round2(n: number): number {
-    return Math.round((n + Number.EPSILON) * 100) / 100;
+  // ── GET /api/edge/reports/daily-sales?startDate=&endDate= ───────────────────
+  // Aggregate settled orders + walk-in txns in date range from local SQLite.
+  if (url.pathname === "/api/edge/reports/daily-sales" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const startDate = url.searchParams.get("startDate") || getKolkataDateString();
+    const endDate = url.searchParams.get("endDate") || startDate;
+    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+    const [sy, sm, sd] = startDate.split("-").map(Number);
+    const [ey, em, ed] = endDate.split("-").map(Number);
+    const startTs = Date.UTC(sy, sm - 1, sd, 0, 0, 0, 0) - IST_OFFSET_MS;
+    const endTs = Date.UTC(ey, em - 1, ed, 23, 59, 59, 999) - IST_OFFSET_MS;
+
+    const db = getDb();
+    const venueTableIds = getVenueTableIds(db, url.searchParams.get("venueId"));
+    const vf = tableIdFilter(venueTableIds);
+    const orders = db.query(
+      `SELECT id, paid_at FROM order_record WHERE restaurant_id = ? AND status = 'SETTLED' AND paid_at >= ? AND paid_at <= ?${vf.clause}`
+    ).all(restaurantId, startTs, endTs, ...vf.params) as any[];
+
+    let totalRevenue = 0, totalDiscount = 0, totalCGST = 0, totalSGST = 0;
+    const byMethod: Record<string, { count: number; amount: number }> = {};
+    const byDayMap = new Map<string, { revenue: number; transactions: number }>();
+
+    for (const order of orders) {
+      const settleRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
+      if (!settleRow?.value) continue;
+      try {
+        const pd = JSON.parse(settleRow.value);
+        const grand = Number(pd.grandTotal || 0);
+        totalRevenue += grand;
+        totalDiscount += Number(pd.discountAmount || 0);
+        totalCGST += Number(pd.cgst || 0);
+        totalSGST += Number(pd.sgst || 0);
+        const method = (pd.paymentMethod || "CASH").toUpperCase();
+        if (!byMethod[method]) byMethod[method] = { count: 0, amount: 0 };
+        byMethod[method].count += 1;
+        byMethod[method].amount += grand;
+        const dayKey = new Date(Number(order.paid_at) + IST_OFFSET_MS).toISOString().slice(0, 10);
+        const dayEntry = byDayMap.get(dayKey) || { revenue: 0, transactions: 0 };
+        dayEntry.revenue += grand;
+        dayEntry.transactions += 1;
+        byDayMap.set(dayKey, dayEntry);
+      } catch {}
+    }
+
+    // Walk-in transactions (not filtered by venue — walk-ins have no table)
+    let walkinCount = 0;
+    if (!venueTableIds) {
+      try {
+        const walkinRows = db.query("SELECT key, value FROM edge_config WHERE key LIKE 'walkin_txn:%'").all() as any[];
+        for (const row of walkinRows) {
+          try {
+            const data = JSON.parse(row.value);
+            if (data.restaurantId === restaurantId && data.createdAt >= startTs && data.createdAt <= endTs) {
+              const grand = Number(data.grandTotal || data.total || 0);
+              totalRevenue += grand;
+              walkinCount += 1;
+              const method = (data.paymentMethod || "CASH").toUpperCase();
+              if (!byMethod[method]) byMethod[method] = { count: 0, amount: 0 };
+              byMethod[method].count += 1;
+              byMethod[method].amount += grand;
+              const dayKey = new Date(Number(data.createdAt) + IST_OFFSET_MS).toISOString().slice(0, 10);
+              const dayEntry = byDayMap.get(dayKey) || { revenue: 0, transactions: 0 };
+              dayEntry.revenue += grand;
+              dayEntry.transactions += 1;
+              byDayMap.set(dayKey, dayEntry);
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+
+    const totalTransactions = orders.length + walkinCount;
+    const byDay = Array.from(byDayMap.entries())
+      .map(([date, v]) => ({ date, revenue: round2(v.revenue), transactions: v.transactions }))
+      .sort((a, b) => a.date.localeCompare(b.date));
+
+    return jsonResponse({
+      summary: {
+        totalRevenue: round2(totalRevenue),
+        totalTransactions,
+        averageBillValue: totalTransactions > 0 ? round2(totalRevenue / totalTransactions) : 0,
+        totalDiscount: round2(totalDiscount),
+        totalCGST: round2(totalCGST),
+        totalSGST: round2(totalSGST),
+      },
+      byMethod: Object.fromEntries(
+        Object.entries(byMethod).map(([k, v]) => [k, { count: v.count, amount: round2(v.amount) }])
+      ),
+      byDay,
+      dateRange: { startDate, endDate },
+    }, 200, { "Cache-Control": "no-store" });
   }
 
-  // ── Helper: get printer config + resolve bill printer name ──────────────────
-  function getBillPrinterName(): string | null {
-    try {
-      const outlet = getOutletSettings();
-      const pc = outlet?.printerConfig || {};
-      return resolvePrinterName(null, "BILL_PRINTER", null, pc) || null;
-    } catch { return null; }
+  // ── GET /api/edge/reports/categorywise-sales?startDate=&endDate= ────────────
+  if (url.pathname === "/api/edge/reports/categorywise-sales" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const startDate = url.searchParams.get("startDate") || getKolkataDateString();
+    const endDate = url.searchParams.get("endDate") || startDate;
+    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+    const [sy, sm, sd] = startDate.split("-").map(Number);
+    const [ey, em, ed] = endDate.split("-").map(Number);
+    const startTs = Date.UTC(sy, sm - 1, sd, 0, 0, 0, 0) - IST_OFFSET_MS;
+    const endTs = Date.UTC(ey, em - 1, ed, 23, 59, 59, 999) - IST_OFFSET_MS;
+
+    const db = getDb();
+    const venueTableIds = getVenueTableIds(db, url.searchParams.get("venueId"));
+    const vf = tableIdFilter(venueTableIds);
+    const orders = db.query(
+      `SELECT id FROM order_record WHERE restaurant_id = ? AND status = 'SETTLED' AND paid_at >= ? AND paid_at <= ?${vf.clause}`
+    ).all(restaurantId, startTs, endTs, ...vf.params) as any[];
+
+    const catMap = new Map<string, { name: string; itemCount: number; totalQuantity: number; totalRevenue: number }>();
+    for (const order of orders) {
+      const settleRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
+      let discountFactor = 1;
+      if (settleRow?.value) {
+        try { discountFactor = 1 - Number(JSON.parse(settleRow.value).discountPercent || 0) / 100; } catch {}
+      }
+      const items = db.query(
+        "SELECT oi.name, oi.price, oi.quantity, oi.menu_item_id, c.name AS category FROM order_item oi LEFT JOIN menu_item m ON oi.menu_item_id = m.id LEFT JOIN category c ON m.category_id = c.id WHERE oi.order_id = ? AND oi.removed_from_bill = 0"
+      ).all(order.id) as any[];
+      for (const item of items) {
+        const catName = (item.category || "Uncategorized").trim();
+        const key = catName.toLowerCase();
+        const quantity = Number(item.quantity || 0);
+        const revenue = Math.round(Number(item.price || 0) * quantity * discountFactor * 100) / 100;
+        const entry = catMap.get(key) || { name: catName, itemCount: 0, totalQuantity: 0, totalRevenue: 0 };
+        entry.itemCount += 1;
+        entry.totalQuantity += quantity;
+        entry.totalRevenue += revenue;
+        catMap.set(key, entry);
+      }
+    }
+
+    const result = Array.from(catMap.values())
+      .map(e => ({ name: e.name, itemCount: e.itemCount, totalQuantity: e.totalQuantity, totalRevenue: round2(e.totalRevenue) }))
+      .sort((a, b) => b.totalRevenue - a.totalRevenue);
+
+    return jsonResponse({ categories: result, dateRange: { startDate, endDate } }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── GET /api/edge/reports/payment-methods?startDate=&endDate= ───────────────
+  if (url.pathname === "/api/edge/reports/payment-methods" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const startDate = url.searchParams.get("startDate") || getKolkataDateString();
+    const endDate = url.searchParams.get("endDate") || startDate;
+    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+    const [sy, sm, sd] = startDate.split("-").map(Number);
+    const [ey, em, ed] = endDate.split("-").map(Number);
+    const startTs = Date.UTC(sy, sm - 1, sd, 0, 0, 0, 0) - IST_OFFSET_MS;
+    const endTs = Date.UTC(ey, em - 1, ed, 23, 59, 59, 999) - IST_OFFSET_MS;
+
+    const db = getDb();
+    const venueTableIds = getVenueTableIds(db, url.searchParams.get("venueId"));
+    const vf = tableIdFilter(venueTableIds);
+    const orders = db.query(
+      `SELECT id FROM order_record WHERE restaurant_id = ? AND status = 'SETTLED' AND paid_at >= ? AND paid_at <= ?${vf.clause}`
+    ).all(restaurantId, startTs, endTs, ...vf.params) as any[];
+
+    const byMethod: Record<string, { count: number; amount: number }> = {};
+    let totalRevenue = 0;
+    for (const order of orders) {
+      const settleRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
+      if (!settleRow?.value) continue;
+      try {
+        const pd = JSON.parse(settleRow.value);
+        const grand = Number(pd.grandTotal || 0);
+        totalRevenue += grand;
+        const method = (pd.paymentMethod || "CASH").toUpperCase();
+        if (!byMethod[method]) byMethod[method] = { count: 0, amount: 0 };
+        byMethod[method].count += 1;
+        byMethod[method].amount += grand;
+      } catch {}
+    }
+
+    return jsonResponse({
+      byMethod: Object.fromEntries(
+        Object.entries(byMethod).map(([k, v]) => [k, { count: v.count, amount: round2(v.amount) }])
+      ),
+      totalRevenue: round2(totalRevenue),
+      totalTransactions: orders.length,
+      dateRange: { startDate, endDate },
+    }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── GET /api/edge/reports/discount-report?startDate=&endDate= ───────────────
+  if (url.pathname === "/api/edge/reports/discount-report" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const startDate = url.searchParams.get("startDate") || getKolkataDateString();
+    const endDate = url.searchParams.get("endDate") || startDate;
+    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+    const [sy, sm, sd] = startDate.split("-").map(Number);
+    const [ey, em, ed] = endDate.split("-").map(Number);
+    const startTs = Date.UTC(sy, sm - 1, sd, 0, 0, 0, 0) - IST_OFFSET_MS;
+    const endTs = Date.UTC(ey, em - 1, ed, 23, 59, 59, 999) - IST_OFFSET_MS;
+
+    const db = getDb();
+    const venueTableIds = getVenueTableIds(db, url.searchParams.get("venueId"));
+    const vf = tableIdFilter(venueTableIds);
+    const orders = db.query(
+      `SELECT id, bill_number FROM order_record WHERE restaurant_id = ? AND status = 'SETTLED' AND paid_at >= ? AND paid_at <= ?${vf.clause}`
+    ).all(restaurantId, startTs, endTs, ...vf.params) as any[];
+
+    let totalDiscount = 0;
+    const discountedOrders: any[] = [];
+    const byPercentMap = new Map<number, { percent: number; count: number; amount: number }>();
+
+    for (const order of orders) {
+      const settleRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
+      if (!settleRow?.value) continue;
+      try {
+        const pd = JSON.parse(settleRow.value);
+        const discountAmount = Number(pd.discountAmount || 0);
+        const discountPercent = Number(pd.discountPercent || 0);
+        const grandTotal = Number(pd.grandTotal || 0);
+        if (discountAmount > 0 || discountPercent > 0) {
+          totalDiscount += discountAmount;
+          discountedOrders.push({
+            orderId: order.id,
+            billNumber: order.bill_number,
+            discountPercent,
+            discountAmount: round2(discountAmount),
+            grandTotal: round2(grandTotal),
+          });
+          const key = discountPercent;
+          const entry = byPercentMap.get(key) || { percent: discountPercent, count: 0, amount: 0 };
+          entry.count += 1;
+          entry.amount += discountAmount;
+          byPercentMap.set(key, entry);
+        }
+      } catch {}
+    }
+
+    const byDiscountPercent = Array.from(byPercentMap.values())
+      .map(e => ({ percent: e.percent, count: e.count, amount: round2(e.amount) }))
+      .sort((a, b) => a.percent - b.percent);
+
+    return jsonResponse({
+      totalDiscount: round2(totalDiscount),
+      discountedOrders,
+      byDiscountPercent,
+      dateRange: { startDate, endDate },
+    }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── GET /api/edge/reports/gst-report?startDate=&endDate= ────────────────────
+  if (url.pathname === "/api/edge/reports/gst-report" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const startDate = url.searchParams.get("startDate") || getKolkataDateString();
+    const endDate = url.searchParams.get("endDate") || startDate;
+    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+    const [sy, sm, sd] = startDate.split("-").map(Number);
+    const [ey, em, ed] = endDate.split("-").map(Number);
+    const startTs = Date.UTC(sy, sm - 1, sd, 0, 0, 0, 0) - IST_OFFSET_MS;
+    const endTs = Date.UTC(ey, em - 1, ed, 23, 59, 59, 999) - IST_OFFSET_MS;
+
+    const db = getDb();
+    const venueTableIds = getVenueTableIds(db, url.searchParams.get("venueId"));
+    const vf = tableIdFilter(venueTableIds);
+    const orders = db.query(
+      `SELECT id FROM order_record WHERE restaurant_id = ? AND status = 'SETTLED' AND paid_at >= ? AND paid_at <= ?${vf.clause}`
+    ).all(restaurantId, startTs, endTs, ...vf.params) as any[];
+
+    let totalCGST = 0, totalSGST = 0, totalTaxableValue = 0;
+    const byRateMap = new Map<number, { rate: number; taxableValue: number; cgst: number; sgst: number }>();
+
+    for (const order of orders) {
+      const settleRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
+      if (!settleRow?.value) continue;
+      try {
+        const pd = JSON.parse(settleRow.value);
+        const cgst = Number(pd.cgst || 0);
+        const sgst = Number(pd.sgst || 0);
+        const taxableValue = Number(pd.subTotal || pd.grandTotal || 0) - cgst - sgst;
+        totalCGST += cgst;
+        totalSGST += sgst;
+        totalTaxableValue += taxableValue;
+        // Derive GST rate from cgst+sgst if taxable > 0
+        const rate = taxableValue > 0 ? Math.round(((cgst + sgst) / taxableValue) * 100) : 0;
+        const entry = byRateMap.get(rate) || { rate, taxableValue: 0, cgst: 0, sgst: 0 };
+        entry.taxableValue += taxableValue;
+        entry.cgst += cgst;
+        entry.sgst += sgst;
+        byRateMap.set(rate, entry);
+      } catch {}
+    }
+
+    const byRate = Array.from(byRateMap.values())
+      .map(e => ({ rate: e.rate, taxableValue: round2(e.taxableValue), cgst: round2(e.cgst), sgst: round2(e.sgst) }))
+      .sort((a, b) => a.rate - b.rate);
+
+    return jsonResponse({
+      totalCGST: round2(totalCGST),
+      totalSGST: round2(totalSGST),
+      totalTaxableValue: round2(totalTaxableValue),
+      byRate,
+      transactions: orders.length,
+      dateRange: { startDate, endDate },
+    }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── GET /api/edge/reports/cancelled-items?startDate=&endDate= ───────────────
+  if (url.pathname === "/api/edge/reports/cancelled-items" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const startDate = url.searchParams.get("startDate") || getKolkataDateString();
+    const endDate = url.searchParams.get("endDate") || startDate;
+    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+    const [sy, sm, sd] = startDate.split("-").map(Number);
+    const [ey, em, ed] = endDate.split("-").map(Number);
+    const startTs = Date.UTC(sy, sm - 1, sd, 0, 0, 0, 0) - IST_OFFSET_MS;
+    const endTs = Date.UTC(ey, em - 1, ed, 23, 59, 59, 999) - IST_OFFSET_MS;
+
+    const db = getDb();
+    const venueTableIds = getVenueTableIds(db, url.searchParams.get("venueId"));
+    const vf = tableIdFilter(venueTableIds);
+    const orders = db.query(
+      `SELECT id FROM order_record WHERE restaurant_id = ? AND status = 'SETTLED' AND paid_at >= ? AND paid_at <= ?${vf.clause}`
+    ).all(restaurantId, startTs, endTs, ...vf.params) as any[];
+
+    const items: any[] = [];
+    const byItemMap = new Map<string, { name: string; count: number; amount: number }>();
+    let totalCancelled = 0;
+
+    for (const order of orders) {
+      const cancelledItems = db.query(
+        "SELECT name, price, cancelled_quantity, removed_by, removed_at FROM order_item WHERE order_id = ? AND cancelled_quantity > 0"
+      ).all(order.id) as any[];
+      for (const item of cancelledItems) {
+        const qty = Number(item.cancelled_quantity || 0);
+        const amount = Math.round(Number(item.price || 0) * qty * 100) / 100;
+        totalCancelled += qty;
+        items.push({
+          name: item.name,
+          quantity: qty,
+          price: Number(item.price || 0),
+          cancelledBy: item.removed_by,
+          cancelledAt: item.removed_at,
+        });
+        const key = (item.name || "").toLowerCase().trim();
+        const entry = byItemMap.get(key) || { name: item.name, count: 0, amount: 0 };
+        entry.count += qty;
+        entry.amount += amount;
+        byItemMap.set(key, entry);
+      }
+    }
+
+    const byItem = Array.from(byItemMap.values())
+      .map(e => ({ name: e.name, count: e.count, amount: round2(e.amount) }))
+      .sort((a, b) => b.count - a.count);
+
+    return jsonResponse({
+      totalCancelled,
+      items,
+      byItem,
+      dateRange: { startDate, endDate },
+    }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── GET /api/edge/reports/hourly-analysis?date=YYYY-MM-DD ───────────────────
+  if (url.pathname === "/api/edge/reports/hourly-analysis" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const date = url.searchParams.get("date") || getKolkataDateString();
+    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+    const [dy, dm, dd] = date.split("-").map(Number);
+    const startTs = Date.UTC(dy, dm - 1, dd, 0, 0, 0, 0) - IST_OFFSET_MS;
+    const endTs = Date.UTC(dy, dm - 1, dd, 23, 59, 59, 999) - IST_OFFSET_MS;
+
+    const db = getDb();
+    const venueTableIds = getVenueTableIds(db, url.searchParams.get("venueId"));
+    const vf = tableIdFilter(venueTableIds);
+    const orders = db.query(
+      `SELECT id, paid_at FROM order_record WHERE restaurant_id = ? AND status = 'SETTLED' AND paid_at >= ? AND paid_at <= ?${vf.clause}`
+    ).all(restaurantId, startTs, endTs, ...vf.params) as any[];
+
+    const byHourMap = new Map<number, { hour: number; revenue: number; transactions: number; items: number }>();
+    for (let h = 0; h < 24; h++) byHourMap.set(h, { hour: h, revenue: 0, transactions: 0, items: 0 });
+
+    for (const order of orders) {
+      const hour = new Date(Number(order.paid_at) + IST_OFFSET_MS).getHours();
+      const settleRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
+      let grand = 0;
+      if (settleRow?.value) {
+        try { grand = Number(JSON.parse(settleRow.value).grandTotal || 0); } catch {}
+      }
+      const itemCount = db.query("SELECT COUNT(*) AS cnt FROM order_item WHERE order_id = ? AND removed_from_bill = 0").get(order.id) as any;
+      const entry = byHourMap.get(hour)!;
+      entry.revenue += grand;
+      entry.transactions += 1;
+      entry.items += Number(itemCount?.cnt || 0);
+    }
+
+    const byHour = Array.from(byHourMap.values())
+      .map(e => ({ hour: e.hour, revenue: round2(e.revenue), transactions: e.transactions, items: e.items }));
+
+    const activeHours = byHour.filter(h => h.transactions > 0);
+    const peakHour = activeHours.length > 0 ? activeHours.reduce((max, h) => h.revenue > max.revenue ? h : max) : null;
+    const slowestHour = activeHours.length > 0 ? activeHours.reduce((min, h) => h.revenue < min.revenue ? h : min) : null;
+
+    return jsonResponse({ byHour, peakHour, slowestHour, date }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── GET /api/edge/reports/table-utilization?startDate=&endDate= ─────────────
+  if (url.pathname === "/api/edge/reports/table-utilization" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const startDate = url.searchParams.get("startDate") || getKolkataDateString();
+    const endDate = url.searchParams.get("endDate") || startDate;
+    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+    const [sy, sm, sd] = startDate.split("-").map(Number);
+    const [ey, em, ed] = endDate.split("-").map(Number);
+    const startTs = Date.UTC(sy, sm - 1, sd, 0, 0, 0, 0) - IST_OFFSET_MS;
+    const endTs = Date.UTC(ey, em - 1, ed, 23, 59, 59, 999) - IST_OFFSET_MS;
+
+    const db = getDb();
+    const venueId = url.searchParams.get("venueId");
+    const orders = db.query(
+      `SELECT o.id, o.table_id, t.number AS table_number, s.name AS section_name FROM order_record o LEFT JOIN "table" t ON o.table_id = t.id LEFT JOIN section s ON t.section_id = s.id WHERE o.restaurant_id = ? AND o.status = 'SETTLED' AND o.paid_at >= ? AND o.paid_at <= ?${venueId ? " AND s.venue_id = ?" : ""}`
+    ).all(restaurantId, startTs, endTs, ...(venueId ? [venueId] : [])) as any[];
+
+    const byTableMap = new Map<string, { tableNumber: number; sectionName: string; orderCount: number; revenue: number }>();
+    let totalOrders = 0, totalRevenue = 0;
+
+    for (const order of orders) {
+      const tid = order.table_id;
+      const settleRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
+      let grand = 0;
+      if (settleRow?.value) {
+        try { grand = Number(JSON.parse(settleRow.value).grandTotal || 0); } catch {}
+      }
+      totalOrders += 1;
+      totalRevenue += grand;
+      const entry = byTableMap.get(tid) || { tableNumber: order.table_number, sectionName: order.section_name || "—", orderCount: 0, revenue: 0 };
+      entry.orderCount += 1;
+      entry.revenue += grand;
+      byTableMap.set(tid, entry);
+    }
+
+    const byTable = Array.from(byTableMap.values())
+      .map(e => ({
+        tableNumber: e.tableNumber,
+        sectionName: e.sectionName,
+        orderCount: e.orderCount,
+        revenue: round2(e.revenue),
+        avgOrderValue: e.orderCount > 0 ? round2(e.revenue / e.orderCount) : 0,
+      }))
+      .sort((a, b) => b.revenue - a.revenue);
+
+    return jsonResponse({ byTable, totalOrders, totalRevenue: round2(totalRevenue), dateRange: { startDate, endDate } }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── GET /api/edge/reports/kot-count?startDate=&endDate= ─────────────────────
+  if (url.pathname === "/api/edge/reports/kot-count" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const startDate = url.searchParams.get("startDate") || getKolkataDateString();
+    const endDate = url.searchParams.get("endDate") || startDate;
+    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+    const [sy, sm, sd] = startDate.split("-").map(Number);
+    const [ey, em, ed] = endDate.split("-").map(Number);
+    const startTs = Date.UTC(sy, sm - 1, sd, 0, 0, 0, 0) - IST_OFFSET_MS;
+    const endTs = Date.UTC(ey, em - 1, ed, 23, 59, 59, 999) - IST_OFFSET_MS;
+
+    const db = getDb();
+    const venueTableIds = getVenueTableIds(db, url.searchParams.get("venueId"));
+    const vf = tableIdFilter(venueTableIds, "k.table_id");
+    // Single JOIN query replaces per-KOT N+1 queries: fetch all KOT rows with
+    // their items' menu_type in one pass, then group in memory.
+    const rows = db.query(
+      `SELECT k.id, k.created_at, mi.menu_type FROM kot k LEFT JOIN kot_item ki ON ki.kot_id = k.id LEFT JOIN menu_item mi ON ki.menu_item_id = mi.id WHERE k.restaurant_id = ? AND k.created_at >= ? AND k.created_at <= ?${vf.clause} ORDER BY k.id`
+    ).all(restaurantId, startTs, endTs, ...vf.params) as any[];
+
+    // Group rows by kot.id — each KOT may span multiple rows (one per item).
+    const kotMap = new Map<string, { createdAt: number; isLiquor: boolean }>();
+    for (const row of rows) {
+      const entry = kotMap.get(row.id) || { createdAt: Number(row.created_at), isLiquor: false };
+      const mt = String(row.menu_type || "FOOD").toUpperCase();
+      if (mt === "LIQUOR" || mt === "BAR") entry.isLiquor = true;
+      kotMap.set(row.id, entry);
+    }
+
+    const byTypeMap = new Map<string, { type: string; count: number }>();
+    const byDayMap = new Map<string, number>();
+    for (const [kotId, info] of kotMap) {
+      const type = info.isLiquor ? "LIQUOR" : "FOOD";
+      const typeEntry = byTypeMap.get(type) || { type, count: 0 };
+      typeEntry.count += 1;
+      byTypeMap.set(type, typeEntry);
+      const dayKey = new Date(info.createdAt + IST_OFFSET_MS).toISOString().slice(0, 10);
+      byDayMap.set(dayKey, (byDayMap.get(dayKey) || 0) + 1);
+    }
+
+    const byType = Array.from(byTypeMap.values()).map(e => ({ type: e.type, count: e.count }));
+    const byDay = Array.from(byDayMap.entries())
+      .map(([d, c]) => ({ date: d, count: c }))
+      .sort((a, b) => a.date.localeCompare(b.date));
+
+    return jsonResponse({ totalKots: kotMap.size, byType, byDay, dateRange: { startDate, endDate } }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── GET /api/edge/reports/venue-revenue?startDate=&endDate= ─────────────────
+  if (url.pathname === "/api/edge/reports/venue-revenue" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const startDate = url.searchParams.get("startDate") || getKolkataDateString();
+    const endDate = url.searchParams.get("endDate") || startDate;
+    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+    const [sy, sm, sd] = startDate.split("-").map(Number);
+    const [ey, em, ed] = endDate.split("-").map(Number);
+    const startTs = Date.UTC(sy, sm - 1, sd, 0, 0, 0, 0) - IST_OFFSET_MS;
+    const endTs = Date.UTC(ey, em - 1, ed, 23, 59, 59, 999) - IST_OFFSET_MS;
+
+    const db = getDb();
+    const venueIdFilter = url.searchParams.get("venueId");
+    const orders = db.query(
+      `SELECT o.id, t.section_id, s.venue_id FROM order_record o LEFT JOIN "table" t ON o.table_id = t.id LEFT JOIN section s ON t.section_id = s.id WHERE o.restaurant_id = ? AND o.status = 'SETTLED' AND o.paid_at >= ? AND o.paid_at <= ?${venueIdFilter ? " AND s.venue_id = ?" : ""}`
+    ).all(restaurantId, startTs, endTs, ...(venueIdFilter ? [venueIdFilter] : [])) as any[];
+
+    const byVenueMap = new Map<string, { venueName: string; revenue: number; transactions: number; items: number }>();
+    let totalRevenue = 0;
+
+    for (const order of orders) {
+      const venueId = order.venue_id;
+      let venueName = "Unassigned";
+      if (venueId) {
+        const venue = db.query("SELECT name FROM venue WHERE id = ?").get(venueId) as any;
+        venueName = venue?.name || "Unassigned";
+      }
+      const settleRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
+      let grand = 0;
+      if (settleRow?.value) {
+        try { grand = Number(JSON.parse(settleRow.value).grandTotal || 0); } catch {}
+      }
+      const itemCount = db.query("SELECT COUNT(*) AS cnt FROM order_item WHERE order_id = ? AND removed_from_bill = 0").get(order.id) as any;
+      totalRevenue += grand;
+      const key = venueId || "unassigned";
+      const entry = byVenueMap.get(key) || { venueName, revenue: 0, transactions: 0, items: 0 };
+      entry.revenue += grand;
+      entry.transactions += 1;
+      entry.items += Number(itemCount?.cnt || 0);
+      byVenueMap.set(key, entry);
+    }
+
+    const byVenue = Array.from(byVenueMap.values())
+      .map(e => ({ venueName: e.venueName, revenue: round2(e.revenue), transactions: e.transactions, items: e.items }))
+      .sort((a, b) => b.revenue - a.revenue);
+
+    return jsonResponse({ byVenue, totalRevenue: round2(totalRevenue), dateRange: { startDate, endDate } }, 200, { "Cache-Control": "no-store" });
   }
 
   // ── GET /api/edge/x-report?date=YYYY-MM-DD ──────────────────────────────────
@@ -1900,12 +2503,8 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     let body: any; try { body = JSON.parse(await req.text()); } catch { return errorResponse("Invalid JSON", 400); }
 
     const db = getDb();
-    const row = db.query("SELECT * FROM expenditure WHERE id = ?").get(body.expenditureId) as any;
-    if (!row) return errorResponse("Expenditure not found", 404);
-
-    const outlet = getOutletSettings();
-    const printerName = getBillPrinterName();
-    const escposData = buildExpenditure({
+    const row = db.query("SELECT * FROM expenditure WHERE id = ? AND restaurant_id = ?").get(body.expenditureId, restaurantId) as any;
+    const expenditure = row ? {
       expenditureNo: row.expenditure_no,
       expenditureDate: row.date,
       paidToType: row.paid_to_type || "",
@@ -1915,6 +2514,15 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       approvedByName: row.approver || null,
       createdByName: row.created_by || null,
       status: row.voided ? "VOIDED" : "ACTIVE",
+    } : body.expenditure;
+    if (!expenditure) return errorResponse("Expenditure not found", 404);
+
+    const outlet = getOutletSettings();
+    const printerName = getBillPrinterName();
+    const escposData = buildExpenditure({
+      ...expenditure,
+      expenditureNo: Number(expenditure.expenditureNo),
+      amount: Number(expenditure.amount),
       restaurant: { name: outlet?.name || "" },
     });
 
@@ -2328,8 +2936,8 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
 
     const db = getDb();
     const user = db.query(
-      "SELECT id, name, pin, role, is_active FROM users WHERE id = ? AND outlet_id = ?"
-    ).get(userId, getRestaurantId()) as { id: string; name: string; pin: string | null; role: string; is_active: number } | null;
+      "SELECT id, name, pin, role, is_active, permissions FROM users WHERE id = ? AND outlet_id = ?"
+    ).get(userId, getRestaurantId()) as { id: string; name: string; pin: string | null; role: string; is_active: number; permissions: string | null } | null;
 
     if (!user) {
       return errorResponse("Invalid credentials", 401);
@@ -2348,6 +2956,18 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       return errorResponse("Invalid credentials", 401);
     }
 
+    // Issue a user-bound staff token for cashier-specific authorization.
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    let permissions: Record<string, any> = {};
+    try { permissions = user.permissions ? JSON.parse(user.permissions) : {}; } catch { permissions = {}; }
+    const staffToken = issueStaffToken({
+      userId: user.id,
+      role: user.role,
+      outletId: restaurantId,
+      permissions,
+    });
+
     return jsonResponse({
       success: true,
       user: {
@@ -2355,9 +2975,11 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         name: user.name,
         role: user.role,
         restaurantId: getRestaurantId(),
+        permissions,
       },
       runtimeToken: getOrCreateRuntimeToken(),
       edgeApiKey: getEdgeApiKey(),
+      staffToken,
     });
   }
 
@@ -2398,6 +3020,22 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   if (url.pathname === "/api/edge/sync/alerts" && req.method === "GET") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const alerts = getSyncAlerts();
+    // Surface queue invariant violations alongside DB-level alerts so monitoring
+    // dashboards can detect impossible state combinations without grepping logs.
+    try {
+      const violations = checkQueueInvariants();
+      for (const v of violations) {
+        alerts.push({
+          type: `queue_inconsistency:${v.type}`,
+          severity: v.severity,
+          message: v.message,
+          since: Date.now(),
+          count: v.count,
+        });
+      }
+    } catch {
+      // Non-fatal — invariant check should never break the alerts endpoint
+    }
     return jsonResponse({ alerts, count: alerts.length });
   }
 
@@ -2405,6 +3043,21 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   if (url.pathname === "/api/edge/sync/push" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const result = await manualSyncPush();
+    return jsonResponse(result);
+  }
+
+  // ── POST /api/edge/sync/backfill — re-enqueue stuck/missing transactions ───
+  // Body: { dryRun?: boolean, days?: number|null, noCloudCheck?: boolean }
+  // Returns a recovery report as JSON. Runs inside the edge server process,
+  // so no DB lock concerns — same connection as the sync worker.
+  if (url.pathname === "/api/edge/sync/backfill" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const body = await req.json().catch(() => ({}));
+    const result = await runBackfill({
+      dryRun: body.dryRun === true,
+      days: typeof body.days === "number" ? body.days : null,
+      noCloudCheck: body.noCloudCheck === true,
+    });
     return jsonResponse(result);
   }
 
@@ -2519,7 +3172,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
             `SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'transaction' ORDER BY audited_at DESC LIMIT 1`
           ).get(pendingRow.id) as any;
 
-          if (auditRow && ["rejected", "conflict"].includes(auditRow.outcome)) {
+          if (auditRow && ["rejected", "conflict", "permanent"].includes(auditRow.outcome)) {
             if (!dryRun) {
               enqueueSync("transaction", localTxnId, "insert");
             }
@@ -2578,7 +3231,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
           const auditRow = db.query(
             `SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'walkin_transaction' ORDER BY audited_at DESC LIMIT 1`
           ).get(pendingRow.id) as any;
-          if (auditRow && ["rejected", "conflict"].includes(auditRow.outcome)) {
+          if (auditRow && ["rejected", "conflict", "permanent"].includes(auditRow.outcome)) {
             if (!dryRun) {
               enqueueSync("walkin_transaction", localId, "insert");
             }
@@ -2706,7 +3359,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   // returns the download URL if an update exists. The Host handles the
   // download, binary swap, and restart.
   if (url.pathname === "/api/edge/update-check" && req.method === "GET") {
-    const currentVersion = "23.12.1";
+    const currentVersion = "23.14.0";
     const backendUrl = getBackendUrl();
     const sessionToken = getSessionToken();
 
@@ -3097,6 +3750,57 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     let body: any;
     try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
 
+    // ── Authorization: require user-bound staff token ─────────────────────────
+    const staffPayload = validateStaffToken(req.headers.get("X-Staff-Token"));
+    if (!staffPayload) {
+      return errorResponse("Staff token required for menu updates", 401);
+    }
+    // Outlet binding: token outlet must match the active edge restaurant.
+    if (staffPayload.outletId !== getRestaurantId()) {
+      return errorResponse("Staff token is not valid for this outlet", 403);
+    }
+    const role = (staffPayload.role || "").toUpperCase();
+    const isCashier = role === "CASHIER";
+
+    // Cashier restrictions: cannot set image, soft-delete, or category printer target.
+    if (isCashier) {
+      if (body.imageUrl !== undefined) return errorResponse("Cashier cannot set an image URL", 400);
+      if (body.isDeleted !== undefined) return errorResponse("Cashier cannot delete items", 403);
+      if (body.categoryPrinterTarget !== undefined && body.categoryPrinterTarget !== null) {
+        return errorResponse("Cashier cannot set category printer target", 403);
+      }
+      if (body.category !== undefined) {
+        return errorResponse("Cashier cannot change item category", 403);
+      }
+      // Determine whether this update touches regular fields, special fields, or both.
+      const hasRegularFields =
+        body.name !== undefined ||
+        body.basePrice !== undefined ||
+        body.price !== undefined ||
+        body.isVeg !== undefined ||
+        body.isAvailable !== undefined ||
+        body.menuType !== undefined ||
+        body.unit !== undefined ||
+        body.printerTarget !== undefined ||
+        body.printerName !== undefined ||
+        body.gstEnabled !== undefined ||
+        body.description !== undefined;
+      const hasSpecialFields =
+        body.isSpecial !== undefined ||
+        body.specialChannel !== undefined ||
+        body.specialActive !== undefined ||
+        body.specialExpiresAt !== undefined;
+      if (hasRegularFields && !staffHasPermission(staffPayload, "menuEdit")) {
+        return errorResponse("Cashier does not have permission to edit menu items", 403);
+      }
+      if (hasSpecialFields && !staffHasPermission(staffPayload, "menuSpecials")) {
+        return errorResponse("Cashier does not have permission to manage Today Specials", 403);
+      }
+      if (!hasRegularFields && !hasSpecialFields) {
+        return errorResponse("No updatable fields provided", 400);
+      }
+    }
+
     const db = getDb();
     const restaurantId = getRestaurantId();
     const updates: string[] = [];
@@ -3104,10 +3808,13 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
 
     if (body.name !== undefined) { updates.push("name = ?"); values.push(body.name); }
     if (body.basePrice !== undefined) { updates.push("base_price = ?"); values.push(Number(body.basePrice)); }
+    if (body.price !== undefined) { updates.push("base_price = ?"); values.push(Number(body.price)); }
     if (body.isVeg !== undefined) { updates.push("is_veg = ?"); values.push(body.isVeg ? 1 : 0); }
     if (body.isAvailable !== undefined) { updates.push("is_available = ?"); values.push(body.isAvailable ? 1 : 0); }
     if (body.menuType !== undefined) { updates.push("menu_type = ?"); values.push(body.menuType); }
-    if (body.printerTarget !== undefined) { updates.push("printer_target = ?"); values.push(body.printerTarget); }
+    if (body.unit !== undefined) { updates.push("unit = ?"); values.push(body.unit ? String(body.unit).slice(0, 20) : null); }
+    if (body.printerTarget !== undefined) { updates.push("printer_target = ?"); values.push(body.printerTarget || null); }
+    if (body.printerName !== undefined) { updates.push("printer_name = ?"); values.push(body.printerName || null); }
     if (body.isDeleted !== undefined) { updates.push("is_deleted = ?"); values.push(body.isDeleted ? 1 : 0); }
     if (body.description !== undefined) { updates.push("description = ?"); values.push(body.description); }
     // Persist GST flag; liquor/bar always forced off
@@ -3117,14 +3824,63 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     } else if (body.gstEnabled !== undefined) {
       updates.push("gst_enabled = ?"); values.push(body.gstEnabled ? 1 : 0);
     }
+    // Special fields (Today's Specials management)
+    if (body.isSpecial !== undefined) { updates.push("is_special = ?"); values.push(body.isSpecial ? 1 : 0); }
+    if (body.specialChannel !== undefined) {
+      const channel = String(body.specialChannel || "").toUpperCase();
+      updates.push("special_channel = ?"); values.push(["CASHIER", "CAPTAIN", "BOTH"].includes(channel) ? channel : "BOTH");
+    }
+    if (body.specialActive !== undefined) { updates.push("special_active = ?"); values.push(body.specialActive ? 1 : 0); }
+    if (body.specialExpiresAt !== undefined) {
+      updates.push("special_expires_at = ?"); values.push(body.specialExpiresAt ? new Date(body.specialExpiresAt).getTime() : null);
+    }
 
     if (updates.length === 0) return errorResponse("No fields to update", 400);
 
-    values.push(itemId);
-    db.query(`UPDATE menu_item SET ${updates.join(", ")} WHERE id = ? AND restaurant_id = ?`).run(...values, restaurantId);
-    enqueueSync("menu_item", itemId, "update");
+    try {
+      values.push(itemId);
+      db.query(`UPDATE menu_item SET ${updates.join(", ")} WHERE id = ? AND restaurant_id = ?`).run(...values, restaurantId);
+      enqueueSync("menu_item", itemId, "update");
+    } catch (err: any) {
+      console.error("[Edge] Menu item update failed:", err);
+      return errorResponse(err?.message || "Failed to update menu item", 500);
+    }
 
-    return jsonResponse({ success: true, id: itemId });
+    // Return POS-compatible response (same shape as POST)
+    const item = db.query("SELECT * FROM menu_item WHERE id = ?").get(itemId) as any;
+    const variants = db.query("SELECT * FROM menu_item_variant WHERE menu_item_id = ?").all(itemId) as any[];
+    return jsonResponse({
+      success: true,
+      id: itemId,
+      item: {
+        id: item.id,
+        name: item.name,
+        isVeg: !!item.is_veg,
+        isAvailable: !!item.is_available,
+        categoryId: item.category_id,
+        restaurantId: item.restaurant_id,
+        basePrice: item.base_price,
+        unit: item.unit,
+        menuType: item.menu_type,
+        gstEnabled: !!item.gst_enabled,
+        printerTarget: item.printer_target,
+        printerName: item.printer_name,
+        isDeleted: !!item.is_deleted,
+        isSpecial: !!item.is_special,
+        specialChannel: item.special_channel,
+        specialActive: !!item.special_active,
+        specialExpiresAt: item.special_expires_at,
+        variants: variants.map(v => ({
+          id: v.id,
+          name: v.name,
+          price: v.price,
+          isDefault: !!v.is_default,
+          menuItemId: v.menu_item_id,
+          isAvailable: !!v.is_available,
+          restaurantId: v.restaurant_id,
+        })),
+      },
+    });
   }
 
   // ── POST /api/edge/admin/menu-item — create menu item ───────────────────────
@@ -3133,22 +3889,254 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     let body: any;
     try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
 
+    // ── Authorization: require user-bound staff token for cashier writes ──────
+    const staffPayload = validateStaffToken(req.headers.get("X-Staff-Token"));
+    if (!staffPayload) {
+      return errorResponse("Staff token required for menu creation", 401);
+    }
+    // Outlet binding: token outlet must match the active edge restaurant.
+    if (staffPayload.outletId !== getRestaurantId()) {
+      return errorResponse("Staff token is not valid for this outlet", 403);
+    }
+    // Cashier role requires the menuAdd permission.
+    const role = (staffPayload.role || "").toUpperCase();
+    if (role === "CASHIER" && !staffHasPermission(staffPayload, "menuAdd")) {
+      return errorResponse("Cashier does not have permission to add menu items", 403);
+    }
+
+    // ── Payload validation ────────────────────────────────────────────────────
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!name || name.length > 200) {
+      return errorResponse("name must be 1-200 characters", 400);
+    }
+    const price = Number(body.basePrice ?? body.price);
+    if (!isFinite(price) || price <= 0) {
+      return errorResponse("basePrice must be a positive finite number", 400);
+    }
+    const menuType = String(body.menuType || "FOOD").toUpperCase();
+    if (!["FOOD", "LIQUOR", "BAR"].includes(menuType)) {
+      return errorResponse("menuType must be FOOD, LIQUOR, or BAR", 400);
+    }
+    const unit = body.unit ? String(body.unit).slice(0, 20) : null;
+    const printerTarget = body.printerTarget ? String(body.printerTarget) : null;
+    const printerName = body.printerName ? String(body.printerName) : null;
+    const isVeg = menuType === "LIQUOR" || menuType === "BAR" ? false : (body.isVeg !== false);
+    const gstEnabled = (menuType === "LIQUOR" || menuType === "BAR") ? false : (body.gstEnabled !== false);
+    const categoryRef = typeof body.category === "string" ? body.category.trim() : (typeof body.categoryId === "string" ? body.categoryId.trim() : "");
+    if (!categoryRef) {
+      return errorResponse("category is required", 400);
+    }
+    // Cashier cannot set image URL or manage specials.
+    if (role === "CASHIER") {
+      if (body.imageUrl) return errorResponse("Cashier cannot set an image URL", 400);
+      if (body.isSpecial || body.specialChannel || body.specialActive || body.specialExpiresAt) {
+        return errorResponse("Cashier cannot manage Today Specials", 400);
+      }
+    }
+
+    // ── Idempotency: return existing item if this request was already applied ──
+    const idempotencyKey = typeof body.idempotencyKey === "string" && body.idempotencyKey.trim()
+      ? body.idempotencyKey.trim()
+      : null;
+
     const db = getDb();
     const restaurantId = getRestaurantId();
-    const itemId = crypto.randomUUID();
 
-    const createMenuType = body.menuType || "FOOD";
-    const createGst = (createMenuType === "LIQUOR" || createMenuType === "BAR")
-      ? 0
-      : (body.gstEnabled === false ? 0 : 1);
-    db.query(`INSERT INTO menu_item (id, name, description, is_veg, is_available, sort_order, category_id, restaurant_id,
-              base_price, unit, menu_type, gst_enabled, is_deleted)
-              VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, 0)`)
-      .run(itemId, body.name, body.description || null, body.isVeg ? 1 : 0,
-           body.categoryId, restaurantId, Number(body.basePrice || 0), body.unit || null, createMenuType, createGst);
-    enqueueSync("menu_item", itemId, "create");
+    if (idempotencyKey) {
+      const existing = db.query("SELECT id FROM menu_item WHERE id = ?").get(idempotencyKey) as { id: string } | null;
+      if (existing) {
+        const item = db.query("SELECT * FROM menu_item WHERE id = ?").get(existing.id) as any;
+        const variants = db.query("SELECT * FROM menu_item_variant WHERE menu_item_id = ?").all(existing.id) as any[];
+        return jsonResponse({ success: true, id: existing.id, item: { ...item, variants }, idempotent: true });
+      }
+    }
 
-    return jsonResponse({ success: true, id: itemId });
+    // ── Resolve existing category (no auto-create) ───────────────────────────
+    const category = db.query(
+      "SELECT id FROM category WHERE restaurant_id = ? AND (id = ? OR name = ? COLLATE NOCASE) LIMIT 1"
+    ).get(restaurantId, categoryRef, categoryRef) as { id: string } | null;
+    if (!category) {
+      return errorResponse("Category does not exist. Use an existing category.", 400);
+    }
+
+    // ── Transactional local write ─────────────────────────────────────────────
+    const itemId = idempotencyKey || crypto.randomUUID();
+    const variantId = crypto.randomUUID();
+    const venuePrices = (body.venuePrices && typeof body.venuePrices === "object") ? body.venuePrices : null;
+
+    try {
+      const tx = db.transaction(() => {
+        // 1. Insert menu item
+        db.query(
+          `INSERT INTO menu_item (id, name, description, is_veg, is_available, sort_order, category_id, restaurant_id,
+            base_price, unit, menu_type, gst_enabled, is_deleted, printer_target, printer_name, is_special, special_channel, special_active)
+           VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0, 'BOTH', 0)`
+        ).run(
+          itemId, name, body.description || null, isVeg ? 1 : 0,
+          category.id, restaurantId, price, unit, menuType, gstEnabled ? 1 : 0,
+          printerTarget, printerName
+        );
+        enqueueSync("menu_item", itemId, "create");
+
+        // 2. Insert default Regular variant
+        db.query(
+          `INSERT INTO menu_item_variant (id, name, price, is_default, menu_item_id, is_available, restaurant_id)
+           VALUES (?, 'Regular', ?, 1, ?, 1, ?)`
+        ).run(variantId, price, itemId, restaurantId);
+        enqueueSync("menu_item_variant", variantId, "create");
+
+        // 3. Insert venue prices
+        if (venuePrices) {
+          for (const [venueId, vp] of Object.entries(venuePrices)) {
+            const vpPrice = Number(vp);
+            if (!isFinite(vpPrice) || vpPrice < 0) continue;
+            const vpId = crypto.randomUUID();
+            db.query(
+              `INSERT INTO venue_price (id, venue_id, menu_item_id, price, is_active, restaurant_id)
+               VALUES (?, ?, ?, ?, 1, ?)`
+            ).run(vpId, venueId, itemId, vpPrice, restaurantId);
+            enqueueSync("venue_price", vpId, "create");
+          }
+        }
+      });
+      tx();
+    } catch (err: any) {
+      console.error("[Edge] Menu item creation failed:", err);
+      return errorResponse(err?.message || "Failed to create menu item", 500);
+    }
+
+    // ── Return POS-compatible response ─────────────────────────────────────────
+    const item = db.query("SELECT * FROM menu_item WHERE id = ?").get(itemId) as any;
+    const variants = db.query("SELECT * FROM menu_item_variant WHERE menu_item_id = ?").all(itemId) as any[];
+    return jsonResponse({
+      success: true,
+      id: itemId,
+      item: {
+        id: item.id,
+        name: item.name,
+        isVeg: !!item.is_veg,
+        isAvailable: !!item.is_available,
+        categoryId: item.category_id,
+        restaurantId: item.restaurant_id,
+        basePrice: item.base_price,
+        unit: item.unit,
+        menuType: item.menu_type,
+        gstEnabled: !!item.gst_enabled,
+        printerTarget: item.printer_target,
+        printerName: item.printer_name,
+        isDeleted: !!item.is_deleted,
+        variants: variants.map(v => ({
+          id: v.id,
+          name: v.name,
+          price: v.price,
+          isDefault: !!v.is_default,
+          menuItemId: v.menu_item_id,
+          isAvailable: !!v.is_available,
+          restaurantId: v.restaurant_id,
+        })),
+      },
+    });
+  }
+
+  // ── POST /api/edge/admin/bulk-specials — bulk upsert today specials ─────────
+  if (url.pathname === "/api/edge/admin/bulk-specials" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    let body: any;
+    try { body = await req.json(); } catch { return errorResponse("Invalid JSON", 400); }
+
+    // Authorization: require staff token; CASHIER requires menuSpecials permission.
+    const staffPayload = validateStaffToken(req.headers.get("X-Staff-Token"));
+    if (!staffPayload) {
+      return errorResponse("Staff token required for specials management", 401);
+    }
+    if (staffPayload.outletId !== getRestaurantId()) {
+      return errorResponse("Staff token is not valid for this outlet", 403);
+    }
+    const role = (staffPayload.role || "").toUpperCase();
+    if (role === "CASHIER" && !staffHasPermission(staffPayload, "menuSpecials")) {
+      return errorResponse("Cashier does not have permission to manage Today Specials", 403);
+    }
+
+    const items = Array.isArray(body.items) ? body.items : [];
+    if (items.length === 0) return errorResponse("items array is required", 400);
+    if (items.length > 50) return errorResponse("Cannot import more than 50 specials at once", 400);
+
+    // Validate every item strictly
+    for (const item of items) {
+      const name = typeof item.name === "string" ? item.name.trim() : "";
+      const price = Number(item.price ?? item.basePrice);
+      if (!name || !isFinite(price) || price <= 0) {
+        return errorResponse(`Invalid special: name and a positive price are required ('${item.name || '<missing>'}')`, 400);
+      }
+      if (String(item.menuType || "").toUpperCase() === "LIQUOR") {
+        return errorResponse("LIQUOR items cannot be set as Today Specials", 400);
+      }
+    }
+
+    const db = getDb();
+    const restaurantId = getRestaurantId();
+    let count = 0;
+
+    try {
+      const tx = db.transaction(() => {
+        for (const item of items) {
+          const name = String(item.name).trim();
+          const channel = String(item.specialChannel || "BOTH").toUpperCase();
+          const safeChannel = ["CASHIER", "CAPTAIN", "BOTH"].includes(channel) ? channel : "BOTH";
+          const menuType = String(item.menuType || "FOOD").toUpperCase();
+          const isVeg = menuType === "LIQUOR" || menuType === "BAR" ? false : (item.isVeg !== false);
+          const price = Number(item.price ?? item.basePrice);
+
+          // Find existing menu_item by name (case-insensitive) in the active outlet.
+          const existing = db.query(
+            "SELECT id FROM menu_item WHERE restaurant_id = ? AND name = ? COLLATE NOCASE AND is_deleted = 0 LIMIT 1"
+          ).get(restaurantId, name) as { id: string } | null;
+
+          if (existing) {
+            db.query(
+              `UPDATE menu_item SET is_special = 1, special_active = 1, special_channel = ? WHERE id = ? AND restaurant_id = ?`
+            ).run(safeChannel, existing.id, restaurantId);
+            enqueueSync("menu_item", existing.id, "update");
+            count++;
+            continue;
+          }
+
+          // Not found — create new item as a special.
+          const categoryRef = typeof item.category === "string" ? item.category.trim() : "";
+          if (!categoryRef) {
+            throw new Error(`Category is required for new special '${name}'`);
+          }
+          const category = db.query(
+            "SELECT id FROM category WHERE restaurant_id = ? AND (id = ? OR name = ? COLLATE NOCASE) LIMIT 1"
+          ).get(restaurantId, categoryRef, categoryRef) as { id: string } | null;
+          if (!category) {
+            throw new Error(`Category '${categoryRef}' does not exist for new special '${name}'`);
+          }
+
+          const itemId = crypto.randomUUID();
+          const variantId = crypto.randomUUID();
+          db.query(
+            `INSERT INTO menu_item (id, name, description, is_veg, is_available, sort_order, category_id, restaurant_id,
+              base_price, unit, menu_type, gst_enabled, is_deleted, printer_target, printer_name, is_special, special_channel, special_active)
+             VALUES (?, ?, NULL, ?, 1, 0, ?, ?, ?, NULL, ?, ?, 0, NULL, NULL, 1, ?, 1)`
+          ).run(itemId, name, isVeg ? 1 : 0, category.id, restaurantId, price, menuType, menuType === "LIQUOR" || menuType === "BAR" ? 0 : 1, safeChannel);
+          enqueueSync("menu_item", itemId, "create");
+
+          db.query(
+            `INSERT INTO menu_item_variant (id, name, price, is_default, menu_item_id, is_available, restaurant_id)
+             VALUES (?, 'Regular', ?, 1, ?, 1, ?)`
+          ).run(variantId, price, itemId, restaurantId);
+          enqueueSync("menu_item_variant", variantId, "create");
+          count++;
+        }
+      });
+      tx();
+    } catch (err: any) {
+      console.error("[Edge] Bulk specials failed:", err);
+      return errorResponse(err?.message || "Failed to import specials", 500);
+    }
+
+    return jsonResponse({ success: true, count });
   }
 
   // ── DELETE /api/edge/admin/menu-item/:id — soft delete menu item ─────────────

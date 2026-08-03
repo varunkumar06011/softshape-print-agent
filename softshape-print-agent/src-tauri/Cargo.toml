@@ -1,6 +1,6 @@
 [package]
 name = "softshape-print-agent"
-version = "23.12.1"
+version = "23.14.0"
 description = "Windows Print Agent for SoftShape"
 authors = ["SoftShape"]
 license = "MIT"

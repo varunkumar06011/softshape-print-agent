@@ -37,7 +37,7 @@ import { startSocketSync, stopSocketSync, getSocketStatus, isInFallbackMode } fr
 import { startHeartbeat, stopHeartbeat } from "./socketSync.ts";
 import { startHeartbeatLoop, stopHeartbeatLoop, releaseInstanceLock, acquireInstanceLock } from "./instanceLock.ts";
 import { startPrintService, stopPrintService } from "./printServiceManager.ts";
-import { runDailyMaintenance, runPeriodicBackup } from "./backup.ts";
+import { runDailyMaintenance, runPeriodicBackup, forceBackupNow } from "./backup.ts";
 import { getRecoveryStatus } from "./db.ts";
 
 // ── Singleton ────────────────────────────────────────────────────────────────
@@ -569,6 +569,16 @@ class RuntimeManager {
 
     this.setConnectionState("OFFLINE", "shutdown");
     this.setRuntimeState("STOPPED", "shutdown complete");
+
+    // ── Final backup before DB close ──────────────────────────────────────────
+    // All services are stopped so no writes are in flight. Guarantees a fresh
+    // snapshot exists right before the process exits — important when the
+    // Runtime Host is about to swap the binary for an auto-update.
+    try {
+      forceBackupNow(getDb(), "pre-shutdown");
+    } catch (err) {
+      runtimeLog.warn("Pre-shutdown backup failed (non-fatal)", { error: err });
+    }
 
     runtimeLog.info("RuntimeManager shutdown complete", {
       elapsedMs: this._startupBeganAt ? Date.now() - this._startupBeganAt : 0,

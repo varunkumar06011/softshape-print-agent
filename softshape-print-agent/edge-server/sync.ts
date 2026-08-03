@@ -67,20 +67,46 @@ interface SyncPayloadItem {
 
 function collectBatch(): SyncQueueRow[] {
   const db = getDb();
-  // Simple FIFO — oldest first. Exhausted rows remain eligible for retry and
-  // are moved behind fresh rows so a transient outage can never permanently
-  // strand a valid record. The DEAD_LETTER prefix is an observability marker,
-  // not a terminal state; reconciliation also resets it periodically.
+  // Two-tier priority: healthy records first (priority 1), exhausted/dead-lettered
+  // records last (priority 2). The dependency filter below guarantees orders sync
+  // before their dependent transactions, so transactions no longer need a special
+  // priority tier — they're filtered out until their order is synced.
+  //
+  // Dependency filter (dual-signal gate): a transaction is blocked ONLY if BOTH
+  //   (a) its order still has a pending queue row (any state), AND
+  //   (b) order_record.cloud_synced = 0.
+  // If either signal says "synced" (queue row deleted OR cloud_synced = 1), the
+  // transaction is eligible. Using both prevents infinite waiting if a crash
+  // leaves one signal in a stale state. Walk-in transactions (order_id IS NULL)
+  // are always eligible.
   return db.query(`
     SELECT * FROM sync_queue
     WHERE synced = 0
+      AND state = 'pending'
+      AND NOT (
+        table_name IN ('transaction', 'walkin_transaction')
+        AND EXISTS (
+          SELECT 1 FROM transaction_record tr
+          WHERE tr.id = sync_queue.record_id
+            AND tr.order_id IS NOT NULL
+            AND EXISTS (
+              SELECT 1 FROM sync_queue sq2
+              WHERE sq2.table_name = 'order'
+                AND sq2.record_id = tr.order_id
+                AND sq2.synced = 0
+                AND sq2.state IN ('pending', 'in_flight', 'waiting_dependency', 'dead_letter')
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM order_record o
+              WHERE o.id = tr.order_id
+                AND o.cloud_synced = 1
+            )
+        )
+      )
     ORDER BY
-      -- Payment records are business-critical and must not wait behind
-      -- repeatedly duplicated KOT/config rows.
       CASE
-        WHEN table_name IN ('transaction', 'walkin_transaction') THEN 0
-        WHEN attempts >= ? THEN 1
-        ELSE 2
+        WHEN attempts >= ? THEN 2
+        ELSE 1
       END,
       created_at ASC, id ASC
     LIMIT ?
@@ -290,6 +316,19 @@ function loadRecordData(tableName: string, recordId: string): any | null {
       };
     }
 
+    case "venue_price": {
+      const vp = db.query("SELECT * FROM venue_price WHERE id = ?").get(recordId) as any;
+      if (!vp) return null;
+      return {
+        id: vp.id,
+        venueId: vp.venue_id,
+        menuItemId: vp.menu_item_id,
+        price: vp.price,
+        isActive: !!vp.is_active,
+        restaurantId: vp.restaurant_id,
+      };
+    }
+
     case "users": {
       const u = db.query("SELECT * FROM users WHERE id = ?").get(recordId) as any;
       if (!u) return null;
@@ -389,49 +428,76 @@ function markSynced(queueIds: number[]): void {
   const db = getDb();
   const placeholders = queueIds.map(() => "?").join(",");
 
-  // Before deleting, set cloud_synced = 1 on the source records so
-  // getOrderSyncStatus can confirm sync even after queue rows are cleaned up.
-  const rows = db.query(`SELECT id, table_name, record_id FROM sync_queue WHERE id IN (${placeholders})`).all(...queueIds) as any[];
-  for (const row of rows) {
-    // A newer local update may have created another pending row while this
-    // request was in flight. Keep the source marked unsynced until that newer
-    // row is acknowledged too.
-    const newerPending = db.query(
-      "SELECT 1 FROM sync_queue WHERE table_name = ? AND record_id = ? AND synced = 0 AND id != ? LIMIT 1",
-    ).get(row.table_name, row.record_id, row.id);
-    if (newerPending) continue;
+  // Atomic transaction: cloud_synced update + dependent flip + queue row deletion
+  // all commit together. If the process crashes mid-way, SQLite WAL rolls back
+  // and neither persists — no dual source of truth. See Design Contract 2.
+  db.transaction(() => {
+    // Before deleting, set cloud_synced = 1 on the source records so
+    // getOrderSyncStatus can confirm sync even after queue rows are cleaned up.
+    const rows = db.query(`SELECT id, table_name, record_id FROM sync_queue WHERE id IN (${placeholders})`).all(...queueIds) as any[];
+    for (const row of rows) {
+      // A newer local update may have created another pending row while this
+      // request was in flight. Keep the source marked unsynced until that newer
+      // row is acknowledged too.
+      const newerPending = db.query(
+        "SELECT 1 FROM sync_queue WHERE table_name = ? AND record_id = ? AND synced = 0 AND id != ? LIMIT 1",
+      ).get(row.table_name, row.record_id, row.id);
+      if (newerPending) continue;
 
-    if (row.table_name === "order") {
-      db.query("UPDATE order_record SET cloud_synced = 1 WHERE id = ?").run(row.record_id);
-    } else if (row.table_name === "order_item") {
-      db.query("UPDATE order_item SET cloud_synced = 1 WHERE id = ?").run(row.record_id);
-    } else if (row.table_name === "kot") {
-      db.query("UPDATE kot SET cloud_synced = 1 WHERE id = ?").run(row.record_id);
-    } else if (row.table_name === "kot_item") {
-      db.query("UPDATE kot_item SET cloud_synced = 1 WHERE id = ?").run(row.record_id);
-    } else if (row.table_name === "transaction" || row.table_name === "walkin_transaction") {
-      // Mark the durable transaction_record as synced so the reconciliation
-      // worker knows it reached the cloud and doesn't re-enqueue it.
-      markTransactionRecordSynced(row.record_id);
-    } else if (row.table_name === "expenditure") {
-      db.query("UPDATE expenditure SET cloud_synced = 1 WHERE id = ?").run(row.record_id);
-    } else if (row.table_name === "employee") {
-      db.query("UPDATE employee SET cloud_synced = 1, synced_at = ? WHERE id = ?").run(Date.now(), row.record_id);
-    } else if (row.table_name === "ledger_category") {
-      db.query("UPDATE ledger_category SET cloud_synced = 1, synced_at = ? WHERE id = ?").run(Date.now(), row.record_id);
+      if (row.table_name === "order") {
+        db.query("UPDATE order_record SET cloud_synced = 1 WHERE id = ?").run(row.record_id);
+
+        // ── Flip waiting_dependency transactions back to pending ──────────
+        // Now that the order is confirmed synced, any transactions waiting on
+        // it can be scheduled. This is the "waiting_dependency resolved" event.
+        // Inside the same transaction as the DELETE below, so the flip and the
+        // queue row removal commit atomically.
+        const unblocked = db.query(
+          `UPDATE sync_queue
+           SET state = 'pending', last_error = NULL
+           WHERE state = 'waiting_dependency'
+             AND table_name IN ('transaction', 'walkin_transaction')
+             AND EXISTS (
+               SELECT 1 FROM transaction_record tr
+               WHERE tr.id = sync_queue.record_id
+                 AND tr.order_id = ?
+             )`
+        ).run(row.record_id);
+        if (unblocked.changes && unblocked.changes > 0) {
+          console.log(`[Sync] waiting_dependency resolved: ${unblocked.changes} transaction(s) unblocked by order ${row.record_id} sync`);
+        }
+      } else if (row.table_name === "order_item") {
+        db.query("UPDATE order_item SET cloud_synced = 1 WHERE id = ?").run(row.record_id);
+      } else if (row.table_name === "kot") {
+        db.query("UPDATE kot SET cloud_synced = 1 WHERE id = ?").run(row.record_id);
+      } else if (row.table_name === "kot_item") {
+        db.query("UPDATE kot_item SET cloud_synced = 1 WHERE id = ?").run(row.record_id);
+      } else if (row.table_name === "transaction" || row.table_name === "walkin_transaction") {
+        // Mark the durable transaction_record as synced so the reconciliation
+        // worker knows it reached the cloud and doesn't re-enqueue it.
+        markTransactionRecordSynced(row.record_id);
+      } else if (row.table_name === "expenditure") {
+        db.query("UPDATE expenditure SET cloud_synced = 1 WHERE id = ?").run(row.record_id);
+      } else if (row.table_name === "employee") {
+        db.query("UPDATE employee SET cloud_synced = 1, synced_at = ? WHERE id = ?").run(Date.now(), row.record_id);
+      } else if (row.table_name === "ledger_category") {
+        db.query("UPDATE ledger_category SET cloud_synced = 1, synced_at = ? WHERE id = ?").run(Date.now(), row.record_id);
+      }
     }
-  }
 
-  // Delete instead of marking synced=1 — keeps the table small so
-  // collectBatch() stays fast and INSERTs don't slow down over a shift.
-  db.query(`DELETE FROM sync_queue WHERE id IN (${placeholders})`).run(...queueIds);
+    // Delete instead of marking synced=1 — keeps the table small so
+    // collectBatch() stays fast and INSERTs don't slow down over a shift.
+    db.query(`DELETE FROM sync_queue WHERE id IN (${placeholders})`).run(...queueIds);
+  })();
 }
 
 function incrementAttempts(queueIds: number[], error: string): void {
   if (queueIds.length === 0) return;
   const db = getDb();
   const placeholders = queueIds.map(() => "?").join(",");
-  db.query(`UPDATE sync_queue SET attempts = attempts + 1, last_error = ? WHERE id IN (${placeholders})`)
+  // Reset state to 'pending' (from 'in_flight') so collectBatch picks it up again.
+  // attempts++ is the retry signal; state='pending' is the eligibility signal.
+  db.query(`UPDATE sync_queue SET attempts = attempts + 1, last_error = ?, state = 'pending' WHERE id IN (${placeholders})`)
     .run(error, ...queueIds);
 }
 
@@ -442,7 +508,7 @@ function claimBatch(queueIds: number[]): void {
   // Mark rows while the request is in flight. enqueueSync() preserves these
   // rows and inserts a second row for a newer local update, preventing an old
   // acknowledgment from deleting the newer update's retry entry.
-  db.query(`UPDATE sync_queue SET last_error = 'IN_FLIGHT' WHERE id IN (${placeholders}) AND synced = 0`)
+  db.query(`UPDATE sync_queue SET state = 'in_flight', last_error = 'IN_FLIGHT' WHERE id IN (${placeholders}) AND synced = 0`)
     .run(...queueIds);
 }
 
@@ -450,18 +516,29 @@ function claimBatch(queueIds: number[]): void {
 
 function deadLetterExhausted(): void {
   const db = getDb();
-  // Keep a clear reason when a process died after claiming a row. IN_FLIGHT is
-  // only a crash-recovery marker, never a useful permanent error message.
+  // Set state = 'dead_letter' so collectBatch() (which filters state = 'pending')
+  // skips these. Keep last_error as the reason (without the DEAD_LETTER: prefix
+  // now that state is a first-class column). IN_FLIGHT is only a crash-recovery
+  // marker, never a useful permanent error message.
+  //
+  // Also set dead_lettered_at = now so the reconciliation auto-reset gate can
+  // skip records that have been dead-lettered for a long time (leaving them for
+  // manual intervention + alerting) while auto-retrying recent ones.
+  //
+  // Only dead-letter rows in 'pending' state — waiting_dependency rows should
+  // not be dead-lettered (they're waiting for a dependency, not failing).
   db.query(`
     UPDATE sync_queue
-    SET last_error = 'DEAD_LETTER: ' || CASE
-      WHEN last_error IS NULL OR last_error = 'IN_FLIGHT' THEN 'max attempts reached'
-      ELSE last_error
-    END
+    SET state = 'dead_letter',
+        dead_lettered_at = ?,
+        last_error = CASE
+          WHEN last_error IS NULL OR last_error = 'IN_FLIGHT' THEN 'max attempts reached'
+          ELSE last_error
+        END
     WHERE synced = 0
       AND attempts >= ?
-      AND last_error NOT LIKE 'DEAD_LETTER:%'
-  `).run(MAX_ATTEMPTS);
+      AND state = 'pending'
+  `).run(Date.now(), MAX_ATTEMPTS);
 }
 
 // ─── Main sync push ──────────────────────────────────────────────────────────
@@ -536,7 +613,7 @@ async function refreshCloudSession(): Promise<boolean> {
     // With a fresh JWT they should succeed on the next sync cycle.
     try {
       const db = getDb();
-      const resetResult = db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL WHERE synced = 0 AND attempts >= ?").run(MAX_ATTEMPTS);
+      const resetResult = db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL, state = 'pending', dead_lettered_at = NULL WHERE synced = 0 AND state = 'dead_letter' AND attempts >= ?").run(MAX_ATTEMPTS);
       if (resetResult.changes && resetResult.changes > 0) {
         console.log(`[Sync] Reset ${resetResult.changes} dead-lettered records after session refresh`);
       }
@@ -768,8 +845,19 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
             markSynced(retryResult.accepted);
             const retryDequeueIds: number[] = [];
             if (retryResult.rejected && retryResult.rejected.length > 0) {
+              const db = getDb();
               for (const rej of retryResult.rejected) {
-                if (rej.outcome === "rejected" || rej.outcome === "permanent" || rej.outcome === "conflict" || rej.outcome === "duplicate") {
+                if (rej.outcome === "waiting_dependency") {
+                  // Dependency not ready — don't increment attempts, don't dequeue.
+                  // Set state to waiting_dependency. collectBatch() will skip it.
+                  // markSynced() will flip it back to pending when the order syncs.
+                  const item = payloadMap.get(rej.queueId);
+                  if (item) {
+                    db.query("UPDATE sync_queue SET state = 'waiting_dependency', last_error = ? WHERE id = ?")
+                      .run(rej.error, rej.queueId);
+                    console.log(`[Sync] waiting_dependency entered: queueId=${rej.queueId} (${item.tableName}/${item.recordId}) — ${rej.error}`);
+                  }
+                } else if (rej.outcome === "rejected" || rej.outcome === "permanent" || rej.outcome === "conflict" || rej.outcome === "duplicate") {
                   retryDequeueIds.push(rej.queueId);
                   const item = payloadMap.get(rej.queueId);
                   if (item) insertSyncAudit(rej.queueId, item.tableName, item.recordId, item.operation, rej.outcome, rej.error);
@@ -824,6 +912,9 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
     markSynced(result.accepted);
 
     // Handle rejected records based on their outcome:
+    // - "waiting_dependency": dependency not ready — set state, don't increment
+    //   attempts, don't dequeue. markSynced() flips back to pending when the
+    //   order syncs. The invariant checker auto-repairs stale waits.
     // - "error": transient failure — increment attempts for retry
     // - "rejected"/"conflict"/"duplicate": legacy permanent outcomes;
     //   audit and dequeue for backward compatibility
@@ -833,8 +924,19 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
     const retryIds: number[] = [];
     const dequeueIds: number[] = [];
     if (result.rejected && result.rejected.length > 0) {
+      const db = getDb();
       for (const rej of result.rejected) {
-        if (rej.outcome === "rejected" || rej.outcome === "conflict" || rej.outcome === "duplicate" || rej.outcome === "permanent") {
+        if (rej.outcome === "waiting_dependency") {
+          // Dependency not ready — don't increment attempts, don't dequeue.
+          // Set state to waiting_dependency. collectBatch() will skip it.
+          // markSynced() will flip it back to pending when the order syncs.
+          const item = payloadMap.get(rej.queueId);
+          if (item) {
+            db.query("UPDATE sync_queue SET state = 'waiting_dependency', last_error = ? WHERE id = ?")
+              .run(rej.error, rej.queueId);
+            console.log(`[Sync] waiting_dependency entered: queueId=${rej.queueId} (${item.tableName}/${item.recordId}) — ${rej.error}`);
+          }
+        } else if (rej.outcome === "rejected" || rej.outcome === "conflict" || rej.outcome === "duplicate" || rej.outcome === "permanent") {
           dequeueIds.push(rej.queueId);
           // Persist audit record before dequeuing
           const item = payloadMap.get(rej.queueId);
@@ -919,7 +1021,7 @@ async function runSyncCycle(): Promise<void> {
   try {
     const result = await pushSyncBatch();
 
-    // Label exhausted records (attempts >= MAX_ATTEMPTS) with DEAD_LETTER prefix
+    // Label exhausted records (attempts >= MAX_ATTEMPTS) with state = 'dead_letter'
     // so the recovery UI can surface them. This must run every cycle to catch
     // records that just crossed the attempt threshold.
     deadLetterExhausted();
@@ -935,8 +1037,8 @@ async function runSyncCycle(): Promise<void> {
 
     // Record sync metrics for observability and alerting (Gap 8)
     const _db = getDb();
-    const _pendingAfter = (_db.query("SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0").get() as any)?.c || 0;
-    const _deadLetterAfter = (_db.query("SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0 AND attempts >= ?").get(MAX_ATTEMPTS) as any)?.c || 0;
+    const _pendingAfter = (_db.query("SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0 AND state = 'pending'").get() as any)?.c || 0;
+    const _deadLetterAfter = (_db.query("SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0 AND state = 'dead_letter'").get() as any)?.c || 0;
     recordSyncMetric({
       cycleAt: cycleStart,
       pushed: result.pushed,
@@ -990,8 +1092,22 @@ async function runSyncCycle(): Promise<void> {
         if (recon.enqueued > 0 || recon.reset > 0 || recon.backfilled > 0) {
           console.log(`[Sync] Reconciliation: ${recon.enqueued} re-enqueued, ${recon.reset} dead-letter resets, ${recon.backfilled} backfilled from legacy edge_config`);
         }
+
+        // Queue invariant check — detect impossible state combinations that
+        // indicate bugs or crash recovery issues. See Design Contract 4.
+        const violations = checkQueueInvariants();
+        for (const v of violations) {
+          if (v.severity === "critical") {
+            console.error(`[Sync] INVARIANT VIOLATION: ${v.type} — ${v.message}`);
+            if (v.examples.length > 0) {
+              console.error(`[Sync]   Examples: ${JSON.stringify(v.examples)}`);
+            }
+          } else {
+            console.warn(`[Sync] Invariant warning: ${v.type} — ${v.message}`);
+          }
+        }
       } catch (reconErr) {
-        console.warn("[Sync] Reconciliation failed:", (reconErr as Error)?.message || reconErr);
+        console.warn("[Sync] Reconciliation/invariant check failed:", (reconErr as Error)?.message || reconErr);
       }
     }
   } catch (err) {
@@ -1061,12 +1177,43 @@ export function getSyncStatus(): {
   lastSyncResult: typeof lastSyncResult;
   pendingCount: number;
   deadLetterCount: number;
+  waitingDependencyCount: number;
+  permanentFailureCount: number;
   consecutiveFailures: number;
   nextSyncInMs: number;
+  alerts: Array<{ type: string; severity: string; message: string; since: number; count: number }>;
 } {
   const db = getDb();
-  const pendingCount = (db.query("SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0").get() as any)?.c || 0;
-  const deadLetterCount = (db.query("SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0 AND attempts >= ?").get(MAX_ATTEMPTS) as any)?.c || 0;
+  const pendingCount = (db.query("SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0 AND state = 'pending'").get() as any)?.c || 0;
+  const deadLetterCount = (db.query("SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0 AND state = 'dead_letter'").get() as any)?.c || 0;
+  const waitingDependencyCount = (db.query(
+    "SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0 AND state = 'waiting_dependency'"
+  ).get() as any)?.c || 0;
+  const permanentFailureCount = (db.query(
+    `SELECT COUNT(*) as c FROM sync_audit
+     WHERE outcome = 'permanent'
+       AND table_name IN ('transaction', 'walkin_transaction')
+       AND audited_at > ?`
+  ).get(Date.now() - 24 * 60 * 60 * 1000) as any)?.c || 0;
+
+  // Merge DB-level alerts with queue invariant violations so the monitoring
+  // endpoint (/api/edge/sync/status) surfaces both. Without this, invariant
+  // violations are only visible in server logs — invisible to dashboards.
+  const alerts = getSyncAlerts();
+  try {
+    const violations = checkQueueInvariants();
+    for (const v of violations) {
+      alerts.push({
+        type: `queue_inconsistency:${v.type}`,
+        severity: v.severity,
+        message: v.message,
+        since: Date.now(),
+        count: v.count,
+      });
+    }
+  } catch {
+    // Non-fatal — invariant check should never break status reporting
+  }
 
   return {
     workerRunning: syncTimer !== null,
@@ -1074,8 +1221,11 @@ export function getSyncStatus(): {
     lastSyncResult,
     pendingCount,
     deadLetterCount,
+    waitingDependencyCount,
+    permanentFailureCount,
     consecutiveFailures,
     nextSyncInMs: getBackoffDelay(),
+    alerts,
   };
 }
 
@@ -1096,7 +1246,7 @@ export async function manualSyncPush(): Promise<{ ok: boolean; pushed: number; a
 
 export function retryDeadLetters(): { reset: number } {
   const db = getDb();
-  const result = db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL WHERE synced = 0 AND attempts >= ?").run(MAX_ATTEMPTS);
+  const result = db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL, state = 'pending', dead_lettered_at = NULL WHERE synced = 0 AND state = 'dead_letter' AND attempts >= ?").run(MAX_ATTEMPTS);
   return { reset: result.changes || 0 };
 }
 
@@ -1116,9 +1266,9 @@ export function getDeadLetterRecords(): Array<{
   const rows = db.query(
     `SELECT id, table_name, record_id, operation, attempts, last_error, created_at
      FROM sync_queue
-     WHERE synced = 0 AND attempts >= ?
+     WHERE synced = 0 AND state = 'dead_letter'
      ORDER BY created_at ASC`
-  ).all(MAX_ATTEMPTS) as any[];
+  ).all() as any[];
 
   return rows.map((row) => {
     const payload = loadRecordData(row.table_name, row.record_id);
@@ -1147,8 +1297,147 @@ export function discardDeadLetter(queueId: number): { success: boolean } {
 
 export function retrySingleDeadLetter(queueId: number): { success: boolean } {
   const db = getDb();
-  const result = db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL WHERE id = ? AND synced = 0 AND attempts >= ?").run(queueId, MAX_ATTEMPTS);
+  const result = db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL, state = 'pending', dead_lettered_at = NULL WHERE id = ? AND synced = 0 AND state = 'dead_letter' AND attempts >= ?").run(queueId, MAX_ATTEMPTS);
   return { success: (result.changes || 0) > 0 };
+}
+
+// ─── Queue invariant checker ─────────────────────────────────────────────────
+// Detects impossible state combinations that indicate bugs or crash recovery
+// issues. Runs every reconciliation cycle (5 min). See Design Contract 4.
+
+export interface InvariantViolation {
+  type: string;
+  severity: "critical" | "warning";
+  message: string;
+  count: number;
+  examples: Array<{ queueId: number; tableName: string; recordId: string; detail: string }>;
+}
+
+export function checkQueueInvariants(): InvariantViolation[] {
+  const db = getDb();
+  const violations: InvariantViolation[] = [];
+
+  // Invariant 1: Transaction in waiting_dependency but order has no queue row
+  // AND order cloud_synced = 0. The transaction is waiting for an order that
+  // will never sync — the order's queue row was lost or never enqueued.
+  const orphanedWaits = db.query(`
+    SELECT sq.id as queue_id, sq.table_name, sq.record_id,
+           tr.order_id, o.cloud_synced
+    FROM sync_queue sq
+    JOIN transaction_record tr ON tr.id = sq.record_id
+    LEFT JOIN order_record o ON o.id = tr.order_id
+    WHERE sq.state = 'waiting_dependency'
+      AND tr.order_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM sync_queue sq2
+        WHERE sq2.table_name = 'order'
+          AND sq2.record_id = tr.order_id
+          AND sq2.synced = 0
+      )
+      AND (o.cloud_synced IS NULL OR o.cloud_synced = 0)
+  `).all() as any[];
+
+  if (orphanedWaits.length > 0) {
+    violations.push({
+      type: "orphaned_waiting_dependency",
+      severity: "critical",
+      message: `${orphanedWaits.length} transaction(s) in waiting_dependency state but their order has no queue row and cloud_synced=0 — order sync was lost`,
+      count: orphanedWaits.length,
+      examples: orphanedWaits.slice(0, 5).map(r => ({
+        queueId: r.queue_id,
+        tableName: r.table_name,
+        recordId: r.record_id,
+        detail: `order_id=${r.order_id}, cloud_synced=${r.cloud_synced}`,
+      })),
+    });
+  }
+
+  // Invariant 2: Order with cloud_synced = 1 but queue row still exists.
+  // markSynced() set cloud_synced but crashed before DELETE, or a bug updated
+  // cloud_synced without deleting the queue row.
+  const staleQueueRows = db.query(`
+    SELECT sq.id as queue_id, sq.table_name, sq.record_id, sq.state
+    FROM sync_queue sq
+    JOIN order_record o ON o.id = sq.record_id
+    WHERE sq.table_name = 'order'
+      AND sq.synced = 0
+      AND o.cloud_synced = 1
+  `).all() as any[];
+
+  if (staleQueueRows.length > 0) {
+    violations.push({
+      type: "stale_queue_row_after_sync",
+      severity: "warning",
+      message: `${staleQueueRows.length} order queue row(s) still exist but order_record.cloud_synced=1 — stale queue rows from non-atomic markSynced`,
+      count: staleQueueRows.length,
+      examples: staleQueueRows.slice(0, 5).map(r => ({
+        queueId: r.queue_id,
+        tableName: r.table_name,
+        recordId: r.record_id,
+        detail: `state=${r.state}`,
+      })),
+    });
+  }
+
+  // Invariant 3: Transaction in waiting_dependency but order cloud_synced = 1.
+  // The order synced but the transaction wasn't flipped back to pending.
+  // SAFETY: Don't repair immediately. Flag with STALE_WAIT_CONFIRMED: prefix
+  // and require the condition to persist for one full reconciliation cycle
+  // (5 minutes) before flipping back to pending. This avoids reacting to
+  // transient states during SQLite writes or crash recovery.
+  const staleWaits = db.query(`
+    SELECT sq.id as queue_id, sq.table_name, sq.record_id, tr.order_id
+    FROM sync_queue sq
+    JOIN transaction_record tr ON tr.id = sq.record_id
+    JOIN order_record o ON o.id = tr.order_id
+    WHERE sq.state = 'waiting_dependency'
+      AND o.cloud_synced = 1
+  `).all() as any[];
+
+  if (staleWaits.length > 0) {
+    const ids = staleWaits.map(r => r.queue_id);
+    const placeholders = ids.map(() => "?").join(",");
+    const confirmedRows = db.query(
+      `SELECT id FROM sync_queue WHERE id IN (${placeholders}) AND last_error LIKE 'STALE_WAIT_CONFIRMED:%'`
+    ).all(...ids) as any[];
+    const confirmedIds = new Set(confirmedRows.map(r => r.id));
+
+    const toRepair = staleWaits.filter(r => confirmedIds.has(r.queue_id));
+    const toFlag = staleWaits.filter(r => !confirmedIds.has(r.queue_id));
+
+    // Flag first-time detections — repaired next cycle if still true
+    if (toFlag.length > 0) {
+      const flagIds = toFlag.map(r => r.queue_id);
+      const flagPlaceholders = flagIds.map(() => "?").join(",");
+      db.query(`UPDATE sync_queue SET last_error = 'STALE_WAIT_CONFIRMED: order cloud_synced=1, will auto-repair next cycle' WHERE id IN (${flagPlaceholders})`).run(...flagIds);
+      console.log(`[Sync] Invariant warning: ${toFlag.length} stale waiting_dependency transaction(s) detected — will auto-repair next cycle if condition persists`);
+    }
+
+    // Repair confirmed detections (persisted for one full cycle)
+    if (toRepair.length > 0) {
+      const repairIds = toRepair.map(r => r.queue_id);
+      const repairPlaceholders = repairIds.map(() => "?").join(",");
+      db.query(`UPDATE sync_queue SET state = 'pending', last_error = NULL WHERE id IN (${repairPlaceholders})`).run(...repairIds);
+      console.log(`[Sync] Invariant auto-repair: flipped ${toRepair.length} stale waiting_dependency transaction(s) back to pending (order cloud_synced=1 confirmed for 2 cycles)`);
+    }
+
+    if (toFlag.length > 0 || toRepair.length > 0) {
+      violations.push({
+        type: "stale_waiting_dependency",
+        severity: "warning",
+        message: `${staleWaits.length} transaction(s) in waiting_dependency but order cloud_synced=1 — ${toRepair.length} auto-repaired (confirmed 2 cycles), ${toFlag.length} flagged for recheck next cycle`,
+        count: staleWaits.length,
+        examples: staleWaits.slice(0, 5).map(r => ({
+          queueId: r.queue_id,
+          tableName: r.table_name,
+          recordId: r.record_id,
+          detail: `order_id=${r.order_id} (cloud_synced=1, ${confirmedIds.has(r.queue_id) ? 'repaired' : 'flagged'})`,
+        })),
+      });
+    }
+  }
+
+  return violations;
 }
 
 // ─── Reconciliation worker — guarantees transactions reach the cloud ──────────
@@ -1250,10 +1539,13 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
     }
 
     if (pendingRow.synced === 1) {
-      // Dequeued. Check if it was permanently rejected — if so, re-enqueue
+      // Dequeued. Check if it was rejected/conflicted — if so, re-enqueue
       // because the admin panel will never see the revenue otherwise.
       // "duplicate" is excluded: the cloud already has the transaction, so
       // re-enqueuing would create an infinite cycle.
+      // "permanent" is excluded: genuinely permanent rejections (day-closed
+      // orders) should not be re-enqueued infinitely. The permanent_revenue_failure
+      // alert surfaces these for manual investigation.
       const auditRow = db.query(
         "SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'transaction' ORDER BY audited_at DESC LIMIT 1",
       ).get(pendingRow.id) as { outcome: string } | null;
@@ -1266,9 +1558,9 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
     }
 
     // synced = 0 — still in queue. If dead-lettered, reset attempts so the
-    // normal worker (which now excludes DEAD_LETTER rows) picks it up again.
+    // normal worker (which now excludes dead_letter state rows) picks it up again.
     if (pendingRow.attempts >= MAX_ATTEMPTS) {
-      db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL WHERE id = ?").run(pendingRow.id);
+      db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL, state = 'pending', dead_lettered_at = NULL WHERE id = ?").run(pendingRow.id);
       reset++;
     }
   }
@@ -1315,7 +1607,7 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
     }
 
     if (pendingRow.attempts >= MAX_ATTEMPTS) {
-      db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL WHERE id = ?").run(pendingRow.id);
+      db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL, state = 'pending', dead_lettered_at = NULL WHERE id = ?").run(pendingRow.id);
       reset++;
     }
   }
@@ -1366,7 +1658,7 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
           enqueued++;
         }
       } else if (pendingRow.attempts >= MAX_ATTEMPTS) {
-        db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL WHERE id = ?").run(pendingRow.id);
+        db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL, state = 'pending', dead_lettered_at = NULL WHERE id = ?").run(pendingRow.id);
         reset++;
       }
     } catch { /* ignore */ }
@@ -1437,19 +1729,23 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
   }
 
   // ── 5. General dead-letter reset for all record types ─────────────────────
-  // Records that failed 5 attempts get the DEAD_LETTER: prefix and are
+  // Records that failed 5 attempts get state = 'dead_letter' and are
   // excluded from collectBatch(). Without a reset, they stay permanently
   // stuck — even after the underlying issue (network outage, cloud 500,
   // transient error) resolves.
   //
-  // This step resets ALL dead-lettered rows (any table_name) so the normal
-  // sync worker picks them up again. It runs every RECONCILE_INTERVAL_MS (5
-  // minutes), giving the underlying issue time to resolve while ensuring no
-  // record is permanently stuck.
+  // GATE: Only auto-reset dead-letters dead-lettered within the last 30 minutes.
+  // Records dead-lettered longer ago are left in dead_letter state so the
+  // dead_letter_stuck alert (1 hour threshold) can fire and surface them for
+  // manual intervention. Without this gate, the alert can never fire because
+  // every dead-letter is reset within 5 minutes — making the alert dead code.
+  // The 30-min gate is shorter than the 1-hour alert threshold, giving transient
+  // issues time to resolve while ensuring genuinely stuck records are surfaced.
+  const DEAD_LETTER_AUTO_RESET_WINDOW_MS = 30 * 60_000;
   const deadLetterReset = db.query(
-    `UPDATE sync_queue SET attempts = 0, last_error = NULL
-     WHERE synced = 0 AND last_error LIKE 'DEAD_LETTER:%'`,
-  ).run();
+    `UPDATE sync_queue SET attempts = 0, last_error = NULL, state = 'pending', dead_lettered_at = NULL
+     WHERE synced = 0 AND state = 'dead_letter' AND dead_lettered_at > ?`,
+  ).run(Date.now() - DEAD_LETTER_AUTO_RESET_WINDOW_MS);
   reset += deadLetterReset.changes || 0;
 
   // ── 6. Prune sync_audit to prevent unbounded growth ──────────────────────
