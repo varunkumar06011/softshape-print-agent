@@ -35,5 +35,6 @@ softshape-print-agent/edge-server/edge-server.exe
 Thumbs.db
 Desktop.ini
 .DS_Store
+NUL
 # Capacitor generated platforms
 android/

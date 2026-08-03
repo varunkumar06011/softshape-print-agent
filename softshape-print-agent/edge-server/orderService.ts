@@ -2660,6 +2660,11 @@ export async function transferItemsEdge(
   targetOrder = targetOrder[0];
 
   const now = Date.now();
+  // Capture whether the target table was empty before the transaction creates a new order.
+  // When the target was Free/AVAILABLE, the table row must transition to OCCUPIED so the
+  // frontend's mapRealtimeTablePayload (which discards activeOrder/kotHistory for Free
+  // tables) renders the transferred items. Mirrors cloud transferOrderItemsService.
+  const targetWasEmpty = !targetOrder;
   let newSourceOrderRev = 1, newTargetOrderRev = 1, newSourceTableRev = 1, newTargetTableRev = 1;
   const tx = db.transaction(() => {
     // Create target order if it doesn't exist
@@ -2785,8 +2790,18 @@ export async function transferItemsEdge(
       }
     }
 
-    db.query(`UPDATE "table" SET current_bill = current_bill + ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
-      .run(transferredAmount, newTargetTableRev, meta?.requestId || null, now, targetTableId);
+    // When the target was previously empty/Free, transition it to OCCUPIED so the
+    // frontend renders the newly-transferred order. Mirrors cloud transferOrderItemsService,
+    // which always sets status=OCCUPIED and workflowStatus/sessionStartedAt when the
+    // target was AVAILABLE. Without this, mapRealtimeTablePayload treats the target as
+    // Free and discards activeOrder + kotHistory, hiding the transferred items.
+    if (targetWasEmpty) {
+      db.query(`UPDATE "table" SET current_bill = current_bill + ?, status = 'OCCUPIED', workflow_status = 'Preparing', session_started_at = ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+        .run(transferredAmount, now, newTargetTableRev, meta?.requestId || null, now, targetTableId);
+    } else {
+      db.query(`UPDATE "table" SET current_bill = current_bill + ?, revision = ?, last_command_id = ?, updated_at = ? WHERE id = ?`)
+        .run(transferredAmount, newTargetTableRev, meta?.requestId || null, now, targetTableId);
+    }
     if (targetHistoryJSON !== null) {
       db.query(`UPDATE "table" SET kot_history = ? WHERE id = ?`).run(targetHistoryJSON, targetTableId);
     }
