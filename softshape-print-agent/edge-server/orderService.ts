@@ -2275,9 +2275,11 @@ export interface SettleOrderInput {
   paymentMethod?: string;
   cashAmount?: number;
   cardAmount?: number;
+  upiAmount?: number;
   tipAmount?: number;
   cashTipAmount?: number;
   cardTipAmount?: number;
+  upiTipAmount?: number;
   discountPercent?: number;
   subtotal?: number;
   discountAmount?: number;
@@ -2400,9 +2402,11 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
       paymentMethod: paymentMethod || "CASH",
       cashAmount: input.cashAmount,
       cardAmount: input.cardAmount,
+      upiAmount: input.upiAmount,
       tipAmount: input.tipAmount,
       cashTipAmount: input.cashTipAmount,
       cardTipAmount: input.cardTipAmount,
+      upiTipAmount: input.upiTipAmount,
       discountPercent: input.discountPercent,
       subtotal: input.subtotal,
       discountAmount: input.discountAmount,
@@ -2473,7 +2477,11 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
     paymentMethod: paymentMethod || "CASH",
     cashAmount: input.cashAmount ?? null,
     cardAmount: input.cardAmount ?? null,
+    upiAmount: input.upiAmount ?? null,
     tipAmount: input.tipAmount ?? 0,
+    cashTipAmount: input.cashTipAmount ?? 0,
+    cardTipAmount: input.cardTipAmount ?? 0,
+    upiTipAmount: input.upiTipAmount ?? 0,
     discountPercent: input.discountPercent ?? 0,
     subtotal: input.subtotal ?? null,
     discountAmount: input.discountAmount ?? null,
@@ -3072,7 +3080,7 @@ export async function editBillEdge(
 export async function confirmPaymentEdge(
   restaurantId: string,
   transactionId: string,
-  paymentDetails: { paymentMethod?: string; cashAmount?: number; cardAmount?: number; tipAmount?: number; cashTipAmount?: number; cardTipAmount?: number },
+  paymentDetails: { paymentMethod?: string; cashAmount?: number; cardAmount?: number; upiAmount?: number; tipAmount?: number; cashTipAmount?: number; cardTipAmount?: number; upiTipAmount?: number },
   meta?: CommandMeta,
 ): Promise<{ success: boolean; error?: string }> {
   const db = getDb();
@@ -3236,6 +3244,12 @@ export async function saveTransactionEdge(
     grandTotal?: number;
     roundOff?: number;
     tipAmount?: number;
+    cashTipAmount?: number;
+    cardTipAmount?: number;
+    upiTipAmount?: number;
+    cashAmount?: number;
+    cardAmount?: number;
+    upiAmount?: number;
     sectionId?: string | null;
     sectionTag?: string | null;
     billNumber?: string | null;
@@ -3273,6 +3287,12 @@ export async function saveTransactionEdge(
     grandTotal: Number(txnData.grandTotal || 0),
     roundOff: Number(txnData.roundOff || 0),
     tipAmount: Number(txnData.tipAmount || 0),
+    cashTipAmount: Number(txnData.cashTipAmount || 0),
+    cardTipAmount: Number(txnData.cardTipAmount || 0),
+    upiTipAmount: Number(txnData.upiTipAmount || 0),
+    cashAmount: Number(txnData.cashAmount || 0),
+    cardAmount: Number(txnData.cardAmount || 0),
+    upiAmount: Number(txnData.upiAmount || 0),
     sectionId: txnData.sectionId || null,
     sectionTag: txnData.sectionTag || null,
     billNumber: txnData.billNumber || null,
@@ -3371,6 +3391,12 @@ export async function listTransactionsEdge(
       sgst: Number(paymentData.sgst ?? 0),
       roundOff: Number(paymentData.roundOff ?? 0),
       tipAmount: Number(paymentData.tipAmount ?? 0),
+      cashTipAmount: Number(paymentData.cashTipAmount ?? 0),
+      cardTipAmount: Number(paymentData.cardTipAmount ?? 0),
+      upiTipAmount: Number(paymentData.upiTipAmount ?? 0),
+      cashAmount: Number(paymentData.cashAmount ?? 0),
+      cardAmount: Number(paymentData.cardAmount ?? 0),
+      upiAmount: Number(paymentData.upiAmount ?? 0),
       itemCount: items.length,
       items: items.map(i => ({ name: i.name, quantity: i.quantity, price: i.price })),
       captainId: order.captain_id || "CASHIER",
@@ -3415,6 +3441,12 @@ export async function listTransactionsEdge(
         sgst: Number(txn.sgst ?? 0),
         roundOff: Number(txn.roundOff ?? 0),
         tipAmount: Number(txn.tipAmount ?? 0),
+        cashTipAmount: Number(txn.cashTipAmount ?? 0),
+        cardTipAmount: Number(txn.cardTipAmount ?? 0),
+        upiTipAmount: Number(txn.upiTipAmount ?? 0),
+        cashAmount: Number(txn.cashAmount ?? 0),
+        cardAmount: Number(txn.cardAmount ?? 0),
+        upiAmount: Number(txn.upiAmount ?? 0),
         itemCount: txn.itemCount || (Array.isArray(txn.items) ? txn.items.length : 0),
         items: txn.items || [],
         captainId: txn.captainId || "CASHIER",

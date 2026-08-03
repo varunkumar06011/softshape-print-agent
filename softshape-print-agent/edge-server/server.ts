@@ -1136,9 +1136,11 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       paymentMethod: body.paymentMethod,
       cashAmount: body.cashAmount,
       cardAmount: body.cardAmount,
+      upiAmount: body.upiAmount,
       tipAmount: body.tipAmount,
       cashTipAmount: body.cashTipAmount,
       cardTipAmount: body.cardTipAmount,
+      upiTipAmount: body.upiTipAmount,
       discountPercent: body.discountPercent,
       subtotal: body.subtotal,
       discountAmount: body.discountAmount,
@@ -1221,9 +1223,11 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       paymentMethod: body.paymentMethod,
       cashAmount: body.cashAmount,
       cardAmount: body.cardAmount,
+      upiAmount: body.upiAmount,
       tipAmount: body.tipAmount,
       cashTipAmount: body.cashTipAmount,
       cardTipAmount: body.cardTipAmount,
+      upiTipAmount: body.upiTipAmount,
     }, {
       requestId: body.requestId,
       deviceId: body.deviceId,
@@ -1546,6 +1550,8 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     ).all(restaurantId, startTs, endTs) as any[];
 
     let totalSales = 0, cashAmount = 0, cardAmount = 0, upiAmount = 0, otherAmount = 0, tipsAmount = 0;
+    // Pass 2 accumulators: eligible card/UPI tips for reallocation from cash bucket.
+    let totalCardTip = 0, totalUpiTip = 0;
 
     for (const order of orders) {
       const settleRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
@@ -1554,18 +1560,50 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         const pd = JSON.parse(settleRow.value);
         const grand = Number(pd.grandTotal || 0);
         totalSales += grand;
-        tipsAmount += Number(pd.tipAmount || 0);
         const method = (pd.paymentMethod || "CASH").toUpperCase();
+        const cardTip = Number(pd.cardTipAmount || 0);
+        const upiTip = Number(pd.upiTipAmount || 0);
+        // tipsAmount = card + upi tips only (cash tips excluded — waiter keeps them).
+        tipsAmount += cardTip + upiTip;
+
+        // ── Pass 1: base split (no tip math) ──────────────────────────────────
         if (method === "CASH") cashAmount += Number(pd.cashAmount || grand);
         else if (method === "CARD") cardAmount += Number(pd.cardAmount || grand);
-        else if (method === "UPI") upiAmount += Number(pd.cashAmount || grand);
+        else if (method === "UPI") upiAmount += Number(pd.upiAmount || pd.cashAmount || grand);
         else if (method === "MIXED") {
-          cashAmount += Number(pd.cashAmount || 0);
-          cardAmount += Number(pd.cardAmount || 0);
-          otherAmount += Math.max(0, grand - Number(pd.cashAmount || 0) - Number(pd.cardAmount || 0));
+          const cash = Number(pd.cashAmount || 0);
+          const card = Number(pd.cardAmount || 0);
+          const upi = Number(pd.upiAmount || 0);
+          cashAmount += cash;
+          cardAmount += card;
+          upiAmount += upi;
+          otherAmount += Math.max(0, grand - cash - card - upi);
         } else otherAmount += grand;
+
+        // ── Pass 2: eligibility-aware tip accumulation ─────────────────────────
+        if (cardTip === 0 && upiTip === 0) continue;
+        let eligible = false;
+        if (method === "CARD" || method === "UPI") {
+          eligible = true;
+        } else if (method === "MIXED") {
+          // Eligible iff CASH not selected AND (CARD or UPI selected).
+          const hasCash = Number(pd.cashAmount || 0) > 0;
+          const hasCard = Number(pd.cardAmount || 0) > 0;
+          const hasUpi = Number(pd.upiAmount || 0) > 0;
+          eligible = !hasCash && (hasCard || hasUpi);
+        }
+        if (eligible) {
+          totalCardTip += cardTip;
+          totalUpiTip += upiTip;
+        }
       } catch {}
     }
+
+    // Apply Pass 2 flat adjustment: card/UPI tips move from cash bucket into their
+    // settlement buckets (drawer payout to waiter). Keeps cash+card+upi+other == totalSales.
+    cardAmount += totalCardTip;
+    upiAmount += totalUpiTip;
+    cashAmount -= (totalCardTip + totalUpiTip);
 
     // Expenditures for the date
     const expenditures = db.query(
