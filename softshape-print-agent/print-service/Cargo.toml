@@ -1,6 +1,6 @@
 [package]
 name = "softshape-print-service"
-version = "23.19.0"
+version = "23.20.0"
 edition = "2021"
 rust-version = "1.70"
 
