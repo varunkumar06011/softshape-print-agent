@@ -419,6 +419,86 @@ interface EdgeKotItem {
   menuType?: string;
   printerName?: string | null;
   printerTarget?: string | null;
+  menuItemId?: string;
+  isCombo?: boolean;
+}
+
+/**
+ * Explode combo line items into one EdgeKotItem per ComboComponent (mirror of the
+ * cloud's kotRouting.explodeCombos). A combo is billed as a single OrderItem at
+ * its own price, but for KOT printing each component must be sent to its own
+ * correct printer (kitchen vs bar) using the component's name/menuType/printer.
+ * The combo's own printerTarget is irrelevant for KOT routing — only its
+ * components' targets matter. Non-combo items pass through unchanged.
+ *
+ * Quantity math: each component EdgeKotItem gets `component.quantity * orderItem.quantity`.
+ * Price on exploded KOT lines is 0 (the bill line already carries the combo's
+ * price; KOT tickets are not price-bearing for combos).
+ */
+function explodeCombosForKot(
+  mappedItems: EdgeKotItem[],
+  restaurantId: string,
+  printerConfig: Record<string, any>,
+): EdgeKotItem[] {
+  const comboItems = mappedItems.filter((i) => i.isCombo && i.menuItemId);
+  if (comboItems.length === 0) return mappedItems;
+
+  const comboMenuItemIds = Array.from(new Set(comboItems.map((i) => i.menuItemId!)));
+  const db = getDb();
+  const placeholders = comboMenuItemIds.map(() => "?").join(",");
+  const componentRows = db.query(`
+    SELECT cc.combo_menu_item_id, cc.component_menu_item_id, cc.quantity,
+           m.name, m.menu_type, m.printer_target, m.printer_name,
+           m.is_available, m.is_deleted,
+           c.printer_target AS category_printer_target
+    FROM combo_component cc
+    LEFT JOIN menu_item m ON cc.component_menu_item_id = m.id
+    LEFT JOIN category c ON m.category_id = c.id
+    WHERE cc.combo_menu_item_id IN (${placeholders}) AND cc.restaurant_id = ?
+  `).all(...comboMenuItemIds, restaurantId) as any[];
+
+  const componentsByCombo = new Map<string, any[]>();
+  for (const r of componentRows) {
+    const arr = componentsByCombo.get(r.combo_menu_item_id) ?? [];
+    arr.push(r);
+    componentsByCombo.set(r.combo_menu_item_id, arr);
+  }
+
+  const result: EdgeKotItem[] = [];
+  for (const item of mappedItems) {
+    if (!item.isCombo || !item.menuItemId) {
+      result.push(item);
+      continue;
+    }
+    const comps = componentsByCombo.get(item.menuItemId) ?? [];
+    if (comps.length === 0) {
+      // No components recorded (data inconsistency) — fall back to printing the
+      // combo as a single line so the kitchen at least sees something.
+      result.push(item);
+      continue;
+    }
+    for (const comp of comps) {
+      // Skip components that have been deleted or marked unavailable — they
+      // should not produce KOT tickets (matches integrity-check expectations).
+      if (comp.is_deleted || !comp.is_available) continue;
+      const resolvedPrinterName = resolvePrinterName(
+        comp.printer_name || null,
+        comp.printer_target || null,
+        comp.category_printer_target || null,
+        printerConfig,
+      );
+      result.push({
+        name: comp.name,
+        quantity: Number(comp.quantity || 1) * item.quantity,
+        price: 0,
+        notes: item.notes ?? null,
+        menuType: comp.menu_type || "FOOD",
+        printerTarget: comp.printer_target || comp.category_printer_target || null,
+        printerName: resolvedPrinterName,
+      });
+    }
+  }
+  return result;
 }
 
 function buildKotPrintGroups(
@@ -859,6 +939,8 @@ export async function createOrder(
     );
     return {
       ...i,
+      menuItemId: i.menuItemId,
+      isCombo: !!cat.is_combo,
       printerName: resolvedPrinterName,
       printerTarget: cat.printer_target || cat.category_printer_target,
     };
@@ -887,7 +969,9 @@ export async function createOrder(
   if (!venueKotEnabled) {
     console.warn(`[createOrder] KOT printing DISABLED for table ${tableId} — venue kot_enabled=${table.kot_enabled}, venue_id=${table.venue_id}`);
   }
-  const printGroups = venueKotEnabled ? buildKotPrintGroups(mappedItems, kotOrderData, table, printerConfig) : [];
+  // Explode combos into per-component KOT lines before grouping/routing.
+  const kotItems = venueKotEnabled ? explodeCombosForKot(mappedItems, restaurantId, printerConfig) : mappedItems;
+  const printGroups = venueKotEnabled ? buildKotPrintGroups(kotItems, kotOrderData, table, printerConfig) : [];
   // CRITICAL: When localPrinted=true, printIntents is empty — no print jobs
   // are created or dispatched. This short-circuit also masks a latent dedup
   // bug in preparePrintIntents() (see comment there). Do not change this to
@@ -1223,6 +1307,8 @@ export async function updateOrderItems(
     );
     return {
       ...i,
+      menuItemId: i.menuItemId,
+      isCombo: !!cat.is_combo,
       printerName: resolvedPrinterName,
       printerTarget: cat.printer_target || cat.category_printer_target,
     };
@@ -1251,7 +1337,9 @@ export async function updateOrderItems(
   if (!venueKotEnabled) {
     console.warn(`[updateOrderItems] KOT printing DISABLED for table ${effectiveTableId} — venue kot_enabled=${table.kot_enabled}, venue_id=${table.venue_id}`);
   }
-  const printGroups = venueKotEnabled ? buildKotPrintGroups(mappedItems, kotOrderData, table, printerConfig) : [];
+  // Explode combos into per-component KOT lines before grouping/routing.
+  const kotItems = venueKotEnabled ? explodeCombosForKot(mappedItems, restaurantId, printerConfig) : mappedItems;
+  const printGroups = venueKotEnabled ? buildKotPrintGroups(kotItems, kotOrderData, table, printerConfig) : [];
   // CRITICAL: When localPrinted=true, printIntents is empty — no print jobs
   // are created or dispatched. This short-circuit also masks a latent dedup
   // bug in preparePrintIntents() (see comment there). Do not change this to
@@ -1679,14 +1767,19 @@ export async function reprintKot(input: ReprintKotInput): Promise<{ success: boo
       price: Number(oi.price),
       notes: oi.notes,
       menuType: oi.menu_type,
+      menuItemId: oi.menu_item_id,
+      isCombo: !!menuItem?.is_combo,
       printerName,
       printerTarget: menuItem?.printer_target || category?.printer_target,
-    };
+    } as EdgeKotItem;
   });
 
+  // Explode combos into per-component KOT lines before grouping/routing.
+  const kotPrintItems = explodeCombosForKot(printItems, restaurantId, printerConfig);
+
   // Group by printer and print (same logic as createOrder)
-  const groupedByPrinter = new Map<string | null | undefined, typeof printItems>();
-  for (const item of printItems) {
+  const groupedByPrinter = new Map<string | null | undefined, EdgeKotItem[]>();
+  for (const item of kotPrintItems) {
     const key = item.printerName;
     if (!groupedByPrinter.has(key)) groupedByPrinter.set(key, []);
     groupedByPrinter.get(key)!.push(item);
@@ -1695,8 +1788,8 @@ export async function reprintKot(input: ReprintKotInput): Promise<{ success: boo
   const kotOrderData: OrderData = {
     tableNumber: formattedTableNumber,
     orderId,
-    items: printItems.map((i) => ({
-      name: i.name, quantity: i.quantity, price: i.price, notes: i.notes ?? null,
+    items: kotPrintItems.map((i) => ({
+      name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null,
       type: (i.menuType === "LIQUOR" ? "liquor" : "food") as "food" | "liquor",
     })),
     restaurantName,
@@ -1713,14 +1806,14 @@ export async function reprintKot(input: ReprintKotInput): Promise<{ success: boo
       const barItems = groupItems.filter((i) => i.menuType === "LIQUOR");
 
       if (kitchenItems.length > 0) {
-        const escpos = buildFoodKOT({ ...kotOrderData, items: kitchenItems.map(i => ({ name: i.name, quantity: i.quantity, price: i.price, notes: i.notes ?? null, type: "food" as const })) });
+        const escpos = buildFoodKOT({ ...kotOrderData, items: kitchenItems.map(i => ({ name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null, type: "food" as const })) });
         const fallback = table.kot_printer_name || resolvePrinterName(null, "KOT_PRINTER", null, printerConfig);
         if (escpos.length > 0) {
           printGroups.push({ printerName: fallback || null, escposData: escpos, type: "KOT" });
         }
       }
       if (barItems.length > 0) {
-        const escpos = buildLiquorKOT({ ...kotOrderData, items: barItems.map(i => ({ name: i.name, quantity: i.quantity, price: i.price, notes: i.notes ?? null, type: "liquor" as const })) });
+        const escpos = buildLiquorKOT({ ...kotOrderData, items: barItems.map(i => ({ name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null, type: "liquor" as const })) });
         const fallback = resolvePrinterName(null, "BAR_PRINTER", null, printerConfig);
         if (escpos.length > 0) {
           printGroups.push({ printerName: fallback || null, escposData: escpos, type: "BAR_KOT" });
@@ -1731,7 +1824,7 @@ export async function reprintKot(input: ReprintKotInput): Promise<{ success: boo
       const builder = isAllLiquor ? buildLiquorKOT : buildFoodKOT;
       const escpos = builder({
         ...kotOrderData,
-        items: groupItems.map(i => ({ name: i.name, quantity: i.quantity, price: i.price, notes: i.notes ?? null, type: (i.menuType === "LIQUOR" ? "liquor" : "food") as "food" | "liquor" })),
+        items: groupItems.map(i => ({ name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null, type: (i.menuType === "LIQUOR" ? "liquor" : "food") as "food" | "liquor" })),
       });
       if (escpos.length > 0) printGroups.push({ printerName, escposData: escpos, type: isAllLiquor ? "BAR_KOT" : "KOT" });
     }
@@ -2910,6 +3003,8 @@ export async function editBillEdge(
           price: Number(i.price),
           notes: i.notes ?? null,
           menuType: i.menuType || "FOOD",
+          menuItemId: i.menuItemId || i.id,
+          isCombo: !!cat.is_combo,
           printerName: resolvedPrinterName,
           printerTarget: cat.printer_target || cat.category_printer_target,
         } as EdgeKotItem;
@@ -2938,7 +3033,8 @@ export async function editBillEdge(
 
       const venueKotEnabled = table.kot_enabled !== 0;
       if (venueKotEnabled) {
-        const printGroups = buildKotPrintGroups(mappedAddedItems, kotOrderData, table, printerConfig);
+        const kotItems = explodeCombosForKot(mappedAddedItems, restaurantId, printerConfig);
+        const printGroups = buildKotPrintGroups(kotItems, kotOrderData, table, printerConfig);
         printResults = await printWithLanFallback(printGroups);
       }
     }
