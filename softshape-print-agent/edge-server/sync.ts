@@ -36,8 +36,11 @@ const SYNC_SCHEMA_VERSION = 2;
 let syncRunning = false;
 let lastSyncAt = 0;
 let lastConfigPullAt = 0;
+let lastWalCheckpointAt = 0;
 let consecutiveFailures = 0;
 let lastSyncResult: { ok: boolean; pushed: number; accepted: number; rejected: number; error?: string } | null = null;
+
+const WAL_CHECKPOINT_INTERVAL_MS = 5 * 60_000; // every 5 minutes
 
 function getBackoffDelay(): number {
   if (consecutiveFailures === 0) return SYNC_INTERVAL_MS;
@@ -1026,13 +1029,20 @@ async function runSyncCycle(): Promise<void> {
     // records that just crossed the attempt threshold.
     deadLetterExhausted();
 
-    // Checkpoint WAL to keep the -wal file small and reads fast.
+    const now = Date.now();
+
+    // Checkpoint WAL periodically to keep the -wal file small and reads fast.
     // Without this, the WAL grows throughout a shift and every query
     // has to scan both the main DB and the WAL, causing progressive slowdown.
-    try {
-      getDb().query("PRAGMA wal_checkpoint(TRUNCATE)").run();
-    } catch {
-      // Non-fatal — checkpoint can fail if another connection is busy
+    // Run every 5 minutes (aligned with reconciliation) instead of every 10s
+    // cycle — TRUNCATE blocks writers and is expensive when the WAL is large.
+    if (now - lastWalCheckpointAt >= WAL_CHECKPOINT_INTERVAL_MS) {
+      lastWalCheckpointAt = now;
+      try {
+        getDb().query("PRAGMA wal_checkpoint(TRUNCATE)").run();
+      } catch {
+        // Non-fatal — checkpoint can fail if another connection is busy
+      }
     }
 
     // Record sync metrics for observability and alerting (Gap 8)
@@ -1068,7 +1078,6 @@ async function runSyncCycle(): Promise<void> {
 
     // Periodically pull config changes from cloud (printer config, menu updates, etc.)
     // This is a safety net in case socket events are missed.
-    const now = Date.now();
     if (now - lastConfigPullAt >= CONFIG_PULL_INTERVAL_MS) {
       lastConfigPullAt = now;
       try {
@@ -1469,150 +1478,125 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
   let enqueued = 0;
   let reset = 0;
   let backfilled = 0;
+  const now = Date.now();
 
-  // ── 1. Settled orders → transaction sync ──────────────────────────────────
-  // A settled order must have a transaction_record + a queue row that is either
-  // pending or synced-applied. If the queue row is missing, dead-lettered, or
-  // permanently rejected, we re-enqueue.
-  const settledOrders = db.query(
-    `SELECT id, restaurant_id
-     FROM order_record
-     WHERE status = 'SETTLED'
-       AND NOT EXISTS (SELECT 1 FROM edge_config WHERE key = 'txn_deleted:' || order_record.id)`,
-  ).all() as Array<{ id: string; restaurant_id: string }>;
+  // ── 1. Reset dead-lettered transaction/walkin sync rows ──────────────────
+  // Resets attempts so the normal worker picks them up again. This is the
+  // "sync at all cost" safety net — dead-lettered transactions get retried
+  // every reconciliation cycle.
+  const resetResult = db.query(`
+    UPDATE sync_queue
+    SET attempts = 0, last_error = NULL, state = 'pending', dead_lettered_at = NULL
+    WHERE table_name IN ('transaction', 'walkin_transaction')
+      AND synced = 0 AND attempts >= ?
+  `).run(MAX_ATTEMPTS);
+  reset += resetResult.changes || 0;
 
-  for (const order of settledOrders) {
-    // Find the transaction_record for this order. If missing (older app
-    // version), try to backfill from edge_config settle:* key.
-    let txnRow = db.query("SELECT id, payload FROM transaction_record WHERE order_id = ? AND kind = 'settle' ORDER BY created_at DESC LIMIT 1").get(order.id) as { id: string; payload: string } | null;
+  // ── 2. Re-enqueue settled order transactions missing from queue ──────────
+  // Skip if cloud_synced=1 AND last audit outcome was 'duplicate' (cloud
+  // already has it — re-enqueuing would cause an infinite cycle).
+  const enqueueMissingTxn = db.query(`
+    INSERT INTO sync_queue (table_name, record_id, operation, created_at)
+    SELECT 'transaction', tr.id, 'insert', ?
+    FROM order_record o
+    JOIN transaction_record tr ON tr.order_id = o.id AND tr.kind = 'settle'
+    WHERE o.status = 'SETTLED'
+      AND NOT EXISTS (SELECT 1 FROM sync_queue sq WHERE sq.table_name = 'transaction' AND sq.record_id = tr.id)
+      AND NOT EXISTS (SELECT 1 FROM edge_config ec WHERE ec.key = 'txn_deleted:' || o.id)
+      AND (
+        tr.cloud_synced = 0 OR tr.cloud_synced IS NULL
+        OR IFNULL(
+          (SELECT sa.outcome FROM sync_audit sa
+           WHERE sa.table_name = 'transaction' AND sa.record_id = tr.id
+           ORDER BY sa.audited_at DESC LIMIT 1), ''
+        ) != 'duplicate'
+      )
+  `).run(now);
+  enqueued += enqueueMissingTxn.changes || 0;
 
-    if (!txnRow) {
-      // Backfill from legacy edge_config settle:* key.
-      const settleRow = db.query(
-        "SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ? LIMIT 1",
-      ).get(order.id) as { value: string } | null;
-      if (!settleRow || !settleRow.value) continue;
-      let settleData: any;
-      try { settleData = JSON.parse(settleRow.value); } catch { continue; }
-      const localTxnId = settleData.localTxnId;
-      if (!localTxnId) continue;
-      // Persist into transaction_record so future sync cycles can read it.
-      try {
-        db.query(
-          "INSERT INTO transaction_record (id, restaurant_id, order_id, kind, payload, cloud_synced, created_at) VALUES (?, ?, ?, 'settle', ?, 0, ?) ON CONFLICT(id) DO NOTHING",
-        ).run(localTxnId, order.restaurant_id, order.id, settleRow.value, Date.now());
-        backfilled++;
-        txnRow = { id: localTxnId, payload: settleRow.value };
-      } catch {
-        continue;
-      }
-    }
+  // ── 3. Re-enqueue rejected/conflicted settled order transactions ─────────
+  // These were dequeued (synced=1, e.g. discarded dead-letters) but the cloud
+  // rejected them — re-enqueue so the admin panel eventually sees the revenue.
+  const enqueueRejectedTxn = db.query(`
+    INSERT INTO sync_queue (table_name, record_id, operation, created_at)
+    SELECT 'transaction', tr.id, 'insert', ?
+    FROM order_record o
+    JOIN transaction_record tr ON tr.order_id = o.id AND tr.kind = 'settle'
+    JOIN sync_queue sq ON sq.table_name = 'transaction' AND sq.record_id = tr.id AND sq.synced = 1
+    WHERE o.status = 'SETTLED'
+      AND IFNULL(
+        (SELECT sa.outcome FROM sync_audit sa
+         WHERE sa.queue_id = sq.id AND sa.table_name = 'transaction'
+         ORDER BY sa.audited_at DESC LIMIT 1), ''
+      ) IN ('rejected', 'conflict')
+  `).run(now);
+  enqueued += enqueueRejectedTxn.changes || 0;
 
-    const localTxnId = txnRow.id;
-    const pendingRow = db.query(
-      "SELECT id, synced, attempts, last_error FROM sync_queue WHERE table_name = 'transaction' AND record_id = ? ORDER BY id DESC LIMIT 1",
-    ).get(localTxnId) as { id: number; synced: number; attempts: number; last_error: string | null } | null;
+  // ── 4. Re-enqueue walk-in transactions missing from queue ────────────────
+  const enqueueMissingWalkin = db.query(`
+    INSERT INTO sync_queue (table_name, record_id, operation, created_at)
+    SELECT 'walkin_transaction', tr.id, 'insert', ?
+    FROM transaction_record tr
+    WHERE tr.kind = 'walkin'
+      AND NOT EXISTS (SELECT 1 FROM sync_queue sq WHERE sq.table_name = 'walkin_transaction' AND sq.record_id = tr.id)
+      AND (
+        tr.cloud_synced = 0 OR tr.cloud_synced IS NULL
+        OR IFNULL(
+          (SELECT sa.outcome FROM sync_audit sa
+           WHERE sa.table_name = 'walkin_transaction' AND sa.record_id = tr.id
+           ORDER BY sa.audited_at DESC LIMIT 1), ''
+        ) != 'duplicate'
+      )
+  `).run(now);
+  enqueued += enqueueMissingWalkin.changes || 0;
 
-    if (!pendingRow) {
-      // Missing from queue. Check if it was already dequeued by markSynced
-      // (which DELETEs the queue row AND sets cloud_synced=1 on transaction_record).
-      // If cloud_synced=1 and the last audit outcome was "duplicate", the cloud
-      // already has this transaction — re-enqueuing would cause an infinite cycle
-      // (push → duplicate → dequeue → reconcile → re-enqueue → push → ...).
-      // For "rejected"/"conflict" we still re-enqueue because the admin panel
-      // won't see the revenue otherwise.
-      const txnSynced = db.query("SELECT cloud_synced FROM transaction_record WHERE id = ?").get(localTxnId) as { cloud_synced: number } | null;
-      if (txnSynced?.cloud_synced === 1) {
-        const auditRow = db.query(
-          "SELECT outcome FROM sync_audit WHERE table_name = 'transaction' AND record_id = ? ORDER BY audited_at DESC LIMIT 1",
-        ).get(localTxnId) as { outcome: string } | null;
-        if (auditRow?.outcome === "duplicate") {
-          // Cloud already has this transaction — skip to avoid infinite re-enqueue cycle.
-          continue;
-        }
-      }
-      // Never been pushed, or was rejected/conflict — re-enqueue.
+  // ── 5. Re-enqueue rejected/conflicted walk-in transactions ───────────────
+  const enqueueRejectedWalkin = db.query(`
+    INSERT INTO sync_queue (table_name, record_id, operation, created_at)
+    SELECT 'walkin_transaction', tr.id, 'insert', ?
+    FROM transaction_record tr
+    JOIN sync_queue sq ON sq.table_name = 'walkin_transaction' AND sq.record_id = tr.id AND sq.synced = 1
+    WHERE tr.kind = 'walkin'
+      AND IFNULL(
+        (SELECT sa.outcome FROM sync_audit sa
+         WHERE sa.queue_id = sq.id AND sa.table_name = 'walkin_transaction'
+         ORDER BY sa.audited_at DESC LIMIT 1), ''
+      ) IN ('rejected', 'conflict')
+  `).run(now);
+  enqueued += enqueueRejectedWalkin.changes || 0;
+
+  // ── 6. Backfill missing transaction_records from legacy edge_config ──────
+  // For orders settled before transaction_record existed. This is a small
+  // and shrinking set, so a loop is acceptable here.
+  const legacyOrders = db.query(`
+    SELECT o.id, o.restaurant_id
+    FROM order_record o
+    WHERE o.status = 'SETTLED'
+      AND NOT EXISTS (SELECT 1 FROM transaction_record tr WHERE tr.order_id = o.id AND tr.kind = 'settle')
+      AND NOT EXISTS (SELECT 1 FROM edge_config ec WHERE ec.key = 'txn_deleted:' || o.id)
+  `).all() as Array<{ id: string; restaurant_id: string }>;
+
+  for (const order of legacyOrders) {
+    const settleRow = db.query(
+      "SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ? LIMIT 1",
+    ).get(order.id) as { value: string } | null;
+    if (!settleRow || !settleRow.value) continue;
+    let settleData: any;
+    try { settleData = JSON.parse(settleRow.value); } catch { continue; }
+    const localTxnId = settleData.localTxnId;
+    if (!localTxnId) continue;
+    try {
+      db.query(
+        "INSERT INTO transaction_record (id, restaurant_id, order_id, kind, payload, cloud_synced, created_at) VALUES (?, ?, ?, 'settle', ?, 0, ?) ON CONFLICT(id) DO NOTHING",
+      ).run(localTxnId, order.restaurant_id, order.id, settleRow.value, now);
+      backfilled++;
       db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('transaction', ?, 'insert', ?)")
-        .run(localTxnId, Date.now());
+        .run(localTxnId, now);
       enqueued++;
-      continue;
-    }
-
-    if (pendingRow.synced === 1) {
-      // Dequeued. Check if it was rejected/conflicted — if so, re-enqueue
-      // because the admin panel will never see the revenue otherwise.
-      // "duplicate" is excluded: the cloud already has the transaction, so
-      // re-enqueuing would create an infinite cycle.
-      // "permanent" is excluded: genuinely permanent rejections (day-closed
-      // orders) should not be re-enqueued infinitely. The permanent_revenue_failure
-      // alert surfaces these for manual investigation.
-      const auditRow = db.query(
-        "SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'transaction' ORDER BY audited_at DESC LIMIT 1",
-      ).get(pendingRow.id) as { outcome: string } | null;
-      if (auditRow && ["rejected", "conflict"].includes(auditRow.outcome)) {
-        db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('transaction', ?, 'insert', ?)")
-          .run(localTxnId, Date.now());
-        enqueued++;
-      }
-      continue;
-    }
-
-    // synced = 0 — still in queue. If dead-lettered, reset attempts so the
-    // normal worker (which now excludes dead_letter state rows) picks it up again.
-    if (pendingRow.attempts >= MAX_ATTEMPTS) {
-      db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL, state = 'pending', dead_lettered_at = NULL WHERE id = ?").run(pendingRow.id);
-      reset++;
-    }
+    } catch { /* ignore */ }
   }
 
-  // ── 2. Walk-in transactions → walkin_transaction sync ─────────────────────
-  const walkinRows = db.query(
-    "SELECT id, restaurant_id FROM transaction_record WHERE kind = 'walkin'",
-  ).all() as Array<{ id: string; restaurant_id: string }>;
-
-  for (const row of walkinRows) {
-    const localId = row.id;
-    const pendingRow = db.query(
-      "SELECT id, synced, attempts FROM sync_queue WHERE table_name = 'walkin_transaction' AND record_id = ? ORDER BY id DESC LIMIT 1",
-    ).get(localId) as { id: number; synced: number; attempts: number } | null;
-
-    if (!pendingRow) {
-      // Missing from queue. Same logic as settled orders: if cloud_synced=1
-      // and last audit outcome was "duplicate", skip to avoid infinite cycle.
-      const txnSynced = db.query("SELECT cloud_synced FROM transaction_record WHERE id = ?").get(localId) as { cloud_synced: number } | null;
-      if (txnSynced?.cloud_synced === 1) {
-        const auditRow = db.query(
-          "SELECT outcome FROM sync_audit WHERE table_name = 'walkin_transaction' AND record_id = ? ORDER BY audited_at DESC LIMIT 1",
-        ).get(localId) as { outcome: string } | null;
-        if (auditRow?.outcome === "duplicate") {
-          continue;
-        }
-      }
-      db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('walkin_transaction', ?, 'insert', ?)")
-        .run(localId, Date.now());
-      enqueued++;
-      continue;
-    }
-
-    if (pendingRow.synced === 1) {
-      const auditRow = db.query(
-        "SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'walkin_transaction' ORDER BY audited_at DESC LIMIT 1",
-      ).get(pendingRow.id) as { outcome: string } | null;
-      if (auditRow && ["rejected", "conflict"].includes(auditRow.outcome)) {
-        db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('walkin_transaction', ?, 'insert', ?)")
-          .run(localId, Date.now());
-        enqueued++;
-      }
-      continue;
-    }
-
-    if (pendingRow.attempts >= MAX_ATTEMPTS) {
-      db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL, state = 'pending', dead_lettered_at = NULL WHERE id = ?").run(pendingRow.id);
-      reset++;
-    }
-  }
-
-  // ── 3. Legacy walk-in rows only in edge_config (no transaction_record) ────
+  // ── 7. Legacy walk-in rows only in edge_config (no transaction_record) ────
   const legacyWalkin = db.query("SELECT key, value FROM edge_config WHERE key LIKE 'walkin_txn:%'").all() as Array<{ key: string; value: string }>;
   for (const row of legacyWalkin) {
     const localId = row.key.replace("walkin_txn:", "");
@@ -1623,49 +1607,16 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
     try {
       db.query(
         "INSERT INTO transaction_record (id, restaurant_id, order_id, kind, payload, cloud_synced, created_at) VALUES (?, ?, ?, 'walkin', ?, 0, ?) ON CONFLICT(id) DO NOTHING",
-      ).run(localId, data.restaurantId, data.orderId || null, row.value, Date.now());
+      ).run(localId, data.restaurantId, data.orderId || null, row.value, now);
       backfilled++;
-      // Re-enqueue if missing.
-      const pendingRow = db.query(
-        "SELECT id, synced, attempts FROM sync_queue WHERE table_name = 'walkin_transaction' AND record_id = ? ORDER BY id DESC LIMIT 1",
-      ).get(localId) as { id: number; synced: number; attempts: number } | null;
-      if (!pendingRow) {
-        // Same duplicate guard as above.
-        const txnSynced = db.query("SELECT cloud_synced FROM transaction_record WHERE id = ?").get(localId) as { cloud_synced: number } | null;
-        if (txnSynced?.cloud_synced === 1) {
-          const auditRow = db.query(
-            "SELECT outcome FROM sync_audit WHERE table_name = 'walkin_transaction' AND record_id = ? ORDER BY audited_at DESC LIMIT 1",
-          ).get(localId) as { outcome: string } | null;
-          if (auditRow?.outcome === "duplicate") {
-            // skip — cloud already has it
-          } else {
-            db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('walkin_transaction', ?, 'insert', ?)")
-              .run(localId, Date.now());
-            enqueued++;
-          }
-        } else {
-          db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('walkin_transaction', ?, 'insert', ?)")
-            .run(localId, Date.now());
-          enqueued++;
-        }
-      } else if (pendingRow.synced === 1) {
-        const auditRow = db.query(
-          "SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'walkin_transaction' ORDER BY audited_at DESC LIMIT 1",
-        ).get(pendingRow.id) as { outcome: string } | null;
-        if (auditRow && ["rejected", "conflict"].includes(auditRow.outcome)) {
-          db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('walkin_transaction', ?, 'insert', ?)")
-            .run(localId, Date.now());
-          enqueued++;
-        }
-      } else if (pendingRow.attempts >= MAX_ATTEMPTS) {
-        db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL, state = 'pending', dead_lettered_at = NULL WHERE id = ?").run(pendingRow.id);
-        reset++;
-      }
+      db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('walkin_transaction', ?, 'insert', ?)")
+        .run(localId, now);
+      enqueued++;
     } catch { /* ignore */ }
   }
 
-  // ── 4. Re-enqueue rejected/conflicted records for ALL table types ────────
-  // The transaction reconciliation above (sections 1-2) re-enqueues
+  // ── 8. Re-enqueue rejected/conflicted records for ALL table types ────────
+  // The transaction reconciliation above (sections 2-5) re-enqueues
   // "rejected"/"conflict" outcomes for transaction/walkin_transaction.
   // But other record types (expenditure, employee, ledger_category, order,
   // kot, etc.) that were permanently rejected by the cloud are dequeued via
@@ -1728,7 +1679,7 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
     enqueued++;
   }
 
-  // ── 5. General dead-letter reset for all record types ─────────────────────
+  // ── 9. General dead-letter reset for all record types ─────────────────────
   // Records that failed 5 attempts get state = 'dead_letter' and are
   // excluded from collectBatch(). Without a reset, they stay permanently
   // stuck — even after the underlying issue (network outage, cloud 500,
@@ -1748,7 +1699,7 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
   ).run(Date.now() - DEAD_LETTER_AUTO_RESET_WINDOW_MS);
   reset += deadLetterReset.changes || 0;
 
-  // ── 6. Prune sync_audit to prevent unbounded growth ──────────────────────
+  // ── 10. Prune sync_audit to prevent unbounded growth ─────────────────────
   // The reconciliation steps above re-enqueue rejected/conflicted records,
   // which creates new audit rows on each retry. Without pruning, the table
   // grows indefinitely and the reconciliation query (self-join on sync_audit)

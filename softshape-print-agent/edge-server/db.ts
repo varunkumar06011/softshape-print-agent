@@ -1059,6 +1059,15 @@ function runMigrations(database: Database) {
     database.exec(`ALTER TABLE menu_item ADD COLUMN show_in_menu INTEGER DEFAULT 1`);
   }
   database.exec(`CREATE INDEX IF NOT EXISTS idx_menu_item_combo ON menu_item(restaurant_id, is_combo)`);
+
+  // ── v9: Performance indexes for sync reconciliation ─────────────────────────
+  // reconcileTransactions() looks up sync_queue by (table_name, record_id) and
+  // sync_audit by (table_name, record_id) and (queue_id, table_name). Without
+  // these indexes, each lookup does a full table scan — with thousands of
+  // settled orders, that's thousands of full scans every 5 minutes.
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_sync_queue_table_record ON sync_queue(table_name, record_id)`);
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_sync_audit_table_record ON sync_audit(table_name, record_id)`);
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_sync_audit_queue ON sync_audit(queue_id, table_name)`);
 }
 
 // ── Prepared statement helpers ───────────────────────────────────────────────
