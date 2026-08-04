@@ -263,7 +263,8 @@ setInterval(() => {
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Edge-Key",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Edge-Key, X-Staff-Token",
+  "Access-Control-Allow-Private-Network": "true",
 };
 
 function jsonResponse(data: any, status = 200, extraHeaders: Record<string, string> = {}): Response {
