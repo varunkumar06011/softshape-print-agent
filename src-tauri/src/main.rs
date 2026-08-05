@@ -247,7 +247,7 @@ fn spawn_runtime_host_if_needed(app: tauri::AppHandle) {
         eprintln!("[PrintAgent] Edge server already running on :3101 — skipping host spawn");
         return;
     }
-    let resource_dir = match tauri::api::path::resource_dir(&app.config()) {
+    let resource_dir = match tauri::api::path::resource_dir(&app.package_info(), &app.env()) {
         Some(dir) => dir,
         None => {
             eprintln!("[PrintAgent] Failed to resolve resource dir");
