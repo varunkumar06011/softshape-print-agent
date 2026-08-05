@@ -242,7 +242,7 @@ fn check_edge_health() -> bool {
     response.starts_with("HTTP/1.1 200")
 }
 
-fn spawn_runtime_host_if_needed(app: &tauri::AppHandle) {
+fn spawn_runtime_host_if_needed(app: tauri::AppHandle) {
     if check_edge_health() {
         eprintln!("[PrintAgent] Edge server already running on :3101 — skipping host spawn");
         return;
@@ -362,7 +362,7 @@ fn main() {
             // Spawn the Runtime Host (softshape-host.exe) which supervises
             // edge-server.exe and print-service.exe. The host registers itself
             // for Windows autostart on first run.
-            spawn_runtime_host_if_needed(&app.handle());
+            spawn_runtime_host_if_needed(app.handle());
 
             Ok(())
         })
