@@ -75,9 +75,12 @@ function collectBatch(): SyncQueueRow[] {
     SELECT * FROM sync_queue
     WHERE synced = 0
     ORDER BY
-      -- Payment records are business-critical and must not wait behind
-      -- repeatedly duplicated KOT/config rows.
+      -- Records waiting for a dependency (e.g. transaction whose order hasn't
+      -- synced yet) are deprioritized so they don't block other records.
       CASE
+        WHEN last_error = 'WAITING_DEPENDENCY' THEN 3
+        -- Payment records are business-critical and must not wait behind
+        -- repeatedly duplicated KOT/config rows.
         WHEN table_name IN ('transaction', 'walkin_transaction') THEN 0
         WHEN attempts >= ? THEN 1
         ELSE 2
@@ -773,6 +776,11 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
                   retryDequeueIds.push(rej.queueId);
                   const item = payloadMap.get(rej.queueId);
                   if (item) insertSyncAudit(rej.queueId, item.tableName, item.recordId, item.operation, rej.outcome, rej.error);
+                } else if (rej.outcome === "waiting_dependency") {
+                  // Don't increment attempts — set WAITING_DEPENDENCY marker
+                  const db = getDb();
+                  db.query("UPDATE sync_queue SET last_error = 'WAITING_DEPENDENCY' WHERE id = ? AND synced = 0").run(rej.queueId);
+                  console.log(`[Sync] waiting_dependency: queueId=${rej.queueId} — ${rej.error}`);
                 } else {
                   incrementAttempts([rej.queueId], rej.error);
                 }
@@ -842,6 +850,14 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
             insertSyncAudit(rej.queueId, item.tableName, item.recordId, item.operation, rej.outcome, rej.error);
           }
           console.warn(`[Sync] ${rej.outcome}: queueId=${rej.queueId} — ${rej.error}`);
+        } else if (rej.outcome === "waiting_dependency") {
+          // Dependency not yet synced (e.g. transaction waiting for its order).
+          // Do NOT increment attempts — this is not an error, just an ordering
+          // issue. Set a WAITING_DEPENDENCY marker so collectBatch deprioritizes
+          // it behind other records, giving the dependency a chance to sync first.
+          const db = getDb();
+          db.query("UPDATE sync_queue SET last_error = 'WAITING_DEPENDENCY' WHERE id = ? AND synced = 0").run(rej.queueId);
+          console.log(`[Sync] waiting_dependency: queueId=${rej.queueId} — ${rej.error}`);
         } else {
           retryIds.push(rej.queueId);
           incrementAttempts([rej.queueId], rej.error);
