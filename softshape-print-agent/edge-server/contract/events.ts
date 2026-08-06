@@ -26,6 +26,7 @@ export const EVENT_NAMES = {
   CONFIG_SYNC_STATE_CHANGED: "config_sync.state_changed",
   CONNECTION_STATE_CHANGED: "connection.state_changed",
   CONFIG_SYNC_PROGRESS: "config_sync.progress",
+  CONFIG_CHANGED: "config.changed",
 } as const;
 
 export type EventName = (typeof EVENT_NAMES)[keyof typeof EVENT_NAMES];
@@ -104,6 +105,15 @@ export interface ConfigSyncProgressEvent {
   percent: number;
 }
 
+// Emitted when a config change (menu item, category, venue price, etc.) is
+// applied to local SQLite via socket sync or incremental polling. Frontend
+// clients use this to refresh their menu cache without waiting for the next
+// poll cycle. `tables` lists the affected SQLite table names.
+export interface ConfigChangedEvent {
+  tables: string[];
+  source: "socket" | "poll";
+}
+
 // ── Event union type ─────────────────────────────────────────────────────────
 
 export type RuntimeEvent =
@@ -117,7 +127,8 @@ export type RuntimeEvent =
   | { event: typeof EVENT_NAMES.RUNTIME_STATE_CHANGED; data: RuntimeStateChangedEvent }
   | { event: typeof EVENT_NAMES.CONFIG_SYNC_STATE_CHANGED; data: ConfigSyncStateChangedEvent }
   | { event: typeof EVENT_NAMES.CONNECTION_STATE_CHANGED; data: ConnectionStateChangedEvent }
-  | { event: typeof EVENT_NAMES.CONFIG_SYNC_PROGRESS; data: ConfigSyncProgressEvent };
+  | { event: typeof EVENT_NAMES.CONFIG_SYNC_PROGRESS; data: ConfigSyncProgressEvent }
+  | { event: typeof EVENT_NAMES.CONFIG_CHANGED; data: ConfigChangedEvent };
 
 // ── WebSocket auth message ───────────────────────────────────────────────────
 

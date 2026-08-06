@@ -17,6 +17,31 @@ import { cloudFetch } from "./cloudFetch.ts";
 import { runtimeLog } from "./contract/logger.ts";
 import { getDeviceId } from "./auth.ts";
 import { invalidateReadCache, warmReadCache } from "./reads.ts";
+import { emitEvent } from "./eventBus.ts";
+import { EVENT_NAMES } from "./contract/events.ts";
+
+// Tables whose changes affect the POS/captain menu view. When any of these
+// are upserted/deleted via socket sync or incremental polling, we emit a
+// config.changed runtime event so connected frontend clients refresh their
+// menu cache immediately (instead of waiting for the next poll cycle).
+const MENU_RELATED_TABLES = new Set([
+  "menu_item",
+  "menu_item_variant",
+  "menu_item_addon",
+  "venue_price",
+  "venue_menu_item_availability",
+  "category",
+]);
+
+function notifyConfigChanged(tables: string[], source: "socket" | "poll"): void {
+  const affected = tables.filter((t) => MENU_RELATED_TABLES.has(t));
+  if (affected.length === 0) return;
+  try {
+    emitEvent({ event: EVENT_NAMES.CONFIG_CHANGED, data: { tables: affected, source } });
+  } catch (err) {
+    runtimeLog.warn("[config] Failed to emit config.changed event", { error: String(err) });
+  }
+}
 
 interface ConfigResponse {
   outlet: any;
@@ -859,12 +884,16 @@ export async function pullIncrementalChanges(): Promise<{ success: boolean; chan
     // All changes are applied atomically in a single transaction so a crash
     // mid-pull doesn't leave a half-applied config.
     let applied = 0;
+    const touchedTables: string[] = [];
     if (data.changes && data.changes.length > 0) {
       const db = getDb();
       const tx = db.transaction(() => {
         for (const change of data.changes) {
           const ok = applyChange(db, change);
-          if (ok) applied++;
+          if (ok) {
+            applied++;
+            if (change?.table) touchedTables.push(change.table);
+          }
         }
       });
       tx();
@@ -884,6 +913,9 @@ export async function pullIncrementalChanges(): Promise<{ success: boolean; chan
           error: String(cacheErr),
         });
       }
+      // Notify connected frontend clients so they refresh their menu cache
+      // immediately rather than waiting for the next poll cycle.
+      notifyConfigChanged(touchedTables, "poll");
     }
 
     return { success: true, changesApplied: applied };
@@ -1197,8 +1229,13 @@ const TABLE_NAME_MAP: Record<string, string> = {
 export function applyChangesBatch(changes: any[]): number {
   const db = getDb();
   let applied = 0;
+  const touchedTables: string[] = [];
   for (const change of changes) {
-    if (applyChange(db, change)) applied++;
+    if (applyChange(db, change)) {
+      applied++;
+      if (change?.table) touchedTables.push(change.table);
+    }
   }
+  if (touchedTables.length > 0) notifyConfigChanged(touchedTables, "socket");
   return applied;
 }
