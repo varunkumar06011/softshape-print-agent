@@ -67,27 +67,22 @@ interface SyncPayloadItem {
 
 function collectBatch(): SyncQueueRow[] {
   const db = getDb();
-  // Simple FIFO — oldest first. Exhausted rows remain eligible for retry and
-  // are moved behind fresh rows so a transient outage can never permanently
-  // strand a valid record. The DEAD_LETTER prefix is an observability marker,
-  // not a terminal state; reconciliation also resets it periodically.
+  // Simple FIFO — oldest first. Orders are created before transactions
+  // (customer sits → order, customer pays → transaction), so FIFO naturally
+  // syncs orders before their dependent transactions.
+  // Only WAITING_DEPENDENCY records are deprioritized (they'll be retried
+  // after the dependency has a chance to sync).
   return db.query(`
     SELECT * FROM sync_queue
     WHERE synced = 0
     ORDER BY
-      -- Records waiting for a dependency (e.g. transaction whose order hasn't
-      -- synced yet) are deprioritized so they don't block other records.
       CASE
-        WHEN last_error = 'WAITING_DEPENDENCY' THEN 3
-        -- Payment records are business-critical and must not wait behind
-        -- repeatedly duplicated KOT/config rows.
-        WHEN table_name IN ('transaction', 'walkin_transaction') THEN 0
-        WHEN attempts >= ? THEN 1
-        ELSE 2
+        WHEN last_error = 'WAITING_DEPENDENCY' THEN 1
+        ELSE 0
       END,
       created_at ASC, id ASC
     LIMIT ?
-  `).all(MAX_ATTEMPTS, MAX_BATCH_SIZE) as SyncQueueRow[];
+  `).all(MAX_BATCH_SIZE) as SyncQueueRow[];
 }
 
 // ─── Load the full record data for a sync queue entry ────────────────────────

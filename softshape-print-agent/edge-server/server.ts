@@ -1747,7 +1747,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     ).get(restaurantId, date) as any;
 
     db.query(
-      "INSERT INTO expenditure (id, restaurant_id, amount, paid_to_type, paid_to_name, category, narration, approver, created_by, expenditure_no, date, created_at, employee_id, ledger_category_id, entry_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO expenditure (id, restaurant_id, amount, paid_to_type, paid_to_name, category, narration, approver, created_by, expenditure_no, date, created_at, employee_id, ledger_category_id, entry_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ).run(id, restaurantId, Number(body.amount), body.paidToType, body.paidToName,
           body.category, body.narration, body.approver, body.createdBy,
           counter.next_no, date, now,
