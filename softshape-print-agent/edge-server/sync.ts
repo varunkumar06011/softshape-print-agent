@@ -25,12 +25,12 @@ import { cloudFetch } from "./cloudFetch.ts";
 import { pullIncrementalChanges } from "./config.ts";
 import { startSocketSync } from "./socketSync.ts";
 
-const SYNC_INTERVAL_MS = parseInt(process.env.EDGE_SYNC_INTERVAL_MS || "10000", 10);
+const SYNC_INTERVAL_MS = parseInt(process.env.EDGE_SYNC_INTERVAL_MS || "5000", 10);
 const CONFIG_PULL_INTERVAL_MS = parseInt(process.env.EDGE_CONFIG_PULL_INTERVAL_MS || "60000", 10);
-const MAX_BATCH_SIZE = 10;
+const MAX_BATCH_SIZE = 25;
 const MAX_ATTEMPTS = 5;
-const BACKOFF_BASE_MS = 10_000;   // 10 seconds
-const BACKOFF_MAX_MS = 5 * 60_000; // 5 minutes cap
+const BACKOFF_BASE_MS = 5_000;   // 5 seconds
+const BACKOFF_MAX_MS = 60_000;   // 1 minute cap
 const SYNC_SCHEMA_VERSION = 2;
 
 let syncRunning = false;
@@ -734,8 +734,8 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
         pushedAt: new Date().toISOString(),
         batch: payload,
       }),
-      connectTimeout: 60_000,
-      bodyTimeout: 120_000,
+      connectTimeout: 30_000,
+      bodyTimeout: 60_000,
     });
 
     if (!res.ok) {
