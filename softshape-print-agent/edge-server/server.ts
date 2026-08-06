@@ -1153,6 +1153,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       deviceId: body.deviceId,
       expectedRevision: body.expectedRevision,
       isExtraTable: body.isExtraTable,
+      captainId: body.captainId,
     });
     if (!result.success) return errorResponse(result.error || "Settle failed", 400);
     return jsonResponse(result);

@@ -2199,6 +2199,7 @@ export interface SettleOrderInput {
   expectedRevision?: number;
   isExtraTable?: boolean;
   items?: any[];
+  captainId?: string;
 }
 
 export async function settleOrderEdge(input: SettleOrderInput): Promise<{ success: boolean; error?: string; order?: any; table?: any; transaction?: any; statusCode?: number; revision?: number; tableRevision?: number }> {
@@ -2305,6 +2306,7 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
       orderId,
       restaurantId,
       paymentMethod: paymentMethod || "CASH",
+      captainId: input.captainId || order.captain_id || null,
       cashAmount: input.cashAmount,
       cardAmount: input.cardAmount,
       tipAmount: input.tipAmount,
