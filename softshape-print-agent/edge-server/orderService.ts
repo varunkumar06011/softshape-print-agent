@@ -913,9 +913,9 @@ export async function createOrder(
     }
 
     // 3. Create KOT
-    db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, counter_date, created_at, cloud_synced)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-    `).run(kotId, restaurantId, tableId, orderId, kotNumber, kotCounterDate, now);
+    db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, counter_date, captain_id, created_at, cloud_synced)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+    `).run(kotId, restaurantId, tableId, orderId, kotNumber, kotCounterDate, captainId || null, now);
 
     // 4. Create KOT items
     const orderItems = db.query("SELECT * FROM order_item WHERE order_id = ?").all(orderId) as any[];
@@ -1275,9 +1275,9 @@ export async function updateOrderItems(
     }
 
     // 2. Create new KOT for the new items
-    db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, counter_date, created_at, cloud_synced)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-    `).run(kotId, restaurantId, effectiveTableId, orderId, kotNumber, kotCounterDate, now);
+    db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, counter_date, captain_id, created_at, cloud_synced)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+    `).run(kotId, restaurantId, effectiveTableId, orderId, kotNumber, kotCounterDate, captainId || order.captain_id || null, now);
 
     // 3. Create KOT items for just the new items (using resolved prices)
     for (let i = 0; i < resolvedItems.length; i++) {
@@ -2634,8 +2634,10 @@ export async function transferItemsEdge(
         const newKotId = crypto.randomUUID();
         const newKotNumber = getNextKotNumber(restaurantId);
         const newKotCounterDate = getKolkataDateString();
-        db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, counter_date, created_at, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`)
-          .run(newKotId, restaurantId, targetTableId, targetOrder.id, newKotNumber, newKotCounterDate, now);
+        const sourceKotId = sourceKotItems[0].kot_id;
+        const sourceKotCaptain = (db.query("SELECT captain_id FROM kot WHERE id = ?").get(sourceKotId) as any)?.captain_id || null;
+        db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, counter_date, captain_id, created_at, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`)
+          .run(newKotId, restaurantId, targetTableId, targetOrder.id, newKotNumber, newKotCounterDate, sourceKotCaptain, now);
 
         const newKotItemsForHistory: any[] = [];
         for (const ski of sourceKotItems) {
@@ -2840,9 +2842,9 @@ export async function editBillEdge(
       addedKotId = crypto.randomUUID();
       addedKotNumber = getNextKotNumber(restaurantId);
       const addedKotCounterDate = getKolkataDateString();
-      db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, counter_date, created_at, cloud_synced)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-      `).run(addedKotId, restaurantId, order.table_id, orderId, addedKotNumber, addedKotCounterDate, now);
+      db.query(`INSERT INTO kot (id, restaurant_id, table_id, order_id, kot_number, counter_date, captain_id, created_at, cloud_synced)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+      `).run(addedKotId, restaurantId, order.table_id, orderId, addedKotNumber, addedKotCounterDate, order.captain_id || null, now);
 
       for (const item of resolvedAddedItems) {
         const newItemId = crypto.randomUUID();

@@ -503,6 +503,7 @@ function initSchema(database: Database) {
       order_id        TEXT NOT NULL,
       kot_number      INTEGER NOT NULL,
       counter_date    TEXT NOT NULL DEFAULT '',
+      captain_id      TEXT,
       created_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
       cloud_synced    INTEGER DEFAULT 0,
       UNIQUE(restaurant_id, kot_number, counter_date)
@@ -958,6 +959,15 @@ function runMigrations(database: Database) {
   }
   database.exec(`CREATE INDEX IF NOT EXISTS idx_expenditure_employee ON expenditure(employee_id) WHERE employee_id IS NOT NULL`);
   database.exec(`CREATE INDEX IF NOT EXISTS idx_expenditure_ledger ON expenditure(ledger_category_id) WHERE ledger_category_id IS NOT NULL`);
+
+  // ── v8: kot table — add captain_id for KOT-level captain attribution ─────────
+  // Tracks which captain sent the KOT, so cloud analytics can attribute special
+  // sales to the captain who actually raised the KOT rather than the table's
+  // assigned captain. Backward compatible: existing rows default to NULL.
+  if (!hasColumn("kot", "captain_id")) {
+    database.exec(`ALTER TABLE kot ADD COLUMN captain_id TEXT`);
+    console.warn("[DB] kot table migrated with captain_id column");
+  }
 }
 
 // ── Prepared statement helpers ───────────────────────────────────────────────
