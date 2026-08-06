@@ -240,6 +240,10 @@ function loadRecordData(tableName: string, recordId: string): any | null {
       const m = db.query("SELECT * FROM menu_item WHERE id = ?").get(recordId) as any;
       if (!m) return null;
       const variants = db.query("SELECT * FROM menu_item_variant WHERE menu_item_id = ?").all(recordId) as any[];
+      // Include venue prices + per-venue availability so the cloud receiver can
+      // upsert them alongside the menu item (cashier edge edits may change these).
+      const venuePrices = db.query("SELECT venue_id, price, is_active FROM venue_price WHERE menu_item_id = ?").all(recordId) as any[];
+      const venueAvail = db.query("SELECT venue_id, is_available FROM venue_menu_item_availability WHERE menu_item_id = ?").all(recordId) as any[];
       return {
         id: m.id,
         name: m.name,
@@ -262,6 +266,14 @@ function loadRecordData(tableName: string, recordId: string): any | null {
         specialChannel: m.special_channel,
         specialActive: !!m.special_active,
         specialExpiresAt: m.special_expires_at,
+        // Send the local updated_at only when it was set by a cashier edit.
+        // For rows that only came down from a cloud pull (updated_at still
+        // NULL), send null so the cloud skips the conflict check instead of
+        // treating sync-push time as the edit time (which would mask real
+        // conflicts or falsely pass on clock skew).
+        updatedAt: m.updated_at ?? null,
+        venuePrices: venuePrices.map(vp => ({ venueId: vp.venue_id, price: Number(vp.price), isActive: !!vp.is_active })),
+        venueAvailabilities: venueAvail.map(va => ({ venueId: va.venue_id, isAvailable: !!va.is_available })),
         variants: variants.map(v => ({
           id: v.id,
           name: v.name,
@@ -1434,6 +1446,9 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
         case "order_item": exists = !!db.query("SELECT 1 FROM order_item WHERE id = ?").get(row.record_id); break;
         case "kot":        exists = !!db.query("SELECT 1 FROM kot WHERE id = ?").get(row.record_id); break;
         case "kot_item":   exists = !!db.query("SELECT 1 FROM kot_item WHERE id = ?").get(row.record_id); break;
+        case "table":      exists = !!db.query('SELECT 1 FROM "table" WHERE id = ?').get(row.record_id); break;
+        case "section":    exists = !!db.query("SELECT 1 FROM section WHERE id = ?").get(row.record_id); break;
+        case "floor":      exists = !!db.query("SELECT 1 FROM floor WHERE id = ?").get(row.record_id); break;
         case "expenditure": exists = !!db.query("SELECT 1 FROM expenditure WHERE id = ?").get(row.record_id); break;
         case "employee":   exists = !!db.query("SELECT 1 FROM employee WHERE id = ?").get(row.record_id); break;
         case "ledger_category": exists = !!db.query("SELECT 1 FROM ledger_category WHERE id = ?").get(row.record_id); break;
@@ -1462,6 +1477,56 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
      WHERE synced = 0 AND last_error LIKE 'DEAD_LETTER:%'`,
   ).run();
   reset += deadLetterReset.changes || 0;
+
+  // ── 5b. Backfill missing tables into sync_queue ──────────────────────────
+  // During onboarding (config.ts), tables are inserted into the local DB but
+  // NOT enqueued to sync_queue — they're assumed to already exist in the cloud.
+  // However, if the cloud DB was reset or tables were deleted, orders/KOTs
+  // referencing them will fail with foreign key errors. This step finds any
+  // local tables that have never been synced (not in sync_queue at all, or
+  // only have synced=1 rows) and enqueues them for sync.
+  try {
+    const missingTables = db.query(
+      `SELECT t.id FROM "table" t
+       WHERE NOT EXISTS (
+         SELECT 1 FROM sync_queue sq
+         WHERE sq.table_name = 'table' AND sq.record_id = t.id AND sq.synced = 0
+       )`,
+    ).all() as Array<{ id: string }>;
+    for (const t of missingTables) {
+      db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)")
+        .run("table", t.id, "create", Date.now());
+      backfilled++;
+    }
+    // Also backfill sections (same onboarding gap)
+    const missingSections = db.query(
+      `SELECT s.id FROM section s
+       WHERE NOT EXISTS (
+         SELECT 1 FROM sync_queue sq
+         WHERE sq.table_name = 'section' AND sq.record_id = s.id AND sq.synced = 0
+       )`,
+    ).all() as Array<{ id: string }>;
+    for (const s of missingSections) {
+      db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)")
+        .run("section", s.id, "create", Date.now());
+      backfilled++;
+    }
+    // Also backfill floors (same onboarding gap)
+    const missingFloors = db.query(
+      `SELECT f.id FROM floor f
+       WHERE NOT EXISTS (
+         SELECT 1 FROM sync_queue sq
+         WHERE sq.table_name = 'floor' AND sq.record_id = f.id AND sq.synced = 0
+       )`,
+    ).all() as Array<{ id: string }>;
+    for (const f of missingFloors) {
+      db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)")
+        .run("floor", f.id, "create", Date.now());
+      backfilled++;
+    }
+  } catch {
+    // Non-fatal — backfill should never break reconciliation
+  }
 
   // ── 6. Prune sync_audit to prevent unbounded growth ──────────────────────
   // The reconciliation steps above re-enqueue rejected/conflicted records,

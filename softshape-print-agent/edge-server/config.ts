@@ -558,15 +558,15 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
 
     // ── Menu Items ────────────────────────────────────────────────────────────
     for (const m of config.menuItems ?? []) {
-      db.query(`INSERT INTO menu_item (id, name, description, image_url, is_veg, is_available, sort_order, category_id, restaurant_id, base_price, unit, is_deleted, deleted_at, printer_target, printer_name, menu_type, gst_enabled, is_special, special_channel, special_active, special_expires_at, synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+      db.query(`INSERT INTO menu_item (id, name, description, image_url, is_veg, is_available, sort_order, category_id, restaurant_id, base_price, unit, is_deleted, deleted_at, printer_target, printer_name, menu_type, gst_enabled, is_special, special_channel, special_active, special_expires_at, updated_at, synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, image_url=excluded.image_url,
         is_veg=excluded.is_veg, is_available=excluded.is_available, sort_order=excluded.sort_order,
         category_id=excluded.category_id, base_price=excluded.base_price, unit=excluded.unit,
         is_deleted=excluded.is_deleted, deleted_at=excluded.deleted_at, printer_target=excluded.printer_target,
         printer_name=excluded.printer_name, menu_type=excluded.menu_type, gst_enabled=excluded.gst_enabled,
         is_special=excluded.is_special, special_channel=excluded.special_channel, special_active=excluded.special_active,
-        special_expires_at=excluded.special_expires_at, synced_at=unixepoch()
+        special_expires_at=excluded.special_expires_at, updated_at=excluded.updated_at, synced_at=unixepoch()
       `).run(
         m.id, m.name, m.description || null, m.imageUrl || null,
         m.isVeg !== false ? 1 : 0, m.isAvailable !== false ? 1 : 0, m.sortOrder || 0,
@@ -575,7 +575,10 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
         m.printerTarget || null, m.printerName || null, m.menuType || "FOOD",
         m.gstEnabled !== false ? 1 : 0, m.isSpecial ? 1 : 0,
         m.specialChannel || "BOTH", m.specialActive !== false ? 1 : 0,
-        m.specialExpiresAt ? new Date(m.specialExpiresAt).getTime() : null
+        m.specialExpiresAt ? new Date(m.specialExpiresAt).getTime() : null,
+        // Persist the cloud's updatedAt (ms epoch) so the edge→cloud conflict
+        // check has a meaningful baseline to compare against on the next push.
+        m.updatedAt ? new Date(m.updatedAt).getTime() : null
       );
       totalRows++;
     }
@@ -1107,15 +1110,15 @@ function applyChange(db: any, change: any): boolean {
 
     // ── Menu Item ───────────────────────────────────────────────────────────
     case "menu_item":
-      db.query(`INSERT INTO menu_item (id, name, description, image_url, is_veg, is_available, sort_order, category_id, restaurant_id, base_price, unit, is_deleted, deleted_at, printer_target, printer_name, menu_type, gst_enabled, is_special, special_channel, special_active, special_expires_at, synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+      db.query(`INSERT INTO menu_item (id, name, description, image_url, is_veg, is_available, sort_order, category_id, restaurant_id, base_price, unit, is_deleted, deleted_at, printer_target, printer_name, menu_type, gst_enabled, is_special, special_channel, special_active, special_expires_at, updated_at, synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, image_url=excluded.image_url,
         is_veg=excluded.is_veg, is_available=excluded.is_available, sort_order=excluded.sort_order,
         category_id=excluded.category_id, base_price=excluded.base_price, unit=excluded.unit,
         is_deleted=excluded.is_deleted, deleted_at=excluded.deleted_at, printer_target=excluded.printer_target,
         printer_name=excluded.printer_name, menu_type=excluded.menu_type, gst_enabled=excluded.gst_enabled,
         is_special=excluded.is_special, special_channel=excluded.special_channel, special_active=excluded.special_active,
-        special_expires_at=excluded.special_expires_at, synced_at=unixepoch()
+        special_expires_at=excluded.special_expires_at, updated_at=excluded.updated_at, synced_at=unixepoch()
       `).run(
         row.id, row.name, row.description || null, row.imageUrl || null,
         row.isVeg !== false ? 1 : 0, row.isAvailable !== false ? 1 : 0, row.sortOrder || 0,
@@ -1124,7 +1127,10 @@ function applyChange(db: any, change: any): boolean {
         row.printerTarget || null, row.printerName || null, row.menuType || "FOOD",
         row.gstEnabled !== false ? 1 : 0, row.isSpecial ? 1 : 0,
         row.specialChannel || "BOTH", row.specialActive !== false ? 1 : 0,
-        row.specialExpiresAt ? new Date(row.specialExpiresAt).getTime() : null
+        row.specialExpiresAt ? new Date(row.specialExpiresAt).getTime() : null,
+        // Persist the cloud's updatedAt (ms epoch) so the edge→cloud conflict
+        // check has a meaningful baseline to compare against on the next push.
+        row.updatedAt ? new Date(row.updatedAt).getTime() : null
       );
       return true;
 

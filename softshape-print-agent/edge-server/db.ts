@@ -32,7 +32,7 @@ export function getKolkataDateString(date = new Date()): string {
   return corrected.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
 }
 
-const CURRENT_SCHEMA_VERSION = 6;
+const CURRENT_SCHEMA_VERSION = 7;
 
 // Schema versions that can be migrated in place (via runMigrations) without
 // wiping the database. Any version not in this set triggers the existing
@@ -43,7 +43,8 @@ const CURRENT_SCHEMA_VERSION = 6;
 // v5 → v6 recreates the kot table with a date-scoped unique constraint
 // (UNIQUE(restaurant_id, kot_number, counter_date)) and backfills
 // counter_date from created_at so KOT numbers can restart at 1 daily.
-const SAFE_INPLACE_MIGRATION_FROM = new Set<number>([2, 3, 4, 5]);
+// v6 → v7 adds updated_at to menu_item for cashier edge-edit conflict detection.
+const SAFE_INPLACE_MIGRATION_FROM = new Set<number>([2, 3, 4, 5, 6]);
 
 let db: Database | null = null;
 let recoveryStatus: RecoveryResult = { recovered: false, corruptPath: null, message: "" };
@@ -381,6 +382,7 @@ function initSchema(database: Database) {
       special_channel TEXT DEFAULT 'BOTH',
       special_active  INTEGER DEFAULT 1,
       special_expires_at INTEGER,
+      updated_at      INTEGER,
       synced_at       INTEGER NOT NULL DEFAULT (unixepoch())
     );
     CREATE INDEX IF NOT EXISTS idx_menu_item_category ON menu_item(category_id);
@@ -967,6 +969,14 @@ function runMigrations(database: Database) {
   if (!hasColumn("kot", "captain_id")) {
     database.exec(`ALTER TABLE kot ADD COLUMN captain_id TEXT`);
     console.warn("[DB] kot table migrated with captain_id column");
+  }
+
+  // ── v9: menu_item.updated_at — cashier edge-edit conflict detection ──────────
+  // Tracks the last local write time so the cloud receiver can compare against
+  // the existing cloud row's updatedAt and avoid last-write-wins overwrites when
+  // an admin edited the same item on the cloud while the edge was offline.
+  if (!hasColumn("menu_item", "updated_at")) {
+    database.exec(`ALTER TABLE menu_item ADD COLUMN updated_at INTEGER`);
   }
 }
 

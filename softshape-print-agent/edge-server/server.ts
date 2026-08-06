@@ -27,6 +27,12 @@
 //   GET  /api/edge/sections     — sections with venue + floor info
 //   GET  /api/edge/menu         — full menu with categories, items, variants
 //   GET  /api/edge/menu/items   — lean flat list for POS
+//   POST /api/edge/menu/items          — create menu item (cashier edge edit)
+//   PATCH /api/edge/menu/items/:id     — full edit (name, price, printer, GST, etc.)
+//   PATCH /api/edge/menu/items/:id/availability       — toggle availability
+//   PATCH /api/edge/menu/items/:id/venue-availability — toggle per-venue availability
+//   PATCH /api/edge/menu/items/:id/menu-type          — toggle FOOD ↔ LIQUOR
+//   DELETE /api/edge/menu/items/:id    — soft-delete menu item
 //   GET  /api/edge/venues       — venues with floors and sections
 //   GET  /api/edge/outlet       — outlet settings
 //   GET  /api/edge/staff        — list active staff (for PIN login screen)
@@ -55,6 +61,7 @@ import os from "os";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getSessionToken, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { pullIncrementalChanges } from "./config.ts";
 import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
+import { createMenuItemEdge, updateMenuItemEdge, deleteMenuItemEdge, toggleAvailabilityEdge, toggleVenueAvailabilityEdge, toggleMenuTypeEdge } from "./menuService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders } from "./reads.ts";
 import { startSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
 import { startSocketSync, getSocketStatus, startHeartbeat } from "./socketSync.ts";
@@ -2214,6 +2221,74 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       sampleItems,
       sampleCategories,
     });
+  }
+
+  // ── POST /api/edge/menu/items — create menu item (cashier/captain edge edit) ─
+  // Auth: edge API key + runtime token (validated by middleware before reaching
+  // here). No verifyEdgeRole call — the cashier's logged-in user object doesn't
+  // carry a PIN, and existing financial edge endpoints (settle, print-bill, etc.)
+  // rely on the same edge API key + runtime token gate.
+  if (url.pathname === "/api/edge/menu/items" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const body = await req.json().catch(() => ({}));
+    try {
+      const result = createMenuItemEdge(body);
+      if (!result.success) return jsonResponse(result, result.statusCode || 400);
+      return jsonResponse(result);
+    } catch (err: any) {
+      console.error("[server] createMenuItemEdge failed:", err);
+      return errorResponse("Failed to create menu item", 500);
+    }
+  }
+
+  // ── PATCH /api/edge/menu/items/:id — full edit (name, price, printer, GST, etc.) ─
+  if (url.pathname.startsWith("/api/edge/menu/items/") && req.method === "PATCH") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const parts = url.pathname.split("/");
+    const id = parts[parts.length - 1];
+    const body = await req.json().catch(() => ({}));
+
+    try {
+      // Sub-routes: /availability, /venue-availability, /menu-type
+      if (id === "availability" && parts.length >= 5) {
+        const itemId = parts[parts.length - 2];
+        const r = toggleAvailabilityEdge(itemId);
+        return r.success ? jsonResponse(r) : jsonResponse(r, r.statusCode || 400);
+      }
+      if (id === "venue-availability" && parts.length >= 5) {
+        const itemId = parts[parts.length - 2];
+        const r = toggleVenueAvailabilityEdge(itemId, body.venueId);
+        return r.success ? jsonResponse(r) : jsonResponse(r, r.statusCode || 400);
+      }
+      if (id === "menu-type" && parts.length >= 5) {
+        const itemId = parts[parts.length - 2];
+        const r = toggleMenuTypeEdge(itemId, body.printerTarget);
+        return r.success ? jsonResponse(r) : jsonResponse(r, r.statusCode || 400);
+      }
+
+      const result = updateMenuItemEdge(id, body);
+      if (!result.success) return jsonResponse(result, result.statusCode || 400);
+      return jsonResponse(result);
+    } catch (err: any) {
+      console.error("[server] menu item PATCH failed:", err);
+      return errorResponse("Failed to update menu item", 500);
+    }
+  }
+
+  // ── DELETE /api/edge/menu/items/:id — soft-delete menu item ──────────────────
+  if (url.pathname.startsWith("/api/edge/menu/items/") && req.method === "DELETE") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const parts = url.pathname.split("/");
+    const id = parts[parts.length - 1];
+    const body = await req.json().catch(() => ({}));
+    try {
+      const result = deleteMenuItemEdge(id);
+      if (!result.success) return jsonResponse(result, result.statusCode || 400);
+      return jsonResponse(result);
+    } catch (err: any) {
+      console.error("[server] deleteMenuItemEdge failed:", err);
+      return errorResponse("Failed to delete menu item", 500);
+    }
   }
 
   // ── GET /api/edge/config/version — config version metadata for cache validation
