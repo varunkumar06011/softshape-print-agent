@@ -1478,6 +1478,16 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
   ).run();
   reset += deadLetterReset.changes || 0;
 
+  // ── 5a. Clear WAITING_DEPENDENCY markers so records get retried at normal priority
+  // Without this, records that got WAITING_DEPENDENCY are permanently deprioritized
+  // (collectBatch sorts them last) and never get a fair retry after their
+  // dependency syncs. Clear the marker so they return to normal FIFO priority.
+  const waitingDepReset = db.query(
+    `UPDATE sync_queue SET last_error = NULL
+     WHERE synced = 0 AND last_error = 'WAITING_DEPENDENCY'`,
+  ).run();
+  reset += waitingDepReset.changes || 0;
+
   // ── 5b. Backfill missing tables into sync_queue ──────────────────────────
   // During onboarding (config.ts), tables are inserted into the local DB but
   // NOT enqueued to sync_queue — they're assumed to already exist in the cloud.
