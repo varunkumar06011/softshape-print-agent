@@ -415,7 +415,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       const healthResp = {
         status: rmHealth.status,
         service: "softshape-edge-server",
-        version: "23.12.11",
+        version: "23.12.13",
         uptime: process.uptime(),
         runtimeState: rmHealth.runtimeState,
         configSyncState: rmHealth.configSyncState,
@@ -476,7 +476,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const healthResp = {
       status: "ok",
       service: "softshape-edge-server",
-      version: "23.12.11",
+      version: "23.12.13",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
@@ -1039,7 +1039,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         expectedRevision: body.expectedRevision,
         isExtraTable: body.isExtraTable,
       });
-      results.push({ orderItemId: item.orderItemId, success: result.success, error: result.error });
+      results.push({ orderItemId: item.orderItemId, success: result.success, error: result.error, printResult: result.printResult });
     }
 
     const allSuccess = results.every(r => r.success);
@@ -2744,7 +2744,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   // returns the download URL if an update exists. The Host handles the
   // download, binary swap, and restart.
   if (url.pathname === "/api/edge/update-check" && req.method === "GET") {
-    const currentVersion = "23.12.11";
+    const currentVersion = "23.12.13";
     const backendUrl = getBackendUrl();
     const sessionToken = getSessionToken();
 
@@ -3567,6 +3567,47 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     }
 
     return jsonResponse({ success: true, key: newKey });
+  }
+
+  // ── Cloud analytics/reports proxy ────────────────────────────────────────────
+  // Cashier/captain devices that logged in via PIN have an edge-local token,
+  // not a cloud JWT. Direct calls to /api/analytics or /api/reports get 401.
+  // These proxy routes forward the request to the cloud backend's
+  // /api/edge/analytics and /api/edge/reports endpoints (which accept the
+  // agent session token via authenticateEdge), so PIN-logged-in devices can
+  // access analytics and reports without a cloud JWT.
+  if ((url.pathname.startsWith("/api/edge/analytics/") || url.pathname.startsWith("/api/edge/reports/")) && req.method === "GET") {
+    const backendUrl = getBackendUrl();
+    const sessionToken = getSessionToken();
+    if (!backendUrl || !sessionToken) {
+      return errorResponse("Edge server not registered with cloud", 503);
+    }
+    // Inject the edge server's restaurantId as outletId if the caller didn't
+    // provide one — ensures the proxy defaults to this outlet's data.
+    const restaurantId = getRestaurantId();
+    const searchParams = new URLSearchParams(url.search);
+    if (restaurantId && !searchParams.get("outletId")) {
+      searchParams.set("outletId", restaurantId);
+    }
+    const cloudUrl = `${backendUrl}${url.pathname}?${searchParams.toString()}`;
+    try {
+      const cloudRes = await cloudFetch(cloudUrl, {
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${sessionToken}`,
+          "Accept": "application/json",
+        },
+        timeout: 20_000,
+      });
+      const body = await cloudRes.text();
+      return new Response(body, {
+        status: cloudRes.status,
+        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+      });
+    } catch (err: any) {
+      console.warn(`[EdgeServer] Analytics/reports proxy error: ${err?.message}`);
+      return errorResponse("Cloud backend unreachable", 502);
+    }
   }
 
   // ── 404 ─────────────────────────────────────────────────────────────────────

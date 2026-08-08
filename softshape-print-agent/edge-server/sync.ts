@@ -445,6 +445,26 @@ function incrementAttempts(queueIds: number[], error: string): void {
     .run(error, ...queueIds);
 }
 
+// Handle a waiting_dependency outcome. Gives the dependency time to sync, but
+// after WAITING_DEPENDENCY_TIMEOUT_MS starts incrementing attempts so the record
+// eventually gets dead-lettered and surfaced in the recovery UI instead of
+// waiting forever for an order that may never arrive (409 conflict, missing FK,
+// day-closed, etc.).
+const WAITING_DEPENDENCY_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+
+function handleWaitingDependency(queueId: number, error: string): void {
+  const db = getDb();
+  const row = db.query("SELECT created_at FROM sync_queue WHERE id = ?").get(queueId) as { created_at: number } | null;
+  const waitMs = row ? Date.now() - row.created_at : 0;
+  if (waitMs > WAITING_DEPENDENCY_TIMEOUT_MS) {
+    incrementAttempts([queueId], `waiting_dependency (${Math.round(waitMs / 1000)}s) — dependency may never resolve`);
+    console.warn(`[Sync] waiting_dependency timeout: queueId=${queueId} — waiting ${Math.round(waitMs / 1000)}s, incrementing attempts`);
+  } else {
+    db.query("UPDATE sync_queue SET last_error = 'WAITING_DEPENDENCY' WHERE id = ? AND synced = 0").run(queueId);
+    console.log(`[Sync] waiting_dependency: queueId=${queueId} — ${error}`);
+  }
+}
+
 function claimBatch(queueIds: number[]): void {
   if (queueIds.length === 0) return;
   const db = getDb();
@@ -784,10 +804,7 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
                   const item = payloadMap.get(rej.queueId);
                   if (item) insertSyncAudit(rej.queueId, item.tableName, item.recordId, item.operation, rej.outcome, rej.error);
                 } else if (rej.outcome === "waiting_dependency") {
-                  // Don't increment attempts — set WAITING_DEPENDENCY marker
-                  const db = getDb();
-                  db.query("UPDATE sync_queue SET last_error = 'WAITING_DEPENDENCY' WHERE id = ? AND synced = 0").run(rej.queueId);
-                  console.log(`[Sync] waiting_dependency: queueId=${rej.queueId} — ${rej.error}`);
+                  handleWaitingDependency(rej.queueId, rej.error);
                 } else {
                   incrementAttempts([rej.queueId], rej.error);
                 }
@@ -858,13 +875,7 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
           }
           console.warn(`[Sync] ${rej.outcome}: queueId=${rej.queueId} — ${rej.error}`);
         } else if (rej.outcome === "waiting_dependency") {
-          // Dependency not yet synced (e.g. transaction waiting for its order).
-          // Do NOT increment attempts — this is not an error, just an ordering
-          // issue. Set a WAITING_DEPENDENCY marker so collectBatch deprioritizes
-          // it behind other records, giving the dependency a chance to sync first.
-          const db = getDb();
-          db.query("UPDATE sync_queue SET last_error = 'WAITING_DEPENDENCY' WHERE id = ? AND synced = 0").run(rej.queueId);
-          console.log(`[Sync] waiting_dependency: queueId=${rej.queueId} — ${rej.error}`);
+          handleWaitingDependency(rej.queueId, rej.error);
         } else {
           retryIds.push(rej.queueId);
           incrementAttempts([rej.queueId], rej.error);
@@ -1009,6 +1020,10 @@ async function runSyncCycle(): Promise<void> {
     if (now - lastReconcileAt >= RECONCILE_INTERVAL_MS) {
       lastReconcileAt = now;
       try {
+        const orderRecon = reconcileOrders();
+        if (orderRecon.enqueued > 0 || orderRecon.reset > 0) {
+          console.log(`[Sync] Order reconciliation: ${orderRecon.enqueued} re-enqueued, ${orderRecon.reset} dead-letter resets`);
+        }
         const recon = reconcileTransactions();
         if (recon.enqueued > 0 || recon.reset > 0 || recon.backfilled > 0) {
           console.log(`[Sync] Reconciliation: ${recon.enqueued} re-enqueued, ${recon.reset} dead-letter resets, ${recon.backfilled} backfilled from legacy edge_config`);
@@ -1057,6 +1072,10 @@ export function startSyncWorker(): void {
   // the edge was offline (or before this version) are re-enqueued before the
   // first normal sync cycle. Non-blocking — errors don't stop the worker.
   try {
+    const orderRecon = reconcileOrders();
+    if (orderRecon.enqueued > 0 || orderRecon.reset > 0) {
+      console.log(`[Sync] Startup order reconciliation: ${orderRecon.enqueued} re-enqueued, ${orderRecon.reset} dead-letter resets`);
+    }
     const recon = reconcileTransactions();
     if (recon.enqueued > 0 || recon.reset > 0 || recon.backfilled > 0) {
       console.log(`[Sync] Startup reconciliation: ${recon.enqueued} re-enqueued, ${recon.reset} dead-letter resets, ${recon.backfilled} backfilled`);
@@ -1197,6 +1216,71 @@ export function retrySingleDeadLetter(queueId: number): { success: boolean } {
 
 const RECONCILE_INTERVAL_MS = 5 * 60_000; // every 5 minutes
 let lastReconcileAt = 0;
+
+// ─── Reconcile orders: re-enqueue orders that are missing from sync_queue ────
+//
+// Same safety-net pattern as reconcileTransactions(), but for orders.
+// If an order's sync_queue entry was dequeued (cloud returned "duplicate"
+// because the frontend already created it via offline-sync) but the cloud
+// actually doesn't have the complete order (missing items, missing table
+// link), or if the queue row was lost due to a crash, the order will never
+// reach the cloud. This scans order_record for orders where cloud_synced=0
+// and no pending sync_queue row exists, and re-enqueues them.
+//
+// Runs alongside reconcileTransactions() every RECONCILE_INTERVAL_MS.
+
+export function reconcileOrders(): { enqueued: number; reset: number } {
+  const db = getDb();
+  let enqueued = 0;
+  let reset = 0;
+
+  // Find all orders that haven't been confirmed as cloud-synced.
+  const unsyncedOrders = db.query(
+    `SELECT id FROM order_record
+     WHERE cloud_synced = 0 AND is_deleted = 0`,
+  ).all() as Array<{ id: string }>;
+
+  for (const order of unsyncedOrders) {
+    const pendingRow = db.query(
+      "SELECT id, synced, attempts FROM sync_queue WHERE table_name = 'order' AND record_id = ? ORDER BY id DESC LIMIT 1",
+    ).get(order.id) as { id: number; synced: number; attempts: number } | null;
+
+    if (!pendingRow) {
+      // No queue row at all — re-enqueue. Skip if last audit outcome was
+      // "duplicate" (cloud already has this order) to avoid infinite cycles.
+      const auditRow = db.query(
+        "SELECT outcome FROM sync_audit WHERE table_name = 'order' AND record_id = ? ORDER BY audited_at DESC LIMIT 1",
+      ).get(order.id) as { outcome: string } | null;
+      if (auditRow?.outcome === "duplicate") continue;
+
+      db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('order', ?, 'insert', ?)")
+        .run(order.id, Date.now());
+      enqueued++;
+      continue;
+    }
+
+    if (pendingRow.synced === 1) {
+      // Dequeued. If rejected/conflict (not duplicate), re-enqueue.
+      const auditRow = db.query(
+        "SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'order' ORDER BY audited_at DESC LIMIT 1",
+      ).get(pendingRow.id) as { outcome: string } | null;
+      if (auditRow && ["rejected", "conflict"].includes(auditRow.outcome)) {
+        db.query("INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES ('order', ?, 'insert', ?)")
+          .run(order.id, Date.now());
+        enqueued++;
+      }
+      continue;
+    }
+
+    // synced = 0 — still in queue. Reset dead-lettered rows.
+    if (pendingRow.attempts >= MAX_ATTEMPTS) {
+      db.query("UPDATE sync_queue SET attempts = 0, last_error = NULL WHERE id = ?").run(pendingRow.id);
+      reset++;
+    }
+  }
+
+  return { enqueued, reset };
+}
 
 export function reconcileTransactions(): { enqueued: number; reset: number; backfilled: number } {
   const db = getDb();
