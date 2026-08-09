@@ -520,10 +520,10 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
 
     // ── Sections ─────────────────────────────────────────────────────────────
     for (const s of config.sections ?? []) {
-      db.query(`INSERT INTO section (id, name, restaurant_id, floor_id, venue_id, sort_order, synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, unixepoch())
-        ON CONFLICT(id) DO UPDATE SET name=excluded.name, floor_id=excluded.floor_id, venue_id=excluded.venue_id, sort_order=excluded.sort_order, synced_at=unixepoch()
-      `).run(s.id, s.name, s.restaurantId, s.floorId || null, s.venueId || null, s.sortOrder || 0);
+      db.query(`INSERT INTO section (id, name, restaurant_id, floor_id, venue_id, sort_order, is_default, synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch())
+        ON CONFLICT(id) DO UPDATE SET name=excluded.name, floor_id=excluded.floor_id, venue_id=excluded.venue_id, sort_order=excluded.sort_order, is_default=excluded.is_default, synced_at=unixepoch()
+      `).run(s.id, s.name, s.restaurantId, s.floorId || null, s.venueId || null, s.sortOrder || 0, s.isDefault ? 1 : 0);
       totalRows++;
     }
 
@@ -1071,10 +1071,10 @@ function applyChange(db: any, change: any): boolean {
 
     // ── Section ─────────────────────────────────────────────────────────────
     case "section":
-      db.query(`INSERT INTO section (id, name, restaurant_id, floor_id, venue_id, sort_order, synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, unixepoch())
-        ON CONFLICT(id) DO UPDATE SET name=excluded.name, floor_id=excluded.floor_id, venue_id=excluded.venue_id, sort_order=excluded.sort_order, synced_at=unixepoch()
-      `).run(row.id, row.name, row.restaurantId, row.floorId || null, row.venueId || null, row.sortOrder || 0);
+      db.query(`INSERT INTO section (id, name, restaurant_id, floor_id, venue_id, sort_order, is_default, synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch())
+        ON CONFLICT(id) DO UPDATE SET name=excluded.name, floor_id=excluded.floor_id, venue_id=excluded.venue_id, sort_order=excluded.sort_order, is_default=excluded.is_default, synced_at=unixepoch()
+      `).run(row.id, row.name, row.restaurantId, row.floorId || null, row.venueId || null, row.sortOrder || 0, row.isDefault ? 1 : 0);
       return true;
 
     // ── Table ───────────────────────────────────────────────────────────────

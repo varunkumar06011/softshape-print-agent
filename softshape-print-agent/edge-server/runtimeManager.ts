@@ -268,22 +268,13 @@ class RuntimeManager {
     // The sync worker is always started — it handles session refresh internally
     // (refreshCloudSession) and will retry automatically when the JWT expires.
     // Socket sync and heartbeat require a valid session at startup.
-    const lockResult = acquireInstanceLock();
+    const lockResult = this.startBackgroundServices("startup", isSessionValid());
     if (!lockResult.acquired) {
       runtimeLog.warn("Instance lock held by another instance — sync services disabled", {
         holder: lockResult.holder?.instanceId,
       });
-    } else {
-      startHeartbeatLoop();
-      startSyncWorker();
-      if (isSessionValid()) {
-        startSocketSync();
-        startHeartbeat();
-        this.startIncrementalPolling();
-        runtimeLog.info("Background sync services started");
-      } else {
-        runtimeLog.info("Sync worker started with invalid session — will attempt refresh on next cycle");
-      }
+    } else if (!isSessionValid()) {
+      runtimeLog.info("Sync worker started with invalid session — will attempt refresh on next cycle");
     }
 
     // ── Step 5: If session valid and config not yet downloaded, trigger sync ──
@@ -329,6 +320,39 @@ class RuntimeManager {
     // ── Step 8: Start background timers ──────────────────────────────────────
     this.startMaintenanceTimers();
     this.startConnectionMonitor();
+  }
+
+  private startBackgroundServices(reason: string, startCloudServices: boolean): ReturnType<typeof acquireInstanceLock> {
+    const lockResult = acquireInstanceLock();
+    if (!lockResult.acquired) return lockResult;
+
+    startHeartbeatLoop();
+    startSyncWorker();
+    if (startCloudServices) {
+      startSocketSync();
+      startHeartbeat();
+      this.startIncrementalPolling();
+    }
+    runtimeLog.info("Background sync services started", {
+      reason,
+      restaurantId: getRestaurantId(),
+      deviceId: getDeviceId(),
+    });
+    return lockResult;
+  }
+
+  // Start services after a cloud registration completes. RuntimeManager is the
+  // single owner of the instance lock and background service lifecycle.
+  onSessionRegistered(): ReturnType<typeof acquireInstanceLock> {
+    const lockResult = this.startBackgroundServices("registration", true);
+    if (!lockResult.acquired) {
+      runtimeLog.warn("Registered session but instance lock is owned by another instance", {
+        holder: lockResult.holder?.instanceId,
+        restaurantId: getRestaurantId(),
+        deviceId: getDeviceId(),
+      });
+    }
+    return lockResult;
   }
 
   // ── Config sync pipeline ────────────────────────────────────────────────────

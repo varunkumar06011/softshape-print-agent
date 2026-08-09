@@ -67,22 +67,65 @@ interface SyncPayloadItem {
 
 function collectBatch(): SyncQueueRow[] {
   const db = getDb();
-  // Simple FIFO — oldest first. Orders are created before transactions
-  // (customer sits → order, customer pays → transaction), so FIFO naturally
-  // syncs orders before their dependent transactions.
-  // Only WAITING_DEPENDENCY records are deprioritized (they'll be retried
-  // after the dependency has a chance to sync).
+  // Do not send child records until their local parent has been acknowledged
+  // by the cloud. This makes dependency ordering explicit instead of relying
+  // on queue insertion timing or batch ordering.
   return db.query(`
-    SELECT * FROM sync_queue
-    WHERE synced = 0
-    ORDER BY
-      CASE
-        WHEN last_error = 'WAITING_DEPENDENCY' THEN 1
-        ELSE 0
-      END,
-      created_at ASC, id ASC
+    SELECT sq.*
+    FROM sync_queue sq
+    WHERE sq.synced = 0
+      AND sq.attempts < ?
+      AND (sq.last_error IS NULL OR sq.last_error NOT LIKE 'DEAD_LETTER:%')
+      AND NOT (
+        sq.table_name IN ('order_item', 'kot', 'transaction')
+        AND EXISTS (
+          SELECT 1
+          FROM transaction_record tr
+          WHERE sq.table_name = 'transaction'
+            AND tr.id = sq.record_id
+            AND tr.order_id IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM order_record o
+              WHERE o.id = tr.order_id AND o.cloud_synced = 1
+            )
+        )
+      )
+      AND NOT (
+        sq.table_name = 'order_item'
+        AND EXISTS (
+          SELECT 1 FROM order_item oi
+          WHERE oi.id = sq.record_id
+            AND NOT EXISTS (
+              SELECT 1 FROM order_record o
+              WHERE o.id = oi.order_id AND o.cloud_synced = 1
+            )
+        )
+      )
+      AND NOT (
+        sq.table_name = 'kot'
+        AND EXISTS (
+          SELECT 1 FROM kot k
+          WHERE k.id = sq.record_id
+            AND NOT EXISTS (
+              SELECT 1 FROM order_record o
+              WHERE o.id = k.order_id AND o.cloud_synced = 1
+            )
+        )
+      )
+      AND NOT (
+        sq.table_name = 'kot_item'
+        AND EXISTS (
+          SELECT 1 FROM kot_item ki
+          WHERE ki.id = sq.record_id
+            AND NOT EXISTS (
+              SELECT 1 FROM kot k
+              WHERE k.id = ki.kot_id AND k.cloud_synced = 1
+            )
+        )
+      )
+    ORDER BY sq.created_at ASC, sq.id ASC
     LIMIT ?
-  `).all(MAX_BATCH_SIZE) as SyncQueueRow[];
+  `).all(MAX_ATTEMPTS, MAX_BATCH_SIZE) as SyncQueueRow[];
 }
 
 // ─── Load the full record data for a sync queue entry ────────────────────────
@@ -220,6 +263,7 @@ function loadRecordData(tableName: string, recordId: string): any | null {
         floorId: s.floor_id,
         sortOrder: s.sort_order,
         isActive: !!s.is_active,
+        isDefault: !!s.is_default,
       };
     }
 
@@ -445,24 +489,12 @@ function incrementAttempts(queueIds: number[], error: string): void {
     .run(error, ...queueIds);
 }
 
-// Handle a waiting_dependency outcome. Gives the dependency time to sync, but
-// after WAITING_DEPENDENCY_TIMEOUT_MS starts incrementing attempts so the record
-// eventually gets dead-lettered and surfaced in the recovery UI instead of
-// waiting forever for an order that may never arrive (409 conflict, missing FK,
-// day-closed, etc.).
-const WAITING_DEPENDENCY_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-
+// Park dependency failures without consuming transient retry attempts. The
+// dependency-aware collector will release the row once its parent is synced.
 function handleWaitingDependency(queueId: number, error: string): void {
   const db = getDb();
-  const row = db.query("SELECT created_at FROM sync_queue WHERE id = ?").get(queueId) as { created_at: number } | null;
-  const waitMs = row ? Date.now() - row.created_at : 0;
-  if (waitMs > WAITING_DEPENDENCY_TIMEOUT_MS) {
-    incrementAttempts([queueId], `waiting_dependency (${Math.round(waitMs / 1000)}s) — dependency may never resolve`);
-    console.warn(`[Sync] waiting_dependency timeout: queueId=${queueId} — waiting ${Math.round(waitMs / 1000)}s, incrementing attempts`);
-  } else {
-    db.query("UPDATE sync_queue SET last_error = 'WAITING_DEPENDENCY' WHERE id = ? AND synced = 0").run(queueId);
-    console.log(`[Sync] waiting_dependency: queueId=${queueId} — ${error}`);
-  }
+  db.query("UPDATE sync_queue SET last_error = 'WAITING_DEPENDENCY' WHERE id = ? AND synced = 0").run(queueId);
+  console.log(`[Sync] waiting_dependency: queueId=${queueId} — ${error}`);
 }
 
 function claimBatch(queueIds: number[]): void {
@@ -1546,33 +1578,7 @@ export function reconcileTransactions(): { enqueued: number; reset: number; back
     enqueued++;
   }
 
-  // ── 5. General dead-letter reset for all record types ─────────────────────
-  // Records that failed 5 attempts get the DEAD_LETTER: prefix and are
-  // excluded from collectBatch(). Without a reset, they stay permanently
-  // stuck — even after the underlying issue (network outage, cloud 500,
-  // transient error) resolves.
-  //
-  // This step resets ALL dead-lettered rows (any table_name) so the normal
-  // sync worker picks them up again. It runs every RECONCILE_INTERVAL_MS (5
-  // minutes), giving the underlying issue time to resolve while ensuring no
-  // record is permanently stuck.
-  const deadLetterReset = db.query(
-    `UPDATE sync_queue SET attempts = 0, last_error = NULL
-     WHERE synced = 0 AND last_error LIKE 'DEAD_LETTER:%'`,
-  ).run();
-  reset += deadLetterReset.changes || 0;
-
-  // ── 5a. Clear WAITING_DEPENDENCY markers so records get retried at normal priority
-  // Without this, records that got WAITING_DEPENDENCY are permanently deprioritized
-  // (collectBatch sorts them last) and never get a fair retry after their
-  // dependency syncs. Clear the marker so they return to normal FIFO priority.
-  const waitingDepReset = db.query(
-    `UPDATE sync_queue SET last_error = NULL
-     WHERE synced = 0 AND last_error = 'WAITING_DEPENDENCY'`,
-  ).run();
-  reset += waitingDepReset.changes || 0;
-
-  // ── 5b. Backfill missing tables into sync_queue ──────────────────────────
+  // ── 5. Backfill missing tables into sync_queue ──────────────────────────
   // During onboarding (config.ts), tables are inserted into the local DB but
   // NOT enqueued to sync_queue — they're assumed to already exist in the cloud.
   // However, if the cloud DB was reset or tables were deleted, orders/KOTs

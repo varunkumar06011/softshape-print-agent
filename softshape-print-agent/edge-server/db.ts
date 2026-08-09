@@ -316,6 +316,7 @@ function initSchema(database: Database) {
       venue_id        TEXT,
       sort_order      INTEGER DEFAULT 0,
       is_active       INTEGER DEFAULT 1,
+      is_default      INTEGER DEFAULT 0,
       synced_at       INTEGER NOT NULL DEFAULT (unixepoch())
     );
     CREATE INDEX IF NOT EXISTS idx_section_restaurant ON section(restaurant_id);

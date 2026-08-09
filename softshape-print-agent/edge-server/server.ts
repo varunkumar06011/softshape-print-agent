@@ -60,12 +60,12 @@ import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enque
 import os from "os";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getSessionToken, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { pullIncrementalChanges } from "./config.ts";
-import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
+import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, printWalkinBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
 import { createMenuItemEdge, updateMenuItemEdge, deleteMenuItemEdge, toggleAvailabilityEdge, toggleVenueAvailabilityEdge, toggleMenuTypeEdge } from "./menuService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders } from "./reads.ts";
-import { startSyncWorker, getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
-import { startSocketSync, getSocketStatus, startHeartbeat } from "./socketSync.ts";
-import { acquireInstanceLock, startHeartbeatLoop, forceReleaseLock, getLockStatus } from "./instanceLock.ts";
+import { getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
+import { getSocketStatus } from "./socketSync.ts";
+import { forceReleaseLock, getLockStatus } from "./instanceLock.ts";
 import { cloudFetch } from "./cloudFetch.ts";
 import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount, setClientRegistered, lanBroadcast } from "./lanBroadcast.ts";
 import { printToPrinter, resolvePrinterName } from "./printer.ts";
@@ -415,7 +415,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       const healthResp = {
         status: rmHealth.status,
         service: "softshape-edge-server",
-        version: "23.12.13",
+        version: "23.12.14",
         uptime: process.uptime(),
         runtimeState: rmHealth.runtimeState,
         configSyncState: rmHealth.configSyncState,
@@ -476,7 +476,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const healthResp = {
       status: "ok",
       service: "softshape-edge-server",
-      version: "23.12.13",
+      version: "23.12.14",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
@@ -711,6 +711,9 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   if (url.pathname === "/api/edge/register" && req.method === "POST") {
     const body = await req.json().catch(() => ({}));
     const { setupToken, restaurantCode, backendUrl } = body;
+    const normalizedRestaurantCode = typeof restaurantCode === "string"
+      ? restaurantCode.trim().toUpperCase()
+      : restaurantCode;
 
     if (!setupToken || !backendUrl) {
       return errorResponse("setupToken and backendUrl are required");
@@ -743,7 +746,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         body: JSON.stringify({
           agentId: getDeviceId(),
           printerMapping: {},
-          ...(restaurantCode ? { restaurantCode } : {}),
+          ...(normalizedRestaurantCode ? { restaurantCode: normalizedRestaurantCode } : {}),
           ...(lanIp ? { lanIp } : {}),
         }),
         timeout: 30_000,
@@ -792,29 +795,14 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       }
       if (edgeApiKey) saveEdgeApiKey(edgeApiKey);
 
-      // Start background sync services now that we have a valid session.
-      // On first boot (no prior session), these don't start at process init.
-      // Without this, the edge server has no heartbeat to cloud and no
-      // incremental sync until the process restarts.
-      try {
-        const lockResult = acquireInstanceLock();
-        if (lockResult.acquired) {
-          startHeartbeatLoop();
-          startSyncWorker();
-          startSocketSync();
-          startHeartbeat();
-          console.log("[register] Background sync services started");
-        } else {
-          console.warn(`[register] Could not start sync services — instance lock held by ${lockResult.holder?.instanceId}`);
-        }
-      } catch (syncStartErr: any) {
-        console.warn("[register] Failed to start background sync services:", syncStartErr.message);
+      // RuntimeManager owns the lock and all background service lifecycles.
+      // Config sync remains explicit via /api/edge/config/sync to avoid racing
+      // the frontend's post-registration request.
+      const serviceStart = runtimeManager.onSessionRegistered();
+      if (!serviceStart.acquired) {
+        const holder = serviceStart.holder?.instanceId || "unknown";
+        return errorResponse(`Another edge instance is active (${holder}). Stop it or release the instance lock, then register again.`, 409);
       }
-
-      // Config sync is triggered explicitly by the frontend via
-      // /api/edge/config/sync after registration succeeds. Do NOT kick it
-      // off here — that creates a race condition where the frontend's call
-      // hits the sync mutex and gets rejected.
 
       return jsonResponse({
         success: true,
@@ -1116,6 +1104,34 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       expectedRevision: body.expectedRevision,
     });
     if (!result.success) return errorResponse(result.error || "Print bill failed", 400);
+    return jsonResponse(result);
+  }
+
+  // ── POST /api/edge/print/walkin-bill — assign bill number + print walk-in bill ─
+  if (url.pathname === "/api/edge/print/walkin-bill" && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("No valid session", 401);
+    const body = await req.json().catch(() => ({}));
+    const validationError = validateFields(body, { restaurantId: "string", tableNumber: "string", items: "array" });
+    if (validationError) return errorResponse(validationError, 400);
+    const result = await printWalkinBillEdge({
+      restaurantId: body.restaurantId,
+      tableNumber: body.tableNumber,
+      items: body.items,
+      subtotal: body.subtotal,
+      grandTotal: body.grandTotal,
+      cgst: body.cgst,
+      sgst: body.sgst,
+      discountPercent: body.discountPercent,
+      discountAmount: body.discountAmount,
+      sectionTag: body.sectionTag,
+      sectionName: body.sectionName,
+      captain: body.captain,
+      localPrinted: body.localPrinted,
+      billEventId: body.billEventId,
+      requestId: body.requestId,
+      deviceId: body.deviceId,
+    });
+    if (!result.success) return errorResponse(result.error || "Walk-in bill print failed", 400);
     return jsonResponse(result);
   }
 
@@ -2499,7 +2515,27 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     });
   }
 
-  // ── POST /api/edge/sync/retry — retry dead-lettered records ────────────────
+  // ── Dead-letter recovery endpoints ─────────────────────────────────────────
+  // These endpoints power the cashier recovery UI when operators do not have
+  // access to edge-server logs.
+  if (url.pathname === "/api/edge/sync/dead-letter" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const records = getDeadLetterRecords();
+    return jsonResponse({ count: records.length, records });
+  }
+
+  const deadLetterMatch = url.pathname.match(/^\/api\/edge\/sync\/dead-letter\/(\d+)\/(retry|discard)$/);
+  if (deadLetterMatch && req.method === "POST") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const queueId = Number(deadLetterMatch[1]);
+    const action = deadLetterMatch[2];
+    const result = action === "retry"
+      ? retrySingleDeadLetter(queueId)
+      : discardDeadLetter(queueId);
+    return jsonResponse(result);
+  }
+
+  // ── POST /api/edge/sync/retry — retry all dead-lettered records ─────────────
   if (url.pathname === "/api/edge/sync/retry" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const result = retryDeadLetters();
@@ -2744,7 +2780,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   // returns the download URL if an update exists. The Host handles the
   // download, binary swap, and restart.
   if (url.pathname === "/api/edge/update-check" && req.method === "GET") {
-    const currentVersion = "23.12.13";
+    const currentVersion = "23.12.14";
     const backendUrl = getBackendUrl();
     const sessionToken = getSessionToken();
 
@@ -2960,10 +2996,12 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     return jsonResponse({ success: true, eventId, message: "Test print dispatched" });
   }
 
-  // ── POST /api/edge/onboard — 4-step offline onboarding ─────────────────────
-  // Creates the full local dataset from the QuickOnboarding wizard.
-  // No session required — this is the initial setup flow.
+  // ── POST /api/edge/onboard — retired ───────────────────────────────────────
+  // Quick Onboarding is retired. Cloud onboarding plus /api/edge/register is
+  // the only supported setup path; local-onboard sessions cannot sync to cloud.
   if (url.pathname === "/api/edge/onboard" && req.method === "POST") {
+    return errorResponse("Quick Onboarding is retired. Register the edge through Admin → Printers.", 410);
+
     let body: any;
     try {
       body = await req.json();
@@ -3085,22 +3123,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
           setConfig('printer_config', JSON.stringify({ printers, availablePrinters }));
         }
 
-        // 7. Save session so the edge server is "registered" locally
-        saveSession({
-          sessionToken: `local-onboard-${Date.now()}`,
-          restaurantId,
-          restaurantName,
-          restaurantCode,
-          backendUrl: getBackendUrl() || '',
-          expiresAt: 0, // no expiry for local onboarding
-        });
-
-        // 8. Mark local config as complete so isLocalReady() returns true
-        setSyncState("config_sync_completed", "true");
-
-        // 9. Invalidate the setup nonce inside the transaction so it can't
-        //    be reused. If the transaction rolls back, the nonce is restored.
-        invalidateSetupNonce();
+        throw new Error("Quick Onboarding is retired; use cloud registration through Admin → Printers");
 
         return { userId, numTables, template };
       });

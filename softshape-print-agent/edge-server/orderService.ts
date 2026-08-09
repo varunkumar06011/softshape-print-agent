@@ -2174,6 +2174,212 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
   return result;
 }
 
+// ─── Print Walk-in Bill (no order, no table — edge-first like dine-in) ───────
+// Mirrors printBillEdge but for walk-in/takeaway orders that have no order_record.
+// Assigns a sequential bill number (same counter as dine-in), builds ESC/POS,
+// dispatches via the durable print queue, and returns the bill number so the
+// frontend can pass it to saveTransactionEdge.
+
+export interface PrintWalkinBillInput {
+  restaurantId: string;
+  tableNumber: string;
+  items: Array<{ name: string; quantity: number; price: number; menuType?: string; notes?: string | null; gstEnabled?: boolean }>;
+  subtotal: number;
+  grandTotal: number;
+  cgst?: number;
+  sgst?: number;
+  discountPercent?: number;
+  discountAmount?: number;
+  sectionTag?: string | null;
+  sectionName?: string | null;
+  captain?: string;
+  localPrinted?: boolean;
+  billEventId?: string;
+  requestId?: string;
+  deviceId?: string;
+}
+
+export async function printWalkinBillEdge(input: PrintWalkinBillInput): Promise<{ success: boolean; error?: string; billNumber?: string; printResults?: any[]; printPending?: boolean }> {
+  const db = getDb();
+  const { restaurantId, localPrinted } = input;
+
+  // ── Phase 1: Durable idempotency check via command_log ────────────────────
+  const idemKey = input.requestId || `walkin-bill-${input.tableNumber}-${input.items.length}-${Date.now()}`;
+  const idem = checkCommandIdempotency<{ success: boolean; error?: string; billNumber?: string; printResults?: any[]; printPending?: boolean }>(restaurantId, input, "printWalkinBill", idemKey);
+  if (idem.replay && idem.result) {
+    return idem.result;
+  }
+
+  const outlet = getOutlet(restaurantId);
+  if (!outlet) {
+    const rejectResult = { success: false, error: "Outlet not found in local DB" };
+    recordCommandResult(restaurantId, input, "printWalkinBill", "walkin", idemKey, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
+  }
+
+  // Assign sequential bill number (same daily counter as dine-in printBillEdge)
+  const billNumber = getNextBillNumber(restaurantId);
+
+  // If the frontend already printed locally, skip edge printing — just assign bill number
+  if (localPrinted) {
+    const result = { success: true, billNumber, printResults: [] as any[] };
+    recordCommandResult(restaurantId, input, "printWalkinBill", "walkin", idemKey, "applied", result);
+    return result;
+  }
+
+  // Normalise items
+  const billItems = input.items.map(item => {
+    const mt = ((item.menuType || "FOOD") as string).toUpperCase() as "FOOD" | "LIQUOR";
+    return {
+      name: item.name || "Unknown",
+      quantity: Math.max(0, Math.round(Number(item.quantity || 0))),
+      price: Number(item.price || 0),
+      amount: Number(item.price || 0) * Math.max(0, Math.round(Number(item.quantity || 0))),
+      menuType: mt,
+      gstEnabled: mt === "LIQUOR" ? false : item.gstEnabled !== false,
+      notes: item.notes || null,
+    };
+  });
+
+  // Group identical items (by name + price + notes) — same as printBillEdge
+  const groupedBillItems = (() => {
+    const map = new Map<string, { name: string; quantity: number; price: number; amount: number; menuType: "FOOD" | "LIQUOR"; gstEnabled: boolean; notes: string | null }>();
+    for (const item of billItems) {
+      const key = `${item.name}::${item.price}::${item.notes ?? ""}`;
+      const existing = map.get(key);
+      if (existing) {
+        existing.quantity += item.quantity;
+        existing.amount += item.amount;
+      } else {
+        map.set(key, { ...item });
+      }
+    }
+    return Array.from(map.values());
+  })();
+
+  // Calculate totals (same logic as printBillEdge active-order path + cloud final-bill-emit)
+  const foodItems = groupedBillItems.filter(i => i.menuType === "FOOD");
+  const liquorItems = groupedBillItems.filter(i => i.menuType !== "FOOD");
+  const foodSubtotal = foodItems.reduce((s, i) => s + i.amount, 0);
+  const liquorSubtotal = liquorItems.reduce((s, i) => s + i.amount, 0);
+  const subtotal = foodSubtotal + liquorSubtotal;
+
+  const gstExemptFood = foodItems.filter(i => i.gstEnabled === false).reduce((s, i) => s + i.amount, 0);
+  const gstExemptLiquor = liquorItems.filter(i => i.gstEnabled === false).reduce((s, i) => s + i.amount, 0);
+  const gstExemptTotal = gstExemptFood + gstExemptLiquor;
+
+  const discountPercent = Number(input.discountPercent || 0);
+  const discountAmount = discountPercent > 0
+    ? Math.round(subtotal * (discountPercent / 100) * 100) / 100
+    : 0;
+  const discount = discountPercent > 0 && discountAmount > 0
+    ? { percent: discountPercent, amount: discountAmount }
+    : undefined;
+
+  const discountedSubtotal = Math.max(0, subtotal - discountAmount);
+  const gstExemptAfterDiscount = Math.max(0, gstExemptTotal - (discountAmount > 0 && subtotal > 0 ? discountAmount * (gstExemptTotal / subtotal) : 0));
+  const taxableAmount = Math.max(0, discountedSubtotal - gstExemptAfterDiscount);
+
+  const effectiveRate = getEffectiveGstRate(outlet.gst_rate, outlet.gst_category, outlet.gst_registered);
+  const gstBreakdown = getGstBreakdownWithRate(taxableAmount, effectiveRate, !!outlet.prices_include_gst);
+  const cgst = input.cgst != null ? Number(input.cgst) : gstBreakdown.cgst;
+  const sgst = input.sgst != null ? Number(input.sgst) : gstBreakdown.sgst;
+  const tax = cgst + sgst;
+
+  const scPercent = Number(outlet.service_charge_percent || 0);
+  const serviceChargeAmount = scPercent > 0
+    ? (discountedSubtotal + tax) * (scPercent / 100)
+    : 0;
+
+  const rawGrandTotal = Math.max(0, discountedSubtotal + tax + serviceChargeAmount);
+  const grandTotal = Math.round(rawGrandTotal);
+  const roundOff = Math.round((grandTotal - rawGrandTotal) * 100) / 100;
+
+  // Format date/time in IST
+  const now = new Date();
+  const dateStr = now.toLocaleDateString("en-IN", { day: "2-digit", month: "2-digit", year: "numeric", timeZone: "Asia/Kolkata" });
+  const timeStr = now.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "Asia/Kolkata" });
+
+  // Build BillData and render via renderFinalBill (same renderer as dine-in)
+  const billData: BillData = {
+    billNumber,
+    date: dateStr,
+    time: timeStr,
+    kotNumbers: [],
+    tableNumber: String(input.tableNumber),
+    captain: input.captain || "Walk-in",
+    items: groupedBillItems,
+    subtotal,
+    discount,
+    serviceCharge: scPercent > 0 ? { percent: scPercent, amount: serviceChargeAmount } : undefined,
+    tax: { cgst, sgst, total: tax },
+    grandTotal,
+    roundOff,
+    section: input.sectionName || "Walk-in",
+    sectionTag: input.sectionTag || undefined,
+    itemCount: groupedBillItems.length,
+    qtyCount: groupedBillItems.reduce((s, i) => s + i.quantity, 0),
+    ...(outlet.gstin ? { gstIn: outlet.gstin } : {}),
+    restaurant: {
+      name: outlet.name,
+      receiptHeader: outlet.receipt_header,
+      receiptSubHeader: outlet.receipt_sub_header,
+      address: outlet.address,
+      phone: outlet.phone,
+      gstin: outlet.gstin,
+    },
+  };
+
+  const escposData = buildFinalBill(billData);
+
+  // Resolve bill printer — same pattern as printBillEdge
+  const printerConfig = outlet.printerConfig || {};
+  const billPrinterName = resolvePrinterName(null, "BILL_PRINTER", null, printerConfig);
+
+  const billGroup: PrintGroup = { printerName: billPrinterName || null, escposData, type: "BILL" };
+  const eventId = input.billEventId || `WALKIN-BILL-${idemKey}-${Date.now()}`;
+
+  const printResults: any[] = [];
+  if (escposData.length === 0) {
+    printResults.push({ ok: false, printerName: billPrinterName || "unknown", bytes: 0, error: "No print data", method: "noop" });
+  } else {
+    createPrintJob({
+      eventId,
+      restaurantId,
+      orderId: "",
+      kotId: null,
+      kotNumber: null,
+      tableId: null,
+      printerName: billPrinterName || null,
+      jobType: "BILL",
+      escposData,
+      itemSummary: [],
+      captainName: null,
+    });
+    let result: any;
+    try {
+      result = await awaitDispatchBounded(eventId, billGroup, input.requestId);
+    } catch (e: any) {
+      result = { ok: false, printerName: billPrinterName || "unknown", bytes: 0, error: e?.message || "Dispatch threw", method: "durable_queued", eventId };
+    }
+    printResults.push({
+      ok: result.ok ?? false,
+      printerName: result.printerName || billPrinterName || "unknown",
+      bytes: result.bytes || 0,
+      error: result.error,
+      method: result.method || "durable_queued",
+      eventId,
+      pending: result.pending,
+    });
+  }
+
+  // Bill number is assigned + print job is persisted in SQLite queue.
+  // Always return success=true — the print will complete (either instantly or via background retry).
+  const result = { success: true, billNumber, printResults };
+  recordCommandResult(restaurantId, input, "printWalkinBill", "walkin", idemKey, "applied", result);
+  return result;
+}
+
 // ─── Settle Order (mark as settled, free the table) ───────────────────────────
 
 export interface SettleOrderInput {
