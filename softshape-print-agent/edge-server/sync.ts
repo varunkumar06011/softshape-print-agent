@@ -19,7 +19,7 @@
 //   - Emit socket events for real-time dashboard updates
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, insertSyncAudit, recordSyncMetric, getSyncAlerts, getTransactionRecord, markTransactionRecordSynced } from "./db.ts";
+import { getDb, insertSyncAudit, recordSyncMetric, getSyncAlerts, getTransactionRecord, markTransactionRecordSynced, enqueueSync } from "./db.ts";
 import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid, getDeviceId, saveSession, loadSession } from "./auth.ts";
 import { cloudFetch } from "./cloudFetch.ts";
 import { pullIncrementalChanges } from "./config.ts";
@@ -517,6 +517,53 @@ function handleWaitingDependency(queueId: number, error: string): void {
   console.log(`[Sync] waiting_dependency: queueId=${queueId} — ${error}`);
 }
 
+// When the cloud returns waiting_dependency for a child record, the parent
+// (order/kot) may be marked cloud_synced=1 locally but actually missing from
+// the cloud DB (e.g. after a cloud DB reset, partial sync, or environment
+// mismatch). Without re-pushing the parent, the child is permanently stuck
+// because collectBatch() trusts the local cloud_synced flag. This detects that
+// deadlock and re-enqueues the parent so it gets re-pushed on the next cycle.
+function reenqueueStaleParent(tableName: string, recordId: string): void {
+  const db = getDb();
+
+  const resetOrder = (orderId: string): void => {
+    const order = db.query("SELECT cloud_synced FROM order_record WHERE id = ?").get(orderId) as any;
+    if (order && order.cloud_synced === 1) {
+      db.query("UPDATE order_record SET cloud_synced = 0 WHERE id = ?").run(orderId);
+      enqueueSync("order", orderId, "update");
+      console.warn(`[Sync] Re-enqueued stale parent order ${orderId} (was marked synced but cloud reports missing)`);
+    }
+  };
+
+  const resetKot = (kotId: string): void => {
+    const kot = db.query("SELECT cloud_synced, order_id FROM kot WHERE id = ?").get(kotId) as any;
+    if (kot && kot.cloud_synced === 1) {
+      db.query("UPDATE kot SET cloud_synced = 0 WHERE id = ?").run(kotId);
+      enqueueSync("kot", kotId, "update");
+      console.warn(`[Sync] Re-enqueued stale parent kot ${kotId} (was marked synced but cloud reports missing)`);
+      // Also re-enqueue the kot's order so the kot's FK resolves on the cloud.
+      if (kot.order_id) resetOrder(kot.order_id);
+    }
+  };
+
+  try {
+    if (tableName === "transaction" || tableName === "walkin_transaction") {
+      const tr = db.query("SELECT order_id FROM transaction_record WHERE id = ?").get(recordId) as any;
+      if (tr && tr.order_id) resetOrder(tr.order_id);
+    } else if (tableName === "order_item") {
+      const oi = db.query("SELECT order_id FROM order_item WHERE id = ?").get(recordId) as any;
+      if (oi && oi.order_id) resetOrder(oi.order_id);
+    } else if (tableName === "kot") {
+      resetKot(recordId);
+    } else if (tableName === "kot_item") {
+      const ki = db.query("SELECT kot_id FROM kot_item WHERE id = ?").get(recordId) as any;
+      if (ki && ki.kot_id) resetKot(ki.kot_id);
+    }
+  } catch (err: any) {
+    console.error(`[Sync] reenqueueStaleParent failed for ${tableName}/${recordId}: ${err.message || err}`);
+  }
+}
+
 function claimBatch(queueIds: number[]): void {
   if (queueIds.length === 0) return;
   const db = getDb();
@@ -862,6 +909,8 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
                   if (item) insertSyncAudit(rej.queueId, item.tableName, item.recordId, item.operation, rej.outcome, rej.error);
                 } else if (rej.outcome === "waiting_dependency") {
                   handleWaitingDependency(rej.queueId, rej.error);
+                  const item = payloadMap.get(rej.queueId);
+                  if (item) reenqueueStaleParent(item.tableName, item.recordId);
                 } else {
                   incrementAttempts([rej.queueId], rej.error);
                 }
@@ -933,6 +982,8 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
           console.warn(`[Sync] ${rej.outcome}: queueId=${rej.queueId} — ${rej.error}`);
         } else if (rej.outcome === "waiting_dependency") {
           handleWaitingDependency(rej.queueId, rej.error);
+          const item = payloadMap.get(rej.queueId);
+          if (item) reenqueueStaleParent(item.tableName, item.recordId);
         } else {
           retryIds.push(rej.queueId);
           incrementAttempts([rej.queueId], rej.error);
