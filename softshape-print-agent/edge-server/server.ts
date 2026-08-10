@@ -310,6 +310,147 @@ function invalidateSetupNonce(): void {
   db.query("DELETE FROM edge_config WHERE key = ?").run("setup_nonce");
 }
 
+// ── Beverage classification (mirrors cloud reports.ts) ───────────────────────
+// Used by local /api/edge/reports/* endpoints to classify items into
+// Food / Liquor / Beverages so the cashier DataDashboard sees the same
+// category breakdown as the admin panel without round-tripping to cloud.
+const BEVERAGE_KEYWORDS = [
+  'water', 'sprite', 'thums up', 'thumsup', 'tin thums', 'soda', 'cola', 'coke', 'pepsi',
+  'limca', 'fanta', 'mirinda', '7up', 'pulpy orange', 'fresh lime', 'mojitho', 'mojito',
+  'moctail', 'mocktail', 'fruit punch', 'lassi', 'butter milk', 'buttermilk', 'milk shake',
+  'milkshake', 'monster', 'charged', 'red bull', 'coolberg', 'juice',
+];
+
+const BEVERAGE_ALIASES: Record<string, string> = {
+  'thumsup': 'thums up',
+  'thums': 'thums up',
+  'tin thums': 'thums up',
+  'butter milk': 'buttermilk',
+  'milk shake': 'milkshake',
+  'moctail': 'mocktail',
+  'mojitho': 'mojito',
+};
+
+function normalizeBeverageName(name: string): string {
+  let normalized = String(name || '').toLowerCase();
+  normalized = normalized
+    .replace(/\b(tin|bottle|bottel|pet|can|glass|pack|packs)\b/g, ' ')
+    .replace(/\s+\d+(\.\d+)?\s*(ml|mls|milliliter|millilitre|l|ltr|liter|litre|lt|lts)\b/g, ' ')
+    .replace(/\s+\d+\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return BEVERAGE_ALIASES[normalized] || normalized;
+}
+
+function getReportCategory(menuType: string | null | undefined, name: string): 'Liquor' | 'Food' | 'Beverages' {
+  if (String(menuType || '').toUpperCase() === 'LIQUOR') return 'Liquor';
+  const normalizedName = normalizeBeverageName(name);
+  if (BEVERAGE_KEYWORDS.some((k) => normalizedName.includes(k))) return 'Beverages';
+  return 'Food';
+}
+
+// ── Local transaction collector ──────────────────────────────────────────────
+// Collects all completed transactions (settled orders + walk-in txns) for a
+// restaurant in an IST timestamp range from local SQLite. Returns normalized
+// records that the local reports/analytics endpoints can aggregate.
+interface EdgeTxnRecord {
+  orderId: string | null;
+  paidAtMs: number;
+  grandTotal: number;
+  subtotal: number;
+  discountAmount: number;
+  discountPercent: number;
+  cgst: number;
+  sgst: number;
+  method: string;
+  tableNumber: string | null;
+  billNumber: string | null;
+  captainId: string | null;
+  items: Array<{ menuItemId: string | null; name: string; price: number; quantity: number; menuType: string }>;
+}
+
+function collectEdgeTransactions(restaurantId: string, startTs: number, endTs: number): EdgeTxnRecord[] {
+  const db = getDb();
+  const records: EdgeTxnRecord[] = [];
+
+  // 1. Settled orders
+  const orders = db.query(
+    "SELECT id, paid_at, bill_number, captain_id FROM order_record WHERE restaurant_id = ? AND status = 'SETTLED' AND paid_at >= ? AND paid_at <= ?"
+      + " AND NOT EXISTS (SELECT 1 FROM edge_config WHERE key = 'txn_deleted:' || order_record.id)"
+  ).all(restaurantId, startTs, endTs) as any[];
+
+  for (const order of orders) {
+    const settleRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
+    let pd: any = {};
+    if (settleRow?.value) { try { pd = JSON.parse(settleRow.value); } catch {} }
+
+    const items = db.query("SELECT menu_item_id, name, price, quantity, menu_type FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0").all(order.id) as any[];
+
+    records.push({
+      orderId: order.id,
+      paidAtMs: Number(order.paid_at) || 0,
+      grandTotal: Number(pd.grandTotal ?? 0),
+      subtotal: Number(pd.subtotal ?? 0),
+      discountAmount: Number(pd.discountAmount ?? 0),
+      discountPercent: Number(pd.discountPercent ?? 0),
+      cgst: Number(pd.cgst ?? 0),
+      sgst: Number(pd.sgst ?? 0),
+      method: String(pd.paymentMethod || "CASH").toUpperCase(),
+      tableNumber: null,
+      billNumber: order.bill_number || null,
+      captainId: order.captain_id || null,
+      items: items.map(i => ({
+        menuItemId: i.menu_item_id || null,
+        name: i.name || "Unknown",
+        price: Number(i.price) || 0,
+        quantity: Number(i.quantity) || 0,
+        menuType: String(i.menu_type || "FOOD"),
+      })),
+    });
+  }
+
+  // 2. Walk-in transactions
+  const walkinRows = db.query("SELECT key, value FROM edge_config WHERE key LIKE 'walkin_txn:%'").all() as any[];
+  for (const row of walkinRows) {
+    try {
+      const txn = JSON.parse(row.value);
+      if (txn.restaurantId !== restaurantId) continue;
+      const paidMs = txn.paidAt ? new Date(txn.paidAt).getTime() : (txn.createdAt ? new Date(txn.createdAt).getTime() : 0);
+      if (paidMs < startTs || paidMs > endTs) continue;
+      const items = Array.isArray(txn.items) ? txn.items : [];
+      records.push({
+        orderId: txn.orderId || null,
+        paidAtMs: paidMs,
+        grandTotal: Number(txn.grandTotal ?? txn.amount ?? 0),
+        subtotal: Number(txn.subtotal ?? 0),
+        discountAmount: Number(txn.discountAmount ?? 0),
+        discountPercent: Number(txn.discountPercent ?? 0),
+        cgst: Number(txn.cgst ?? 0),
+        sgst: Number(txn.sgst ?? 0),
+        method: String(txn.method || "OTHER").toUpperCase(),
+        tableNumber: null,
+        billNumber: txn.billNumber || null,
+        captainId: txn.captainId || null,
+        items: items.map((i: any) => ({
+          menuItemId: i.menuItemId || i.id || null,
+          name: i.name || i.n || "Unknown",
+          price: Number(i.price ?? i.p ?? 0),
+          quantity: Number(i.quantity ?? i.q ?? 0),
+          menuType: String(i.menuType || "FOOD"),
+        })),
+      });
+    } catch {}
+  }
+
+  return records;
+}
+
+// Convert epoch ms to IST date string (YYYY-MM-DD)
+function istDateString(ms: number): string {
+  if (!ms) return '';
+  return new Date(ms + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
 // ── Route handlers ────────────────────────────────────────────────────────────
 
 async function handleRequest(req: Request, url: URL, server: any): Promise<Response> {
@@ -3604,6 +3745,366 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     }
 
     return jsonResponse({ success: true, key: newKey });
+  }
+
+  // ── Local reports/analytics from SQLite ──────────────────────────────────────
+  // These endpoints serve the cashier DataDashboard directly from the edge
+  // server's local SQLite so the dashboard works even when the cloud is
+  // unreachable (the whole point of the edge server). They mirror the cloud
+  // /api/reports/* and /api/analytics/* response formats so the frontend
+  // DataDashboard.jsx doesn't need any changes.
+  // They are matched BEFORE the cloud proxy block below (exact path match vs
+  // startsWith), so when the edge server has local data the cashier gets it
+  // instantly without a cloud round-trip.
+
+  const IST_OFFSET_MS_R = 5.5 * 60 * 60 * 1000;
+  function parseISTRangeFromQuery(startDateParam: string | null, endDateParam: string | null) {
+    const startDate = startDateParam || new Date(Date.now() + IST_OFFSET_MS_R).toISOString().slice(0, 10);
+    const endDate = endDateParam || startDate;
+    const [sy, sm, sd] = startDate.split("-").map(Number);
+    const [ey, em, ed] = endDate.split("-").map(Number);
+    const startTs = Date.UTC(sy, sm - 1, sd, 0, 0, 0, 0) - IST_OFFSET_MS_R;
+    const endTs = Date.UTC(ey, em - 1, ed, 23, 59, 59, 999) - IST_OFFSET_MS_R;
+    return { startDate, endDate, startTs, endTs };
+  }
+
+  // ── GET /api/edge/reports/daily-sales — from local SQLite ───────────────────
+  if (url.pathname === "/api/edge/reports/daily-sales" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const { startDate, endDate, startTs, endTs } = parseISTRangeFromQuery(
+      url.searchParams.get("startDate"), url.searchParams.get("endDate"),
+    );
+    const txns = collectEdgeTransactions(restaurantId, startTs, endTs);
+
+    let totalGrandTotal = 0, totalSubtotal = 0, totalDiscount = 0, totalCGST = 0, totalSGST = 0;
+    const byMethod: Record<string, { count: number; amount: number }> = {};
+    const byDayMap = new Map<string, { revenue: number; transactions: number }>();
+    let highestAmt = -Infinity, lowestAmt = Infinity;
+    let highestBill: any = null, lowestBill: any = null;
+
+    for (const t of txns) {
+      const grand = t.grandTotal;
+      totalGrandTotal += grand;
+      totalSubtotal += t.subtotal;
+      totalDiscount += t.discountAmount;
+      totalCGST += t.cgst;
+      totalSGST += t.sgst;
+
+      const mKey = t.method || "UNKNOWN";
+      if (!byMethod[mKey]) byMethod[mKey] = { count: 0, amount: 0 };
+      byMethod[mKey].count += 1;
+      byMethod[mKey].amount += grand;
+
+      const dayKey = istDateString(t.paidAtMs);
+      if (dayKey) {
+        const entry = byDayMap.get(dayKey) || { revenue: 0, transactions: 0 };
+        entry.revenue += grand;
+        entry.transactions += 1;
+        byDayMap.set(dayKey, entry);
+      }
+
+      if (grand > highestAmt) { highestAmt = grand; highestBill = { amount: round2(grand), txnDate: dayKey, tableNumber: t.tableNumber, method: t.method }; }
+      if (grand < lowestAmt) { lowestAmt = grand; lowestBill = { amount: round2(grand), txnDate: dayKey, tableNumber: t.tableNumber, method: t.method }; }
+    }
+
+    const totalTransactions = txns.length;
+    const byDay = Array.from(byDayMap.entries())
+      .map(([date, v]) => ({ date, revenue: round2(v.revenue), transactions: v.transactions }))
+      .sort((a, b) => a.date.localeCompare(b.date));
+
+    return jsonResponse({
+      summary: {
+        totalRevenue: round2(totalGrandTotal),
+        totalSales: round2(totalGrandTotal),
+        netSales: round2(totalSubtotal - totalDiscount),
+        totalTransactions,
+        averageBillValue: totalTransactions > 0 ? Math.round(totalGrandTotal / totalTransactions) : 0,
+        totalSubtotal: round2(totalSubtotal),
+        totalDiscount: round2(totalDiscount),
+        totalCGST: round2(totalCGST),
+        totalSGST: round2(totalSGST),
+        totalGrandTotal: round2(totalGrandTotal),
+        highestBill: highestAmt > -Infinity ? highestBill : null,
+        lowestBill: lowestAmt < Infinity ? lowestBill : null,
+      },
+      byMethod,
+      byOutlet: {},
+      byDay,
+      transactions: [],
+      dateRange: { startDate, endDate },
+    }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── GET /api/edge/reports/categorywise-sales — from local SQLite ────────────
+  if (url.pathname === "/api/edge/reports/categorywise-sales" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const { startDate, endDate, startTs, endTs } = parseISTRangeFromQuery(
+      url.searchParams.get("startDate"), url.searchParams.get("endDate"),
+    );
+    const txns = collectEdgeTransactions(restaurantId, startTs, endTs);
+
+    const catMap = new Map<string, { itemCount: number; totalQuantity: number; totalRevenue: number }>();
+    for (const t of txns) {
+      for (const item of t.items) {
+        const cat = getReportCategory(item.menuType, item.name);
+        const discountFactor = t.discountPercent > 0 ? (1 - t.discountPercent / 100) : 1;
+        const revenue = Math.round(item.price * item.quantity * discountFactor * 100) / 100;
+        const entry = catMap.get(cat) || { itemCount: 0, totalQuantity: 0, totalRevenue: 0 };
+        entry.itemCount += 1;
+        entry.totalQuantity += item.quantity;
+        entry.totalRevenue += revenue;
+        catMap.set(cat, entry);
+      }
+    }
+
+    const totalRevenueAll = Array.from(catMap.values()).reduce((s, c) => s + c.totalRevenue, 0);
+    const totalQuantityAll = Array.from(catMap.values()).reduce((s, c) => s + c.totalQuantity, 0);
+    const categories = Array.from(catMap.entries())
+      .map(([name, c]) => ({
+        name,
+        itemCount: c.itemCount,
+        totalQuantity: c.totalQuantity,
+        totalRevenue: round2(c.totalRevenue),
+        revenuePercent: totalRevenueAll > 0 ? round2((c.totalRevenue / totalRevenueAll) * 100) : 0,
+      }))
+      .sort((a, b) => b.totalRevenue - a.totalRevenue);
+
+    return jsonResponse({
+      categories,
+      summary: { totalRevenue: round2(totalRevenueAll), totalQuantity: totalQuantityAll },
+      dateRange: { startDate, endDate },
+    }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── GET /api/edge/reports/itemwise-sales — from local SQLite ────────────────
+  if (url.pathname === "/api/edge/reports/itemwise-sales" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const { startDate, endDate, startTs, endTs } = parseISTRangeFromQuery(
+      url.searchParams.get("startDate"), url.searchParams.get("endDate"),
+    );
+    const outletType = String(url.searchParams.get("outletType") || "all").toLowerCase();
+    const txns = collectEdgeTransactions(restaurantId, startTs, endTs);
+
+    const itemMap = new Map<string, {
+      id: string; name: string; category: string; menuType: string;
+      reportCategory: "Liquor" | "Food" | "Beverages";
+      quantitySold: number; unitPrice: number; totalRevenue: number; orderIds: Set<string>;
+    }>();
+
+    for (const t of txns) {
+      const discountFactor = t.discountPercent > 0 ? (1 - t.discountPercent / 100) : 1;
+      for (const item of t.items) {
+        const reportCategory = getReportCategory(item.menuType, item.name);
+        const key = reportCategory === "Beverages" ? normalizeBeverageName(item.name) : item.name;
+        const revenue = Math.round(item.price * item.quantity * discountFactor * 100) / 100;
+        const existing = itemMap.get(key);
+        if (existing) {
+          existing.quantitySold += item.quantity;
+          existing.totalRevenue += revenue;
+          if (t.orderId) existing.orderIds.add(t.orderId);
+        } else {
+          itemMap.set(key, {
+            id: item.menuItemId || key,
+            name: reportCategory === "Beverages" ? key : item.name,
+            category: reportCategory === "Beverages" ? "Beverages" : "Uncategorized",
+            menuType: item.menuType,
+            reportCategory,
+            quantitySold: item.quantity,
+            unitPrice: item.price,
+            totalRevenue: revenue,
+            orderIds: new Set(t.orderId ? [t.orderId] : []),
+          });
+        }
+      }
+    }
+
+    let workingItems = Array.from(itemMap.values());
+    if (outletType === "food") workingItems = workingItems.filter(it => it.reportCategory === "Food");
+    else if (outletType === "liquor") workingItems = workingItems.filter(it => it.reportCategory === "Liquor");
+    else if (outletType === "beverages") workingItems = workingItems.filter(it => it.reportCategory === "Beverages");
+
+    const totalRevenueAll = workingItems.reduce((s, it) => s + it.totalRevenue, 0);
+    const totalQuantityAll = workingItems.reduce((s, it) => s + it.quantitySold, 0);
+    const foodRevenue = workingItems.filter(i => i.reportCategory === "Food").reduce((s, i) => s + i.totalRevenue, 0);
+    const liquorRevenue = workingItems.filter(i => i.reportCategory === "Liquor").reduce((s, i) => s + i.totalRevenue, 0);
+    const beveragesRevenue = workingItems.filter(i => i.reportCategory === "Beverages").reduce((s, i) => s + i.totalRevenue, 0);
+
+    const items = workingItems
+      .map(it => ({
+        id: it.id,
+        name: it.name,
+        category: it.category,
+        menuType: it.menuType,
+        reportCategory: it.reportCategory,
+        quantitySold: it.quantitySold,
+        unitPrice: it.quantitySold > 0 ? round2(it.totalRevenue / it.quantitySold) : it.unitPrice,
+        totalRevenue: round2(it.totalRevenue),
+        revenuePercent: totalRevenueAll > 0 ? round2((it.totalRevenue / totalRevenueAll) * 100) : 0,
+        orderCount: it.orderIds.size,
+      }))
+      .sort((a, b) => b.totalRevenue - a.totalRevenue);
+
+    return jsonResponse({
+      items,
+      summary: {
+        totalItems: items.length,
+        totalQuantity: totalQuantityAll,
+        totalRevenue: round2(totalRevenueAll),
+        foodRevenue: round2(foodRevenue),
+        liquorRevenue: round2(liquorRevenue),
+        beveragesRevenue: round2(beveragesRevenue),
+      },
+      dateRange: { startDate, endDate },
+    }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── GET /api/edge/analytics/today-specials-sold — from local SQLite ──────────
+  if (url.pathname === "/api/edge/analytics/today-specials-sold" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const { startDate, endDate, startTs, endTs } = parseISTRangeFromQuery(
+      url.searchParams.get("startDate"), url.searchParams.get("endDate"),
+    );
+    const db = getDb();
+
+    // Load active specials from menu_item
+    const specialRows = db.query("SELECT id, name, special_channel FROM menu_item WHERE restaurant_id = ? AND is_special = 1 AND is_deleted = 0").all(restaurantId) as any[];
+    const specialMap = new Map<string, { id: string; name: string; specialChannel: string | null; soldCount: number }>();
+    for (const s of specialRows) {
+      specialMap.set(s.id, { id: s.id, name: s.name, specialChannel: s.special_channel || null, soldCount: 0 });
+    }
+
+    const txns = collectEdgeTransactions(restaurantId, startTs, endTs);
+    let totalTables = 0;
+    const tablesWithSpecials = new Set<string>();
+
+    for (const t of txns) {
+      totalTables++;
+      let hasSpecial = false;
+      for (const item of t.items) {
+        if (item.menuItemId && specialMap.has(item.menuItemId)) {
+          const entry = specialMap.get(item.menuItemId)!;
+          entry.soldCount += item.quantity;
+          hasSpecial = true;
+        }
+      }
+      if (hasSpecial && t.orderId) tablesWithSpecials.add(t.orderId);
+    }
+
+    const specials = Array.from(specialMap.values()).filter(s => s.soldCount > 0);
+    const tablesWithSpecialsCount = tablesWithSpecials.size;
+
+    return jsonResponse({
+      specials,
+      dateRange: { startDate, endDate },
+      tableMetrics: {
+        totalTables,
+        tablesWithSpecials: tablesWithSpecialsCount,
+        conversionRate: totalTables > 0 ? Math.round((tablesWithSpecialsCount / totalTables) * 100) : 0,
+        totalSpecialsSold: specials.reduce((sum, s) => sum + s.soldCount, 0),
+      },
+    }, 200, { "Cache-Control": "no-store" });
+  }
+
+  // ── GET /api/edge/analytics/today-specials-by-staff — from local SQLite ──────
+  if (url.pathname === "/api/edge/analytics/today-specials-by-staff" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+    const { startDate, endDate, startTs, endTs } = parseISTRangeFromQuery(
+      url.searchParams.get("startDate"), url.searchParams.get("endDate"),
+    );
+    const db = getDb();
+
+    // Load specials lookup
+    const specialRows = db.query("SELECT id, name, base_price FROM menu_item WHERE restaurant_id = ? AND is_special = 1 AND is_deleted = 0").all(restaurantId) as any[];
+    const specialMap = new Map<string, { name: string; price: number }>();
+    for (const s of specialRows) {
+      specialMap.set(s.id, { name: s.name, price: Number(s.base_price) || 0 });
+    }
+
+    // Load KOT captain attribution (per-order, latest KOT wins)
+    const txns = collectEdgeTransactions(restaurantId, startTs, endTs);
+    const orderIds = txns.map(t => t.orderId).filter(Boolean) as string[];
+    const orderKotCaptain = new Map<string, string>();
+    const orderKotCaptainTs = new Map<string, number>();
+    if (orderIds.length > 0) {
+      const kots = db.query(
+        `SELECT k.order_id, k.captain_id, k.created_at FROM kot k WHERE k.captain_id IS NOT NULL AND k.order_id IN (${orderIds.map(() => "?").join(",")})`
+      ).all(...orderIds) as any[];
+      for (const kot of kots) {
+        const existingTs = orderKotCaptainTs.get(kot.order_id) ?? 0;
+        if (!existingTs || Number(kot.created_at) > existingTs) {
+          orderKotCaptain.set(kot.order_id, kot.captain_id);
+          orderKotCaptainTs.set(kot.order_id, Number(kot.created_at) || 0);
+        }
+      }
+    }
+
+    const staffMap = new Map<string, { userId: string; name: string | null; role: string | null; soldCount: number; revenue: number; items: Map<string, { name: string; soldCount: number; revenue: number }> }>();
+
+    for (const t of txns) {
+      const txnCaptain = t.captainId;
+      const kotCaptain = t.orderId ? orderKotCaptain.get(t.orderId) || null : null;
+      const captainId = kotCaptain || txnCaptain;
+      if (!captainId || captainId === "N/A") continue;
+
+      for (const item of t.items) {
+        if (!item.menuItemId) continue;
+        const special = specialMap.get(item.menuItemId);
+        if (!special) continue;
+        const quantity = item.quantity;
+        if (quantity <= 0) continue;
+        const price = special.price || item.price;
+        const name = special.name || item.name;
+
+        const existing = staffMap.get(captainId);
+        if (existing) {
+          existing.soldCount += quantity;
+          existing.revenue += quantity * price;
+          const itemRec = existing.items.get(item.menuItemId);
+          if (itemRec) { itemRec.soldCount += quantity; itemRec.revenue += quantity * price; }
+          else existing.items.set(item.menuItemId, { name, soldCount: quantity, revenue: quantity * price });
+        } else {
+          const itemsMap = new Map<string, { name: string; soldCount: number; revenue: number }>();
+          itemsMap.set(item.menuItemId, { name, soldCount: quantity, revenue: quantity * price });
+          staffMap.set(captainId, { userId: captainId, name: null, role: null, soldCount: quantity, revenue: quantity * price, items: itemsMap });
+        }
+      }
+    }
+
+    // Resolve captain names + roles from users table
+    const userIds = Array.from(staffMap.keys());
+    if (userIds.length > 0) {
+      const users = db.query(`SELECT id, name, role FROM users WHERE id IN (${userIds.map(() => "?").join(",")})`).all(...userIds) as any[];
+      for (const u of users) {
+        const rec = staffMap.get(u.id);
+        if (rec) { rec.name = u.name || null; rec.role = u.role || null; }
+      }
+    }
+
+    const staff = Array.from(staffMap.values())
+      .map(s => ({
+        userId: s.userId,
+        name: s.name,
+        role: s.role,
+        soldCount: s.soldCount,
+        revenue: round2(s.revenue),
+        items: Array.from(s.items.values()).sort((a, b) => b.soldCount - a.soldCount),
+      }))
+      .sort((a, b) => {
+        if (b.soldCount !== a.soldCount) return b.soldCount - a.soldCount;
+        return (a.name || a.userId).localeCompare(b.name || b.userId);
+      });
+
+    return jsonResponse({ staff, dateRange: { startDate, endDate } }, 200, { "Cache-Control": "no-store" });
   }
 
   // ── Cloud analytics/reports proxy ────────────────────────────────────────────

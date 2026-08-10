@@ -575,16 +575,33 @@ function buildKotPrintGroups(
         }
       }
     } else {
-      // Precise printer routing
-      const isAllLiquor = groupItems.every((i) => i.menuType === "LIQUOR");
-      const builder = isAllLiquor ? buildLiquorKOT : buildFoodKOT;
-      const printItems = groupItems.map((i) => ({
-        name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null,
-        type: (i.menuType === "LIQUOR" ? "liquor" : "food") as "food" | "liquor",
-      }));
-      const escpos = builder({ ...kotOrderData, items: printItems });
-      if (escpos.length > 0) {
-        printGroups.push({ printerName, escposData: escpos, type: isAllLiquor ? "BAR_KOT" : "KOT" });
+      // Precise printer routing — split by menuType so mixed food+liquor
+      // groups produce two jobs (one food KOT, one liquor KOT) to the same
+      // printer. Without this split, the all-or-nothing isAllLiquor check
+      // picks one renderer and the other type is silently dropped by the
+      // renderer's internal type filter.
+      const foodItems = groupItems.filter((i) => i.menuType !== "LIQUOR");
+      const liquorItems = groupItems.filter((i) => i.menuType === "LIQUOR");
+
+      if (foodItems.length > 0) {
+        const foodPrintItems = foodItems.map((i) => ({
+          name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null,
+          type: "food" as const,
+        }));
+        const escpos = buildFoodKOT({ ...kotOrderData, items: foodPrintItems });
+        if (escpos.length > 0) {
+          printGroups.push({ printerName, escposData: escpos, type: "KOT" });
+        }
+      }
+      if (liquorItems.length > 0) {
+        const liquorPrintItems = liquorItems.map((i) => ({
+          name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null,
+          type: "liquor" as const,
+        }));
+        const escpos = buildLiquorKOT({ ...kotOrderData, items: liquorPrintItems });
+        if (escpos.length > 0) {
+          printGroups.push({ printerName, escposData: escpos, type: "BAR_KOT" });
+        }
       }
     }
   }
@@ -1850,13 +1867,24 @@ export async function reprintKot(input: ReprintKotInput): Promise<{ success: boo
         }
       }
     } else {
-      const isAllLiquor = groupItems.every((i) => i.menuType === "LIQUOR");
-      const builder = isAllLiquor ? buildLiquorKOT : buildFoodKOT;
-      const escpos = builder({
-        ...kotOrderData,
-        items: groupItems.map(i => ({ name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null, type: (i.menuType === "LIQUOR" ? "liquor" : "food") as "food" | "liquor" })),
-      });
-      if (escpos.length > 0) printGroups.push({ printerName, escposData: escpos, type: isAllLiquor ? "BAR_KOT" : "KOT" });
+      // Split by menuType — same fix as buildKotPrintGroups
+      const foodItems = groupItems.filter((i) => i.menuType !== "LIQUOR");
+      const liquorItems = groupItems.filter((i) => i.menuType === "LIQUOR");
+
+      if (foodItems.length > 0) {
+        const escpos = buildFoodKOT({
+          ...kotOrderData,
+          items: foodItems.map(i => ({ name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null, type: "food" as const })),
+        });
+        if (escpos.length > 0) printGroups.push({ printerName, escposData: escpos, type: "KOT" });
+      }
+      if (liquorItems.length > 0) {
+        const escpos = buildLiquorKOT({
+          ...kotOrderData,
+          items: liquorItems.map(i => ({ name: i.name, quantity: i.quantity, price: Number(i.price), notes: i.notes ?? null, type: "liquor" as const })),
+        });
+        if (escpos.length > 0) printGroups.push({ printerName, escposData: escpos, type: "BAR_KOT" });
+      }
     }
   }
 
