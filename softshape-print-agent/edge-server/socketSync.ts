@@ -25,7 +25,7 @@
 import { io, type Socket } from "socket.io-client";
 import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid } from "./auth.ts";
 import { applyChangesBatch } from "./config.ts";
-import { getDb, setSyncState, updatePrintJobStatus, createPrintJob, claimPrintJob, getConfig } from "./db.ts";
+import { getDb, setSyncState, updatePrintJobStatus, createPrintJob, claimPrintJob, cancelPrintJob, getConfig } from "./db.ts";
 import { printToPrinter, resolvePrinterName } from "./printer.ts";
 import { printerLog } from "./contract/logger.ts";
 import { listPrintersViaService } from "./printServiceManager.ts";
@@ -33,6 +33,14 @@ import { listPrintersViaService } from "./printServiceManager.ts";
 let socket: Socket | null = null;
 let connectionAttempts = 0;
 let fallbackToPolling = false;
+
+// KOT job types are duplicate-prone — a silently retried KOT causes the kitchen
+// to prepare the same food twice. Failed KOT prints are marked "failed" (not
+// "retrying") so the background dispatch loop never re-dispatches them.
+function isKotJobType(type: string): boolean {
+  const t = (type || "").toUpperCase();
+  return t === "KOT" || t === "BAR_KOT" || t === "CANCEL_KOT";
+}
 
 // ─── Gather this edge server's available printer names ──────────────────────
 // Uses the LIVE print service to detect actual OS printers physically connected
@@ -119,7 +127,7 @@ export function startSocketSync(): void {
     socket!.emit("edge:register", {
       restaurantId,
       sessionToken: token,
-      edgeVersion: "23.12.15",
+      edgeVersion: "23.12.16",
       capabilities: ["print"],
     });
 
@@ -164,7 +172,7 @@ export function startSocketSync(): void {
     socket!.emit("edge:register", {
       restaurantId,
       sessionToken: freshToken || token,
-      edgeVersion: "23.12.15",
+      edgeVersion: "23.12.16",
       capabilities: ["print"],
     });
 
@@ -425,12 +433,16 @@ async function handleCloudPrintJob(envelope: any): Promise<void> {
       sendPrintAck(eventId, true, null, data?.requestId);
       printerLog.info(`Cloud print_job printed: ${type} → ${targetPrinter} (${result.bytes} bytes via ${result.method}, eventId=${eventId})`);
     } else {
-      updatePrintJobStatus(eventId, "retrying", result.error || "Print failed", "cloud_direct");
+      // KOT prints: mark as "failed" (not "retrying") to prevent the background
+      // dispatch loop from silently reprinting and causing double-cooking.
+      const failStatus = isKotJobType(type) ? "failed" : "retrying";
+      updatePrintJobStatus(eventId, failStatus, result.error || "Print failed", "cloud_direct");
       sendPrintAck(eventId, false, result.error || "Print failed", data?.requestId);
       printerLog.warn(`Cloud print_job failed: ${type} → ${targetPrinter}: ${result.error} (eventId=${eventId})`);
     }
   } catch (err: any) {
-    updatePrintJobStatus(eventId, "retrying", err?.message || String(err), "cloud_direct");
+    const errStatus = isKotJobType(type) ? "failed" : "retrying";
+    updatePrintJobStatus(eventId, errStatus, err?.message || String(err), "cloud_direct");
     sendPrintAck(eventId, false, err?.message || String(err), data?.requestId);
     printerLog.error(`Cloud print_job dispatch error: ${type} → ${targetPrinter}: ${err instanceof Error ? err.message : err} (eventId=${eventId})`);
   }

@@ -11,7 +11,7 @@
 // Total: 15-40ms from button press to printer starting.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, getNextKotNumber, enqueueSync, getKolkataDateString, createPrintJob, updatePrintJobStatus, getPendingPrintJobs, claimPrintJob, reclaimStalePrintingJobs, getPrintJobByEventId, lookupCommand, recordCommand, nextTableRevision, nextOrderRevision, upsertTransactionRecord } from "./db.ts";
+import { getDb, getNextKotNumber, enqueueSync, getKolkataDateString, createPrintJob, updatePrintJobStatus, getPendingPrintJobs, claimPrintJob, reclaimStalePrintingJobs, getPrintJobByEventId, cancelPrintJob, lookupCommand, recordCommand, nextTableRevision, nextOrderRevision, upsertTransactionRecord } from "./db.ts";
 import { buildFoodKOT, buildLiquorKOT, buildCancelKOT, buildFinalBill, type PrintItem, type OrderData, type BillData } from "./escpos.ts";
 import { resolvePrinterName, printToPrinter } from "./printer.ts";
 import { lanBroadcast } from "./lanBroadcast.ts";
@@ -97,6 +97,15 @@ interface PrintGroup {
   printerName: string | null;
   escposData: any[];
   type: string;
+}
+
+// KOT job types are time-sensitive and duplicate-prone. Unlike bills/reports,
+// a silently retried KOT causes the kitchen to prepare the same food twice.
+// Failed KOT prints are marked "failed" (not "retrying") so the background
+// dispatch loop never re-dispatches them. The captain must retry explicitly.
+function isKotJobType(type: string): boolean {
+  const t = (type || "").toUpperCase();
+  return t === "KOT" || t === "BAR_KOT" || t === "CANCEL_KOT";
 }
 
 async function printWithLanFallback(
@@ -275,8 +284,15 @@ export async function awaitDispatchBounded(
   }
 
   if (result === "timeout") {
-    // Don't cancel the underlying print — just stop awaiting.
-    // The background loop will handle retry if needed.
+    // KOT prints: treat timeout as failure so the captain sees "Failed" and
+    // retries explicitly. Cancel the print_job to prevent the background loop
+    // from silently reprinting later (which causes double-cooking).
+    if (isKotJobType(group.type)) {
+      cancelPrintJob(eventId);
+      return { ok: false, printerName: group.printerName || "unknown", bytes: 0, error: "Print timed out — tap Retry to reprint", method: "durable_queued", eventId };
+    }
+    // Non-KOT (bills/reports): don't cancel the underlying print — just stop
+    // awaiting. The background loop will handle retry if needed.
     return { ok: null, printerName: group.printerName, bytes: 0, method: "durable_queued", eventId, pending: true };
   }
 
@@ -286,9 +302,17 @@ export async function awaitDispatchBounded(
     if (job?.status === "printed") {
       return { ok: true, printerName: group.printerName, bytes: 0, method: job.acked_via || "print_service", eventId };
     } else {
-      return { ok: false, printerName: group.printerName || "unknown", bytes: 0, error: job?.last_error || "Print failed — will retry automatically", method: "durable_queued", eventId };
+      // KOT prints: cancel the failed job so the background loop doesn't
+      // silently retry it. The captain must retry explicitly via reprintKot.
+      if (isKotJobType(group.type)) {
+        cancelPrintJob(eventId);
+      }
+      return { ok: false, printerName: group.printerName || "unknown", bytes: 0, error: job?.last_error || "Print failed — tap Retry to reprint", method: "durable_queued", eventId };
     }
   } catch {
+    if (isKotJobType(group.type)) {
+      cancelPrintJob(eventId);
+    }
     return { ok: false, printerName: group.printerName || "unknown", bytes: 0, error: "Failed to read print job status", method: "durable_queued", eventId };
   }
 }
@@ -327,7 +351,11 @@ export async function dispatchSinglePrintJob(
         return;
       }
       console.warn(`[Print] Job ${eventId} → ${group.printerName} print service failed: ${result.error}`);
-      updatePrintJobStatus(eventId, "retrying", result.error || "Print service call failed");
+      // KOT prints: mark as "failed" (not "retrying") to prevent the background
+      // dispatch loop from silently reprinting. A duplicate KOT causes the
+      // kitchen to prepare the same food twice. The captain retries explicitly.
+      const failureStatus = isKotJobType(group.type) ? "failed" : "retrying";
+      updatePrintJobStatus(eventId, failureStatus, result.error || "Print service call failed");
       return;
     }
 
@@ -337,9 +365,11 @@ export async function dispatchSinglePrintJob(
     // not in restarting the print service.
     const mappingError = `No printer mapped for ${group.type} group (printerName is null)`;
     console.warn(`[Print] Job ${eventId} — ${mappingError}`);
-    updatePrintJobStatus(eventId, "retrying", mappingError);
+    const noPrinterStatus = isKotJobType(group.type) ? "failed" : "retrying";
+    updatePrintJobStatus(eventId, noPrinterStatus, mappingError);
   } catch (err: any) {
-    updatePrintJobStatus(eventId, "retrying", err?.message || String(err));
+    const errStatus = isKotJobType(group.type) ? "failed" : "retrying";
+    updatePrintJobStatus(eventId, errStatus, err?.message || String(err));
     console.error(`[Print] Job ${eventId} dispatch error:`, err);
   }
 }

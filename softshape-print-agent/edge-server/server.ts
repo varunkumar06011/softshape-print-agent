@@ -87,6 +87,14 @@ import { runtimeManager } from "./runtimeManager.ts";
 
 const PORT = parseInt(process.env.EDGE_PORT || "3101", 10);
 
+// KOT job types are duplicate-prone — a silently retried KOT causes the kitchen
+// to prepare the same food twice. Failed KOT prints are marked "failed" (not
+// "retrying") so the background dispatch loop never re-dispatches them.
+function isKotJobType(type: string): boolean {
+  const t = (type || "").toUpperCase();
+  return t === "KOT" || t === "BAR_KOT" || t === "CANCEL_KOT";
+}
+
 // Rate limiting for /health endpoint — 1 request per 5s per IP
 const _healthRateLimit = new Map<string, number>();
 // Cache for print_job summary on /health — refreshed every 5s
@@ -415,7 +423,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       const healthResp = {
         status: rmHealth.status,
         service: "softshape-edge-server",
-        version: "23.12.15",
+        version: "23.12.16",
         uptime: process.uptime(),
         runtimeState: rmHealth.runtimeState,
         configSyncState: rmHealth.configSyncState,
@@ -476,7 +484,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const healthResp = {
       status: "ok",
       service: "softshape-edge-server",
-      version: "23.12.15",
+      version: "23.12.16",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
@@ -659,6 +667,12 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         return jsonResponse({ ok: true, queued: false, method: "print_service", eventId: printEventId });
       }
       console.warn(`[Print] Relay /print → ${effectiveType} → ${targetPrinter} print service failed: ${result.error} — job queued for retry`);
+      // KOT prints: mark as "failed" (not "retrying") to prevent the background
+      // dispatch loop from silently reprinting and causing double-cooking.
+      if (isKotJobType(effectiveType)) {
+        updatePrintJobStatus(printEventId, "failed", result.error || "Print service failed");
+        return jsonResponse({ ok: false, queued: false, error: result.error || "Print service failed", eventId: printEventId }, 503);
+      }
       updatePrintJobStatus(printEventId, "retrying", result.error || "Print service failed");
     }
 
@@ -2780,7 +2794,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   // returns the download URL if an update exists. The Host handles the
   // download, binary swap, and restart.
   if (url.pathname === "/api/edge/update-check" && req.method === "GET") {
-    const currentVersion = "23.12.15";
+    const currentVersion = "23.12.16";
     const backendUrl = getBackendUrl();
     const sessionToken = getSessionToken();
 

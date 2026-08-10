@@ -264,8 +264,10 @@ test("E2E: POST /api/edge/order creates order + KOT + print job", async () => {
   expect(printJob.job_type).toBe("KOT");
   expect(printJob.printer_name).toBe("KitchenPrinter");
   expect(printJob.kot_number).toBe(body.kotNumber);
-  // Status should be "retrying" (print service not running) or "queued"
-  expect(["queued", "retrying", "printing"]).toContain(printJob.status);
+  // Status should be "failed" (KOT print service not running — fail-fast
+  // prevents silent background reprint that causes double-cooking), "queued",
+  // or "printing" if the dispatch is still in flight.
+  expect(["queued", "failed", "printing"]).toContain(printJob.status);
   // ESC/POS data is valid JSON array with content
   const escpos = JSON.parse(printJob.escpos_data);
   expect(Array.isArray(escpos)).toBe(true);
