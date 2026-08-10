@@ -489,6 +489,26 @@ function incrementAttempts(queueIds: number[], error: string): void {
     .run(error, ...queueIds);
 }
 
+// Recover rows claimed by a process that crashed before receiving a response.
+// The worker is single-flight, so this runs between cycles and cannot race an
+// active push from this process. A fresh retry is safer than leaving revenue
+// records permanently marked IN_FLIGHT.
+const IN_FLIGHT_RECOVERY_MS = 2 * 60 * 1000;
+
+function recoverStaleInFlight(): number {
+  const db = getDb();
+  const cutoff = Date.now() - IN_FLIGHT_RECOVERY_MS;
+  const result = db.query(
+    `UPDATE sync_queue
+     SET attempts = attempts + 1,
+         last_error = 'Recovered stale IN_FLIGHT record'
+     WHERE synced = 0
+       AND last_error = 'IN_FLIGHT'
+       AND created_at < ?`,
+  ).run(cutoff);
+  return result.changes || 0;
+}
+
 // Park dependency failures without consuming transient retry attempts. The
 // dependency-aware collector will release the row once its parent is synced.
 function handleWaitingDependency(queueId: number, error: string): void {
@@ -722,6 +742,11 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
 
   const token = getSessionToken();
 
+  const recoveredInFlight = recoverStaleInFlight();
+  if (recoveredInFlight > 0) {
+    console.warn(`[Sync] Recovered ${recoveredInFlight} stale IN_FLIGHT record(s)`);
+  }
+
   const batch = collectBatch();
   if (batch.length === 0) {
     lastSyncAt = Date.now();
@@ -930,11 +955,13 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
     }
 
     lastSyncAt = Date.now();
+    const unacknowledgedCount = retryIds.length + orphanIds.length;
     lastSyncResult = {
-      ok: true,
+      ok: unacknowledgedCount === 0,
       pushed: payload.length,
       accepted: result.accepted.length + dequeueIds.length,
-      rejected: retryIds.length + orphanIds.length,
+      rejected: unacknowledgedCount,
+      ...(unacknowledgedCount > 0 ? { error: "Cloud did not acknowledge every submitted sync record" } : {}),
     };
 
     if (result.accepted.length > 0 || dequeueIds.length > 0) {

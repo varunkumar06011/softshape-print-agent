@@ -25,13 +25,55 @@
 import { io, type Socket } from "socket.io-client";
 import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid } from "./auth.ts";
 import { applyChangesBatch } from "./config.ts";
-import { getDb, setSyncState, updatePrintJobStatus, createPrintJob, claimPrintJob } from "./db.ts";
+import { getDb, setSyncState, updatePrintJobStatus, createPrintJob, claimPrintJob, getConfig } from "./db.ts";
 import { printToPrinter, resolvePrinterName } from "./printer.ts";
 import { printerLog } from "./contract/logger.ts";
+import { listPrintersViaService } from "./printServiceManager.ts";
 
 let socket: Socket | null = null;
 let connectionAttempts = 0;
 let fallbackToPolling = false;
+
+// ─── Gather this edge server's available printer names ──────────────────────
+// Uses the LIVE print service to detect actual OS printers physically connected
+// to THIS machine. This is critical for multi-desktop setups where two desktops
+// share the same outlet but have different printers — the cloud-synced config
+// is identical on both desktops, so only the live print service can tell them
+// apart.
+//
+// Falls back to config-based sources if the print service is not ready yet
+// (e.g. during early startup). The heartbeat will send the accurate list once
+// the print service is up.
+async function getAvailablePrinters(): Promise<string[]> {
+  const printers = new Set<string>();
+
+  // 1. Live print service — actual OS printers connected to THIS machine
+  try {
+    const live = await listPrintersViaService();
+    for (const p of live) {
+      if (p?.name) printers.add(p.name);
+    }
+  } catch { /* print service not ready — fall back to config */ }
+
+  // If the print service returned printers, use ONLY those — they are the
+  // ground truth for what's physically connected to this machine.
+  if (printers.size > 0) return Array.from(printers);
+
+  // 2. Fallback: edge config printer_mapping (kitchen/bar/bill → printer name)
+  //    Used when the print service is not ready yet. The heartbeat will
+  //    send the accurate list once the print service is up.
+  try {
+    const mappingRaw = getConfig("printer_mapping");
+    if (mappingRaw) {
+      const mapping = JSON.parse(mappingRaw);
+      for (const v of Object.values(mapping)) {
+        if (typeof v === "string" && v) printers.add(v);
+      }
+    }
+  } catch { /* ignore */ }
+
+  return Array.from(printers);
+}
 
 // ─── Start socket sync client ────────────────────────────────────────────────
 
@@ -65,19 +107,34 @@ export function startSocketSync(): void {
 
   // ── Connection events ──────────────────────────────────────────────────────
 
-  socket.on("connect", () => {
+  socket.on("connect", async () => {
     console.log("[SocketSync] Connected to cloud");
     connectionAttempts = 0;
     fallbackToPolling = false;
 
     // Register as edge server with print capability.
-    // The cloud routes print_job events directly to this edge server.
+    // Register immediately without availablePrinters so the cloud accepts
+    // the connection fast. Then asynchronously fetch the live printer list
+    // from the print service and send it via edge:printers_report.
     socket!.emit("edge:register", {
       restaurantId,
       sessionToken: token,
-      edgeVersion: "23.12.14",
+      edgeVersion: "23.12.15",
       capabilities: ["print"],
     });
+
+    // Asynchronously report available printers to the cloud.
+    // This uses the live print service to detect actual OS printers on THIS
+    // machine — critical for multi-desktop routing.
+    try {
+      const printers = await getAvailablePrinters();
+      if (printers.length > 0) {
+        socket!.emit("edge:printers_report", { restaurantId, availablePrinters: printers });
+        console.log(`[SocketSync] Reported ${printers.length} printers to cloud: ${printers.join(", ")}`);
+      }
+    } catch (err) {
+      console.warn("[SocketSync] Failed to report printers:", err);
+    }
   });
 
   socket.on("disconnect", (reason: string) => {
@@ -94,7 +151,7 @@ export function startSocketSync(): void {
     }
   });
 
-  socket.on("reconnect", (attempt: number) => {
+  socket.on("reconnect", async (attempt: number) => {
     console.log(`[SocketSync] Reconnected after ${attempt} attempts`);
     connectionAttempts = 0;
 
@@ -107,9 +164,17 @@ export function startSocketSync(): void {
     socket!.emit("edge:register", {
       restaurantId,
       sessionToken: freshToken || token,
-      edgeVersion: "23.12.14",
+      edgeVersion: "23.12.15",
       capabilities: ["print"],
     });
+
+    // Re-report available printers after reconnect
+    try {
+      const printers = await getAvailablePrinters();
+      if (printers.length > 0) {
+        socket!.emit("edge:printers_report", { restaurantId, availablePrinters: printers });
+      }
+    } catch { /* non-fatal */ }
   });
 
   // ── Cloud → edge sync events ───────────────────────────────────────────────
@@ -235,15 +300,22 @@ export function startSocketSync(): void {
 
 // ─── Send heartbeat ──────────────────────────────────────────────────────────
 
-export function sendHeartbeat(): void {
+export async function sendHeartbeat(): Promise<void> {
   if (!socket || !socket.connected) return;
   const restaurantId = getRestaurantId();
   if (!restaurantId) return;
 
+  // Fetch live printers from the print service for accurate ownership tracking
+  let availablePrinters: string[] = [];
+  try {
+    availablePrinters = await getAvailablePrinters();
+  } catch { /* non-fatal */ }
+
   socket.emit("edge:heartbeat", {
     restaurantId,
     timestamp: Date.now(),
-    pendingSync: 0, // Could query sync_queue count here
+    pendingSync: 0,
+    availablePrinters,
   });
 }
 
