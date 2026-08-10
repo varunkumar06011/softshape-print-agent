@@ -383,12 +383,15 @@ function initSchema(database: Database) {
       special_channel TEXT DEFAULT 'BOTH',
       special_active  INTEGER DEFAULT 1,
       special_expires_at INTEGER,
+      is_combo        INTEGER DEFAULT 0,
+      show_in_menu    INTEGER DEFAULT 1,
       updated_at      INTEGER,
       synced_at       INTEGER NOT NULL DEFAULT (unixepoch())
     );
     CREATE INDEX IF NOT EXISTS idx_menu_item_category ON menu_item(category_id);
     CREATE INDEX IF NOT EXISTS idx_menu_item_restaurant ON menu_item(restaurant_id);
     CREATE INDEX IF NOT EXISTS idx_menu_item_available ON menu_item(restaurant_id, is_available, is_deleted);
+    CREATE INDEX IF NOT EXISTS idx_menu_item_combo ON menu_item(restaurant_id, is_combo);
 
     -- Menu Item Variants
     CREATE TABLE IF NOT EXISTS menu_item_variant (
@@ -403,6 +406,21 @@ function initSchema(database: Database) {
     );
     CREATE INDEX IF NOT EXISTS idx_variant_menu_item ON menu_item_variant(menu_item_id);
     CREATE INDEX IF NOT EXISTS idx_variant_restaurant ON menu_item_variant(restaurant_id);
+
+    -- Combo Components (mirror of cloud ComboComponent; used for offline KOT
+    -- ticket splitting — a combo is billed as one line but printed as one KOT
+    -- line per component, routed to each component's own printer).
+    CREATE TABLE IF NOT EXISTS combo_component (
+      id                    TEXT PRIMARY KEY,
+      combo_menu_item_id    TEXT NOT NULL,
+      component_menu_item_id TEXT NOT NULL,
+      quantity              INTEGER DEFAULT 1,
+      restaurant_id         TEXT NOT NULL,
+      synced_at             INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+    CREATE INDEX IF NOT EXISTS idx_combo_component_combo ON combo_component(combo_menu_item_id);
+    CREATE INDEX IF NOT EXISTS idx_combo_component_component ON combo_component(component_menu_item_id);
+    CREATE INDEX IF NOT EXISTS idx_combo_component_restaurant ON combo_component(restaurant_id);
 
     -- Menu Item Addons
     CREATE TABLE IF NOT EXISTS menu_item_addon (
@@ -979,6 +997,18 @@ function runMigrations(database: Database) {
   if (!hasColumn("menu_item", "updated_at")) {
     database.exec(`ALTER TABLE menu_item ADD COLUMN updated_at INTEGER`);
   }
+
+  // ── v8: Combos feature — is_combo / show_in_menu on menu_item ──────────────
+  // Added so the edge server can mirror cloud combo behavior: combos are billed
+  // as a single line but printed as one KOT line per component, and items with
+  // show_in_menu=0 are hidden from the normal POS menu (combo-only components).
+  if (!hasColumn("menu_item", "is_combo")) {
+    database.exec(`ALTER TABLE menu_item ADD COLUMN is_combo INTEGER DEFAULT 0`);
+  }
+  if (!hasColumn("menu_item", "show_in_menu")) {
+    database.exec(`ALTER TABLE menu_item ADD COLUMN show_in_menu INTEGER DEFAULT 1`);
+  }
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_menu_item_combo ON menu_item(restaurant_id, is_combo)`);
 }
 
 // ── Prepared statement helpers ───────────────────────────────────────────────

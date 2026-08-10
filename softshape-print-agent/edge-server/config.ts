@@ -59,6 +59,7 @@ interface ConfigResponse {
   menuItems?: any[];
   menuVariants?: any[];
   menuAddons?: any[];
+  comboComponents?: any[];
   venuePrices?: any[];
   venueAvailability?: any[];
   users?: any[];
@@ -90,6 +91,7 @@ function computeLocalConfigChecksum(db: ReturnType<typeof getDb>, restaurantIds:
     { name: "menu_item", quoted: false },
     { name: "menu_item_variant", quoted: false },
     { name: "menu_item_addon", quoted: false },
+    { name: "combo_component", quoted: false },
     { name: "venue_price", quoted: false },
     { name: "venue_menu_item_availability", quoted: false },
     { name: "users", quoted: false },
@@ -235,6 +237,7 @@ function verifyCounts(
     { cloudKey: "menuItems", table: "menu_item", scopeColumn: "restaurant_id" },
     { cloudKey: "menuVariants", table: "menu_item_variant", scopeColumn: "restaurant_id" },
     { cloudKey: "menuAddons", table: "menu_item_addon", scopeColumn: "restaurant_id" },
+    { cloudKey: "comboComponents", table: "combo_component", scopeColumn: "restaurant_id" },
     { cloudKey: "venuePrices", table: "venue_price", scopeColumn: "restaurant_id" },
     { cloudKey: "venueAvailability", table: "venue_menu_item_availability", scopeColumn: "restaurant_id" },
     { cloudKey: "users", table: "users", scopeColumn: "outlet_id" },
@@ -346,7 +349,7 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
     const arrayFields: (keyof ConfigResponse)[] = [
       "taxProfiles", "priceProfiles", "priceProfileItems",
       "venues", "floors", "sections", "tables",
-      "categories", "menuItems", "menuVariants", "menuAddons",
+      "categories", "menuItems", "menuVariants", "menuAddons", "comboComponents",
       "venuePrices", "venueAvailability", "users",
       "ledgerCategories", "employees",
     ];
@@ -392,6 +395,7 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
     db.query(`DELETE FROM venue_menu_item_availability WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM venue_price WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM menu_item_addon WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM combo_component WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM menu_item_variant WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM menu_item WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM category WHERE restaurant_id = ?`).run(rid);
@@ -558,15 +562,15 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
 
     // ── Menu Items ────────────────────────────────────────────────────────────
     for (const m of config.menuItems ?? []) {
-      db.query(`INSERT INTO menu_item (id, name, description, image_url, is_veg, is_available, sort_order, category_id, restaurant_id, base_price, unit, is_deleted, deleted_at, printer_target, printer_name, menu_type, gst_enabled, is_special, special_channel, special_active, special_expires_at, updated_at, synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+      db.query(`INSERT INTO menu_item (id, name, description, image_url, is_veg, is_available, sort_order, category_id, restaurant_id, base_price, unit, is_deleted, deleted_at, printer_target, printer_name, menu_type, gst_enabled, is_special, special_channel, special_active, special_expires_at, is_combo, show_in_menu, updated_at, synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, image_url=excluded.image_url,
         is_veg=excluded.is_veg, is_available=excluded.is_available, sort_order=excluded.sort_order,
         category_id=excluded.category_id, base_price=excluded.base_price, unit=excluded.unit,
         is_deleted=excluded.is_deleted, deleted_at=excluded.deleted_at, printer_target=excluded.printer_target,
         printer_name=excluded.printer_name, menu_type=excluded.menu_type, gst_enabled=excluded.gst_enabled,
         is_special=excluded.is_special, special_channel=excluded.special_channel, special_active=excluded.special_active,
-        special_expires_at=excluded.special_expires_at, updated_at=excluded.updated_at, synced_at=unixepoch()
+        special_expires_at=excluded.special_expires_at, is_combo=excluded.is_combo, show_in_menu=excluded.show_in_menu, updated_at=excluded.updated_at, synced_at=unixepoch()
       `).run(
         m.id, m.name, m.description || null, m.imageUrl || null,
         m.isVeg !== false ? 1 : 0, m.isAvailable !== false ? 1 : 0, m.sortOrder || 0,
@@ -576,6 +580,7 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
         m.gstEnabled !== false ? 1 : 0, m.isSpecial ? 1 : 0,
         m.specialChannel || "BOTH", m.specialActive !== false ? 1 : 0,
         m.specialExpiresAt ? new Date(m.specialExpiresAt).getTime() : null,
+        m.isCombo ? 1 : 0, m.showInMenu !== false ? 1 : 0,
         // Persist the cloud's updatedAt (ms epoch) so the edge→cloud conflict
         // check has a meaningful baseline to compare against on the next push.
         m.updatedAt ? new Date(m.updatedAt).getTime() : null
@@ -598,6 +603,15 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
         VALUES (?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET name=excluded.name, price=excluded.price, is_available=excluded.is_available, synced_at=unixepoch()
       `).run(a.id, a.name, Number(a.price), a.isAvailable !== false ? 1 : 0, a.menuItemId, a.restaurantId);
+      totalRows++;
+    }
+
+    // ── Combo Components ──────────────────────────────────────────────────────
+    for (const cc of config.comboComponents ?? []) {
+      db.query(`INSERT INTO combo_component (id, combo_menu_item_id, component_menu_item_id, quantity, restaurant_id, synced_at)
+        VALUES (?, ?, ?, ?, ?, unixepoch())
+        ON CONFLICT(id) DO UPDATE SET combo_menu_item_id=excluded.combo_menu_item_id, component_menu_item_id=excluded.component_menu_item_id, quantity=excluded.quantity, synced_at=unixepoch()
+      `).run(cc.id, cc.comboMenuItemId, cc.componentMenuItemId, Number(cc.quantity || 1), cc.restaurantId);
       totalRows++;
     }
 
@@ -1110,15 +1124,15 @@ function applyChange(db: any, change: any): boolean {
 
     // ── Menu Item ───────────────────────────────────────────────────────────
     case "menu_item":
-      db.query(`INSERT INTO menu_item (id, name, description, image_url, is_veg, is_available, sort_order, category_id, restaurant_id, base_price, unit, is_deleted, deleted_at, printer_target, printer_name, menu_type, gst_enabled, is_special, special_channel, special_active, special_expires_at, updated_at, synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+      db.query(`INSERT INTO menu_item (id, name, description, image_url, is_veg, is_available, sort_order, category_id, restaurant_id, base_price, unit, is_deleted, deleted_at, printer_target, printer_name, menu_type, gst_enabled, is_special, special_channel, special_active, special_expires_at, is_combo, show_in_menu, updated_at, synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, image_url=excluded.image_url,
         is_veg=excluded.is_veg, is_available=excluded.is_available, sort_order=excluded.sort_order,
         category_id=excluded.category_id, base_price=excluded.base_price, unit=excluded.unit,
         is_deleted=excluded.is_deleted, deleted_at=excluded.deleted_at, printer_target=excluded.printer_target,
         printer_name=excluded.printer_name, menu_type=excluded.menu_type, gst_enabled=excluded.gst_enabled,
         is_special=excluded.is_special, special_channel=excluded.special_channel, special_active=excluded.special_active,
-        special_expires_at=excluded.special_expires_at, updated_at=excluded.updated_at, synced_at=unixepoch()
+        special_expires_at=excluded.special_expires_at, is_combo=excluded.is_combo, show_in_menu=excluded.show_in_menu, updated_at=excluded.updated_at, synced_at=unixepoch()
       `).run(
         row.id, row.name, row.description || null, row.imageUrl || null,
         row.isVeg !== false ? 1 : 0, row.isAvailable !== false ? 1 : 0, row.sortOrder || 0,
@@ -1128,6 +1142,7 @@ function applyChange(db: any, change: any): boolean {
         row.gstEnabled !== false ? 1 : 0, row.isSpecial ? 1 : 0,
         row.specialChannel || "BOTH", row.specialActive !== false ? 1 : 0,
         row.specialExpiresAt ? new Date(row.specialExpiresAt).getTime() : null,
+        row.isCombo ? 1 : 0, row.showInMenu !== false ? 1 : 0,
         // Persist the cloud's updatedAt (ms epoch) so the edge→cloud conflict
         // check has a meaningful baseline to compare against on the next push.
         row.updatedAt ? new Date(row.updatedAt).getTime() : null
@@ -1140,6 +1155,16 @@ function applyChange(db: any, change: any): boolean {
         VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET name=excluded.name, price=excluded.price, is_default=excluded.is_default, is_available=excluded.is_available, synced_at=unixepoch()
       `).run(row.id, row.name, Number(row.price), row.isDefault ? 1 : 0, row.menuItemId, row.isAvailable !== false ? 1 : 0, row.restaurantId);
+      return true;
+
+    // ── Combo Component ─────────────────────────────────────────────────────
+    // Mirror of cloud ComboComponent. Used only for offline KOT ticket splitting
+    // (a combo is billed as one line but printed as one KOT line per component).
+    case "combo_component":
+      db.query(`INSERT INTO combo_component (id, combo_menu_item_id, component_menu_item_id, quantity, restaurant_id, synced_at)
+        VALUES (?, ?, ?, ?, ?, unixepoch())
+        ON CONFLICT(id) DO UPDATE SET combo_menu_item_id=excluded.combo_menu_item_id, component_menu_item_id=excluded.component_menu_item_id, quantity=excluded.quantity, synced_at=unixepoch()
+      `).run(row.id, row.comboMenuItemId, row.componentMenuItemId, Number(row.quantity || 1), row.restaurantId);
       return true;
 
     // ── Menu Item Addon ─────────────────────────────────────────────────────
@@ -1223,6 +1248,7 @@ const TABLE_NAME_MAP: Record<string, string> = {
   menu_item: "menu_item",
   menu_item_variant: "menu_item_variant",
   menu_item_addon: "menu_item_addon",
+  combo_component: "combo_component",
   venue_price: "venue_price",
   venue_menu_item_availability: "venue_menu_item_availability",
   user: "users",
