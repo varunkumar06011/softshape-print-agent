@@ -427,7 +427,11 @@ export async function dispatchPendingPrintJobs(): Promise<{ dispatched: number; 
         dispatchSinglePrintJob(job.event_id, group, undefined);
         dispatched++;
       } catch (e: any) {
-        updatePrintJobStatus(job.event_id, "retrying", `Background dispatch threw: ${e?.message || e}`);
+        // KOT jobs must never be auto-retried — a duplicate KOT causes the
+        // kitchen to cook the same food twice. Match the safeguard used in
+        // dispatchSinglePrintJob's failure paths.
+        const errStatus = isKotJobType(job.job_type) ? "failed" : "retrying";
+        updatePrintJobStatus(job.event_id, errStatus, `Background dispatch threw: ${e?.message || e}`);
       }
     }
 

@@ -839,9 +839,13 @@ function runMigrations(database: Database) {
   if (!hasColumn("print_job", "failed_at")) {
     database.exec(`ALTER TABLE print_job ADD COLUMN failed_at INTEGER`);
   }
-  // Migrate old status values to new state machine names
-  database.exec(`UPDATE print_job SET status = 'queued' WHERE status = 'accepted'`);
-  database.exec(`UPDATE print_job SET status = 'retrying' WHERE status = 'needs_retry'`);
+  // Migrate old status values to new state machine names.
+  // KOT job types are never auto-requeued on restart — a duplicate KOT causes
+  // the kitchen to cook the same food twice. Non-KOT jobs are safe to retry.
+  database.exec(`UPDATE print_job SET status = 'queued' WHERE status = 'accepted' AND job_type NOT IN ('KOT', 'BAR_KOT', 'CANCEL_KOT')`);
+  database.exec(`UPDATE print_job SET status = 'failed', failed_at = ${Date.now()}, last_error = 'Edge restart — KOT not auto-requeued to prevent duplicate cook' WHERE status = 'accepted' AND job_type IN ('KOT', 'BAR_KOT', 'CANCEL_KOT')`);
+  database.exec(`UPDATE print_job SET status = 'retrying' WHERE status = 'needs_retry' AND job_type NOT IN ('KOT', 'BAR_KOT', 'CANCEL_KOT')`);
+  database.exec(`UPDATE print_job SET status = 'failed', failed_at = ${Date.now()}, last_error = 'Edge restart — KOT not auto-requeued to prevent duplicate cook' WHERE status = 'needs_retry' AND job_type IN ('KOT', 'BAR_KOT', 'CANCEL_KOT')`);
   // Backfill queued_at from created_at for existing queued/retrying jobs
   database.exec(`UPDATE print_job SET queued_at = created_at WHERE queued_at IS NULL AND status IN ('queued', 'retrying')`);
 
@@ -1494,11 +1498,29 @@ export function reclaimStalePrintingJobs(): number {
   // Reclaim jobs whose lease has expired — either by lease_until or by the old
   // updated_at heuristic (for jobs created before the lease_until column existed)
   const cutoff = now - PRINT_JOB_LEASE_MS;
+  // KOT job types are duplicate-prone: a silently requeued KOT causes the
+  // kitchen to cook the same food twice. Reclaim non-KOT jobs to 'queued'
+  // (so the background loop retries them), but mark KOT jobs as 'failed'
+  // (matching the safeguard in dispatchSinglePrintJob) so they are never
+  // auto-re-dispatched. The captain must retry KOT prints explicitly.
   const result = db.query(
-    `UPDATE print_job SET status = 'queued', updated_at = ?, lease_until = NULL
+    `UPDATE print_job
+     SET status = CASE
+       WHEN job_type IN ('KOT', 'BAR_KOT', 'CANCEL_KOT') THEN 'failed'
+       ELSE 'queued'
+     END,
+     failed_at = CASE
+       WHEN job_type IN ('KOT', 'BAR_KOT', 'CANCEL_KOT') THEN ?
+       ELSE failed_at
+     END,
+     last_error = CASE
+       WHEN job_type IN ('KOT', 'BAR_KOT', 'CANCEL_KOT') THEN 'Stale printing lease — KOT marked failed to prevent auto-reprint'
+       ELSE last_error
+     END,
+     updated_at = ?, lease_until = NULL
      WHERE status = 'printing'
      AND (lease_until IS NOT NULL AND lease_until < ? OR lease_until IS NULL AND updated_at < ?)`,
-  ).run(now, now, cutoff);
+  ).run(now, now, now, cutoff);
 
   // Transition jobs that exceeded max attempts to dead_letter
   const deadLetterResult = db.query(
