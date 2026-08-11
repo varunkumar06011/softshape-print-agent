@@ -81,7 +81,7 @@ function collectBatch(): SyncQueueRow[] {
       -- records from starving the queue and blocking table/section syncs
       -- that would resolve the dependency.
       AND NOT (
-        sq.last_error = 'WAITING_DEPENDENCY'
+        COALESCE(sq.last_error, '') = 'WAITING_DEPENDENCY'
         AND EXISTS (
           SELECT 1 FROM sync_queue sq2
           WHERE sq2.synced = 0
@@ -560,11 +560,13 @@ function reenqueueStaleParent(tableName: string, recordId: string): void {
   };
 
   const resetTable = (tableId: string): void => {
-    const table = db.query('SELECT cloud_synced FROM "table" WHERE id = ?').get(tableId) as any;
-    if (table && table.cloud_synced === 1) {
-      db.query('UPDATE "table" SET cloud_synced = 0 WHERE id = ?').run(tableId);
+    // The "table" table has no cloud_synced column, so we can't check if it
+    // was marked synced. Just re-enqueue it — enqueueSync deduplicates by
+    // updating existing pending rows instead of creating duplicates.
+    const table = db.query('SELECT id FROM "table" WHERE id = ?').get(tableId) as any;
+    if (table) {
       enqueueSync("table", tableId, "create");
-      console.warn(`[Sync] Re-enqueued stale parent table ${tableId} (was marked synced but cloud reports missing)`);
+      console.warn(`[Sync] Re-enqueued parent table ${tableId} for order waiting_dependency`);
     }
   };
 
