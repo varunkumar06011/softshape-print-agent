@@ -391,7 +391,8 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_menu_item_category ON menu_item(category_id);
     CREATE INDEX IF NOT EXISTS idx_menu_item_restaurant ON menu_item(restaurant_id);
     CREATE INDEX IF NOT EXISTS idx_menu_item_available ON menu_item(restaurant_id, is_available, is_deleted);
-    CREATE INDEX IF NOT EXISTS idx_menu_item_combo ON menu_item(restaurant_id, is_combo);
+    -- NOTE: idx_menu_item_combo is created in runMigrations() after ALTER TABLE adds is_combo,
+    -- not here, because CREATE INDEX on a missing column crashes before migrations can run.
 
     -- Menu Item Variants
     CREATE TABLE IF NOT EXISTS menu_item_variant (
