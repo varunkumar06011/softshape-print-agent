@@ -76,6 +76,19 @@ function collectBatch(): SyncQueueRow[] {
     WHERE sq.synced = 0
       AND sq.attempts < ?
       AND (sq.last_error IS NULL OR sq.last_error NOT LIKE 'DEAD_LETTER:%')
+      -- Deprioritize WAITING_DEPENDENCY records: skip them when fresh records
+      -- (last_error IS NULL) are available. This prevents stuck dependency
+      -- records from starving the queue and blocking table/section syncs
+      -- that would resolve the dependency.
+      AND NOT (
+        sq.last_error = 'WAITING_DEPENDENCY'
+        AND EXISTS (
+          SELECT 1 FROM sync_queue sq2
+          WHERE sq2.synced = 0
+            AND sq2.attempts < ?
+            AND sq2.last_error IS NULL
+        )
+      )
       AND NOT (
         sq.table_name IN ('order_item', 'kot', 'transaction')
         AND EXISTS (
@@ -125,7 +138,7 @@ function collectBatch(): SyncQueueRow[] {
       )
     ORDER BY sq.created_at ASC, sq.id ASC
     LIMIT ?
-  `).all(MAX_ATTEMPTS, MAX_BATCH_SIZE) as SyncQueueRow[];
+  `).all(MAX_ATTEMPTS, MAX_ATTEMPTS, MAX_BATCH_SIZE) as SyncQueueRow[];
 }
 
 // ─── Load the full record data for a sync queue entry ────────────────────────
@@ -546,6 +559,15 @@ function reenqueueStaleParent(tableName: string, recordId: string): void {
     }
   };
 
+  const resetTable = (tableId: string): void => {
+    const table = db.query('SELECT cloud_synced FROM "table" WHERE id = ?').get(tableId) as any;
+    if (table && table.cloud_synced === 1) {
+      db.query('UPDATE "table" SET cloud_synced = 0 WHERE id = ?').run(tableId);
+      enqueueSync("table", tableId, "create");
+      console.warn(`[Sync] Re-enqueued stale parent table ${tableId} (was marked synced but cloud reports missing)`);
+    }
+  };
+
   try {
     if (tableName === "transaction" || tableName === "walkin_transaction") {
       const tr = db.query("SELECT order_id FROM transaction_record WHERE id = ?").get(recordId) as any;
@@ -558,6 +580,14 @@ function reenqueueStaleParent(tableName: string, recordId: string): void {
     } else if (tableName === "kot_item") {
       const ki = db.query("SELECT kot_id FROM kot_item WHERE id = ?").get(recordId) as any;
       if (ki && ki.kot_id) resetKot(ki.kot_id);
+    } else if (tableName === "order") {
+      // Order waiting_dependency means the cloud is missing its table (or
+      // section/venue). Re-enqueue the table so it gets pushed before the
+      // order retries. The table upsert on the cloud will create the section
+      // if needed (or return waiting_dependency for the section, which the
+      // next cycle will handle).
+      const order = db.query("SELECT table_id FROM order_record WHERE id = ?").get(recordId) as any;
+      if (order && order.table_id) resetTable(order.table_id);
     }
   } catch (err: any) {
     console.error(`[Sync] reenqueueStaleParent failed for ${tableName}/${recordId}: ${err.message || err}`);
