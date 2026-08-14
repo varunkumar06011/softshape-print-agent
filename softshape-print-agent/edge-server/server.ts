@@ -564,7 +564,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       const healthResp = {
         status: rmHealth.status,
         service: "softshape-edge-server",
-        version: "23.12.24",
+        version: "23.12.25",
         uptime: process.uptime(),
         runtimeState: rmHealth.runtimeState,
         configSyncState: rmHealth.configSyncState,
@@ -625,7 +625,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const healthResp = {
       status: "ok",
       service: "softshape-edge-server",
-      version: "23.12.24",
+      version: "23.12.25",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
@@ -752,6 +752,48 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     }
 
     const targetPrinter = printerName || data?.printerName || null;
+
+    // ── Printer availability check (multi-edge print routing) ──────────────
+    // Three-way logic:
+    //   1. Print service up + printer confirmed present → accept (queue/print)
+    //   2. Print service up + printer confirmed absent   → 404 (try next edge)
+    //   3. Print service down (can't verify ownership)    → 503 (try next edge)
+    //
+    // Case 3 is critical: if we skipped the check and queued the job on an
+    // unverified edge, it could sit in the queue forever while the actual
+    // printer is on a different edge. The 503 tells the caller to try the
+    // next edge URL — the correct edge (with print service up) will accept.
+    if (targetPrinter) {
+      let availablePrinters: string[] = [];
+      let printServiceReachable = false;
+      try {
+        const live = await listPrintersViaService();
+        availablePrinters = live.map((p: any) => p?.name).filter((n: any) => typeof n === "string" && n);
+        printServiceReachable = true;
+      } catch { /* print service not ready */ }
+
+      if (printServiceReachable) {
+        if (availablePrinters.length > 0 && !availablePrinters.includes(targetPrinter)) {
+          return jsonResponse({
+            ok: false,
+            error: `Printer "${targetPrinter}" not available on this edge`,
+            printerNotAvailable: true,
+            availablePrinters,
+          }, 404);
+        }
+        // Printer exists (or no printers reported but service is up — accept)
+      } else {
+        // Print service is DOWN — cannot verify printer ownership.
+        // Do NOT queue on an unverified edge; return 503 so the caller tries
+        // the next edge URL. The correct edge (with print service up) will
+        // accept and queue the job.
+        return jsonResponse({
+          ok: false,
+          error: "Print service unavailable — cannot verify printer ownership",
+          printerServiceUnavailable: true,
+        }, 503);
+      }
+    }
 
     // Normalize ESC/POS data to the format the print bridge expects
     let normalizedEscpos = escposData;
@@ -2935,7 +2977,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   // returns the download URL if an update exists. The Host handles the
   // download, binary swap, and restart.
   if (url.pathname === "/api/edge/update-check" && req.method === "GET") {
-    const currentVersion = "23.12.24";
+    const currentVersion = "23.12.25";
     const backendUrl = getBackendUrl();
     const sessionToken = getSessionToken();
 

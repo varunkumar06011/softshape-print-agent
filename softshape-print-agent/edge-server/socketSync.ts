@@ -23,9 +23,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { io, type Socket } from "socket.io-client";
-import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid } from "./auth.ts";
+import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid, getDeviceId } from "./auth.ts";
 import { applyChangesBatch } from "./config.ts";
-import { getDb, setSyncState, updatePrintJobStatus, createPrintJob, claimPrintJob, cancelPrintJob, getConfig } from "./db.ts";
+import { getDb, setSyncState, getSyncState, updatePrintJobStatus, createPrintJob, claimPrintJob, cancelPrintJob, getConfig } from "./db.ts";
 import { printToPrinter, resolvePrinterName } from "./printer.ts";
 import { printerLog } from "./contract/logger.ts";
 import { listPrintersViaService } from "./printServiceManager.ts";
@@ -127,7 +127,7 @@ export function startSocketSync(): void {
     socket!.emit("edge:register", {
       restaurantId,
       sessionToken: token,
-      edgeVersion: "23.12.24",
+      edgeVersion: "23.12.25",
       capabilities: ["print"],
     });
 
@@ -172,7 +172,7 @@ export function startSocketSync(): void {
     socket!.emit("edge:register", {
       restaurantId,
       sessionToken: freshToken || token,
-      edgeVersion: "23.12.24",
+      edgeVersion: "23.12.25",
       capabilities: ["print"],
     });
 
@@ -183,6 +183,20 @@ export function startSocketSync(): void {
         socket!.emit("edge:printers_report", { restaurantId, availablePrinters: printers });
       }
     } catch { /* non-fatal */ }
+
+    // ── Business sync catch-up ──────────────────────────────────────────────
+    // Fetch business state (orders, KOTs, table status) that was missed while
+    // the socket was disconnected. Real-time events are not buffered by
+    // Socket.IO — without this catch-up, any order created on another edge
+    // during the disconnect would be permanently missed.
+    try {
+      const result = await pullBusinessChanges();
+      if (result.applied > 0) {
+        console.log(`[SocketSync] Reconnect catch-up: ${result.applied} business records applied`);
+      }
+    } catch (err) {
+      console.warn("[SocketSync] Reconnect business catch-up failed:", err);
+    }
   });
 
   // ── Cloud → edge sync events ───────────────────────────────────────────────
@@ -276,6 +290,36 @@ export function startSocketSync(): void {
       }
     } catch (err) {
       console.error("[SocketSync] Failed to apply table_update:", err);
+    }
+  });
+
+  // ── Cross-edge business state sync ─────────────────────────────────────────
+  // When another edge server syncs an order/kot/table to cloud, the cloud
+  // relays the record to all other connected edge servers via this event.
+  // We upsert it into local SQLite so /api/edge/tables returns the correct
+  // state without waiting for the 60s config pull.
+  //
+  // The origin edge skips its own data (it already has the record).
+  // All upserts are idempotent and mark records as cloud_synced=1 so the
+  // sync worker doesn't push them back to cloud.
+  socket.on("edge:business_sync", (data: any) => {
+    try {
+      const originDeviceId = data.originDeviceId || null;
+      const myDeviceId = getDeviceId();
+      if (originDeviceId && myDeviceId && originDeviceId === myDeviceId) {
+        return; // skip own data
+      }
+      const tableName = data.table;
+      const row = data.row;
+      if (!tableName || !row) return;
+
+      const applied = applyBusinessSync(tableName, row);
+      if (applied) {
+        setSyncState("last_socket_sync", new Date().toISOString());
+        console.log(`[SocketSync] Business sync applied: ${tableName}/${row.id || "?"}`);
+      }
+    } catch (err) {
+      console.error("[SocketSync] Failed to apply business_sync:", err);
     }
   });
 
@@ -450,6 +494,307 @@ async function handleCloudPrintJob(envelope: any): Promise<void> {
 
 // R5: relayPrintViaCloud removed — cloud relay path eliminated.
 // The runtime SQLite queue is the sole retry owner (ADR-001).
+
+// ─── Cross-edge business state upsert ────────────────────────────────────────
+// Applies an order/kot/table record received from another edge server (via
+// cloud relay) to local SQLite. All upserts are idempotent:
+//   - If the record already exists with cloud_synced=1 and same/newer
+//     updated_at, skip it (we already have this data or a newer version).
+//   - If the record exists with cloud_synced=0 (we created it locally),
+//     update it only if the incoming data is newer (remote has a newer state).
+//   - If the record doesn't exist, insert it with cloud_synced=1 (we received
+//     it from cloud, no need to push it back).
+//
+// This function does NOT enqueue sync records — the data came FROM cloud, so
+// pushing it back would create a loop.
+
+function applyBusinessSync(tableName: string, row: any): boolean {
+  const db = getDb();
+
+  switch (tableName) {
+    case "order":
+      return upsertOrderFromSync(db, row);
+    case "order_item":
+      return upsertOrderItemFromSync(db, row);
+    case "kot":
+      return upsertKotFromSync(db, row);
+    case "kot_item":
+      return upsertKotItemFromSync(db, row);
+    case "table":
+      return upsertTableFromSync(db, row);
+    default:
+      return false;
+  }
+}
+
+function upsertOrderFromSync(db: any, row: any): boolean {
+  const orderId = row.id || row.order_id;
+  if (!orderId) return false;
+
+  const existing = db.query("SELECT updated_at, cloud_synced, table_id FROM order_record WHERE id = ?").get(orderId) as any;
+  const incomingUpdatedAt = Number(row.updated_at || row.updatedAt || Date.now());
+
+  if (existing) {
+    // Skip if local is same or newer
+    if (Number(existing.updated_at) >= incomingUpdatedAt) return false;
+    // Update existing order (remote has newer state).
+    // table_id is critical — without it, a table transfer on Edge A
+    // (Table 5 → Table 8) won't propagate to Edge B, leaving Edge B
+    // showing the order on the wrong table.
+    db.query(`UPDATE order_record SET
+      table_id = ?, status = ?, total_amount = ?, captain_id = ?, bill_number = ?,
+      billing_requested = ?, revision = ?, updated_at = ?, cloud_synced = 1
+      WHERE id = ?`).run(
+      row.table_id || row.tableId || existing.table_id,
+      row.status || "PREPARING",
+      Number(row.total_amount || row.totalAmount || 0),
+      row.captain_id || row.captainId || null,
+      row.bill_number || row.billNumber || null,
+      row.billing_requested || 0,
+      Number(row.revision || 1),
+      incomingUpdatedAt,
+      orderId,
+    );
+  } else {
+    // Insert new order from remote edge
+    db.query(`INSERT INTO order_record
+      (id, table_id, restaurant_id, status, total_amount, captain_id, platform,
+       created_by_user_id, last_request_id, created_at, updated_at, cloud_synced,
+       is_extra_table, bill_number, billing_requested)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`).run(
+      orderId,
+      row.table_id || row.tableId,
+      row.restaurant_id || row.restaurantId,
+      row.status || "PREPARING",
+      Number(row.total_amount || row.totalAmount || 0),
+      row.captain_id || row.captainId || null,
+      row.platform || "DINE_IN",
+      row.created_by_user_id || row.createdByUserId || null,
+      row.last_request_id || row.lastRequestId || null,
+      Number(row.created_at || row.createdAt || Date.now()),
+      incomingUpdatedAt,
+      row.is_extra_table || row.isExtraTable ? 1 : 0,
+      row.bill_number || row.billNumber || null,
+      row.billing_requested || 0,
+    );
+  }
+
+  // Upsert nested items if present
+  if (Array.isArray(row.items)) {
+    for (const item of row.items) {
+      upsertOrderItemFromSync(db, { ...item, order_id: orderId });
+    }
+  }
+  return true;
+}
+
+function upsertOrderItemFromSync(db: any, row: any): boolean {
+  const itemId = row.id || row.order_item_id;
+  if (!itemId) return false;
+  const orderId = row.order_id || row.orderId;
+  if (!orderId) return false;
+
+  const existing = db.query("SELECT id FROM order_item WHERE id = ?").get(itemId) as any;
+  if (existing) {
+    db.query(`UPDATE order_item SET
+      quantity = ?, cancelled_quantity = ?, removed_from_bill = ?, notes = ?, cloud_synced = 1
+      WHERE id = ?`).run(
+      Number(row.quantity || 1),
+      Number(row.cancelled_quantity || row.cancelledQuantity || 0),
+      row.removed_from_bill || row.removedFromBill ? 1 : 0,
+      row.notes || null,
+      itemId,
+    );
+  } else {
+    db.query(`INSERT INTO order_item
+      (id, order_id, menu_item_id, name, price, quantity, notes, menu_type, cloud_synced,
+       cancelled_quantity, removed_from_bill)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(
+      itemId,
+      orderId,
+      row.menu_item_id || row.menuItemId,
+      row.name,
+      Number(row.price || 0),
+      Number(row.quantity || 1),
+      row.notes || null,
+      row.menu_type || row.menuType || "FOOD",
+      Number(row.cancelled_quantity || row.cancelledQuantity || 0),
+      row.removed_from_bill || row.removedFromBill ? 1 : 0,
+    );
+  }
+  return true;
+}
+
+function upsertKotFromSync(db: any, row: any): boolean {
+  const kotId = row.id || row.kot_id;
+  if (!kotId) return false;
+
+  const existing = db.query("SELECT id FROM kot WHERE id = ?").get(kotId) as any;
+  if (existing) return false; // KOTs are immutable — skip if already exists
+
+  db.query(`INSERT INTO kot
+    (id, restaurant_id, table_id, order_id, kot_number, counter_date, captain_id, created_at, cloud_synced)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+    ON CONFLICT(id) DO NOTHING`).run(
+    kotId,
+    row.restaurant_id || row.restaurantId,
+    row.table_id || row.tableId,
+    row.order_id || row.orderId,
+    Number(row.kot_number || row.kotNumber || 0),
+    row.counter_date || row.counterDate || "",
+    row.captain_id || row.captainId || null,
+    Number(row.created_at || row.createdAt || Date.now()),
+  );
+
+  // Upsert nested items if present
+  if (Array.isArray(row.items)) {
+    for (const item of row.items) {
+      upsertKotItemFromSync(db, { ...item, kot_id: kotId });
+    }
+  }
+  return true;
+}
+
+function upsertKotItemFromSync(db: any, row: any): boolean {
+  const itemId = row.id || row.kot_item_id;
+  if (!itemId) return false;
+  const kotId = row.kot_id || row.kotId;
+  if (!kotId) return false;
+
+  db.query(`INSERT INTO kot_item
+    (id, kot_id, order_item_id, menu_item_id, name, quantity, price, notes, status, created_at, cloud_synced)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+    ON CONFLICT(id) DO UPDATE SET
+      status = excluded.status, cloud_synced = 1`).run(
+    itemId,
+    kotId,
+    row.order_item_id || row.orderItemId,
+    row.menu_item_id || row.menuItemId,
+    row.name,
+    Number(row.quantity || 1),
+    Number(row.price || 0),
+    row.notes || null,
+    row.status || "SENT",
+    Number(row.created_at || row.createdAt || Date.now()),
+  );
+  return true;
+}
+
+function upsertTableFromSync(db: any, row: any): boolean {
+  const tableId = row.id;
+  if (!tableId) return false;
+
+  const existing = db.query("SELECT updated_at FROM \"table\" WHERE id = ?").get(tableId) as any;
+  const incomingUpdatedAt = Number(row.updatedAt || row.updated_at || Date.now());
+
+  if (existing) {
+    // Skip if local is same or newer
+    if (Number(existing.updated_at) >= incomingUpdatedAt) return false;
+    // Update business fields from remote edge
+    const sets: string[] = ["updated_at = ?"];
+    const params: any[] = [incomingUpdatedAt];
+
+    if (row.status !== undefined) { sets.push("status = ?"); params.push(row.status); }
+    if (row.workflowStatus !== undefined || row.workflow_status !== undefined) {
+      sets.push("workflow_status = ?");
+      params.push(row.workflowStatus || row.workflow_status);
+    }
+    if (row.currentBill !== undefined || row.current_bill !== undefined) {
+      sets.push("current_bill = ?");
+      params.push(Number(row.currentBill || row.current_bill || 0));
+    }
+    if (row.captainId !== undefined || row.captain_id !== undefined) {
+      sets.push("captain_id = ?");
+      params.push(row.captainId || row.captain_id || null);
+    }
+    if (row.guests !== undefined) { sets.push("guests = ?"); params.push(Number(row.guests || 0)); }
+    if (row.discount !== undefined) {
+      sets.push("discount = ?");
+      params.push(row.discount ? Number(row.discount) : null);
+    }
+    if (row.sessionStartedAt !== undefined || row.session_started_at !== undefined) {
+      sets.push("session_started_at = ?");
+      params.push(row.sessionStartedAt || row.session_started_at || null);
+    }
+    if (row.kotHistory !== undefined || row.kot_history !== undefined) {
+      const kh = row.kotHistory || row.kot_history;
+      sets.push("kot_history = ?");
+      params.push(typeof kh === "string" ? kh : JSON.stringify(kh || []));
+    }
+
+    params.push(tableId);
+    db.query(`UPDATE "table" SET ${sets.join(", ")} WHERE id = ?`).run(...params);
+  } else {
+    // Table doesn't exist locally — skip (config sync will create it)
+    return false;
+  }
+  return true;
+}
+
+// ─── Business sync catch-up (recovery path) ──────────────────────────────────
+// Called on reconnect and periodically to fetch business state that was missed
+// while the edge was offline. Applies through the same applyBusinessSync()
+// functions used for real-time socket events.
+//
+// The watermark "last_business_sync" in sync_state tracks the last successful
+// catch-up timestamp. On each call, we fetch changes since that timestamp and
+// update the watermark after applying them.
+
+export async function pullBusinessChanges(): Promise<{ success: boolean; applied: number; error?: string }> {
+  const backendUrl = getBackendUrl();
+  const token = getSessionToken();
+  const restaurantId = getRestaurantId();
+
+  if (!backendUrl || !token || !restaurantId) {
+    return { success: false, applied: 0, error: "No valid session" };
+  }
+
+  const since = getSyncState("last_business_sync") || new Date(0).toISOString();
+
+  try {
+    const { cloudFetch } = await import("./cloudFetch.ts");
+    const res = await cloudFetch(`${backendUrl}/api/edge/business-changes?since=${encodeURIComponent(since)}`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      connectTimeout: 10_000,
+      bodyTimeout: 30_000,
+      retries: 2,
+    });
+
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      return { success: false, applied: 0, error: body.error || `HTTP ${res.status}` };
+    }
+
+    const data = await res.json();
+    let applied = 0;
+
+    if (data.changes && Array.isArray(data.changes) && data.changes.length > 0) {
+      for (const change of data.changes) {
+        try {
+          const ok = applyBusinessSync(change.table, change.row);
+          if (ok) applied++;
+        } catch (err) {
+          console.warn(`[SocketSync] Business catch-up failed for ${change.table}/${change.row?.id}:`, err);
+        }
+      }
+    }
+
+    // Update the watermark — next catch-up starts from here
+    setSyncState("last_business_sync", data.timestamp || new Date().toISOString());
+
+    if (applied > 0) {
+      console.log(`[SocketSync] Business catch-up applied ${applied}/${data.changes.length} changes since ${since}`);
+    }
+
+    return { success: true, applied };
+  } catch (err: any) {
+    return { success: false, applied: 0, error: err?.message || String(err) };
+  }
+}
 
 export function isCloudSocketConnected(): boolean {
   return socket?.connected || false;

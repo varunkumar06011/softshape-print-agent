@@ -27,6 +27,7 @@ import { startSocketSync } from "./socketSync.ts";
 
 const SYNC_INTERVAL_MS = parseInt(process.env.EDGE_SYNC_INTERVAL_MS || "5000", 10);
 const CONFIG_PULL_INTERVAL_MS = parseInt(process.env.EDGE_CONFIG_PULL_INTERVAL_MS || "60000", 10);
+const BUSINESS_PULL_INTERVAL_MS = parseInt(process.env.EDGE_BUSINESS_PULL_INTERVAL_MS || "30000", 10);
 const MAX_BATCH_SIZE = 5;
 const MAX_ATTEMPTS = 5;
 const BACKOFF_BASE_MS = 5_000;   // 5 seconds
@@ -36,6 +37,7 @@ const SYNC_SCHEMA_VERSION = 2;
 let syncRunning = false;
 let lastSyncAt = 0;
 let lastConfigPullAt = 0;
+let lastBusinessPullAt = 0;
 let consecutiveFailures = 0;
 let lastSyncResult: { ok: boolean; pushed: number; accepted: number; rejected: number; error?: string } | null = null;
 
@@ -1152,6 +1154,23 @@ async function runSyncCycle(): Promise<void> {
         }
       } catch (pullErr) {
         console.warn("[Sync] Config pull failed:", (pullErr as Error)?.message || pullErr);
+      }
+    }
+
+    // Periodically pull business changes from cloud (orders, KOTs, table state
+    // from other edges). This is the recovery path for missed edge:business_sync
+    // socket events. Runs every 30s — the real-time socket event is the fast
+    // path (<1s); this is the safety net for disconnects and missed events.
+    if (now - lastBusinessPullAt >= BUSINESS_PULL_INTERVAL_MS) {
+      lastBusinessPullAt = now;
+      try {
+        const { pullBusinessChanges } = await import("./socketSync.ts");
+        const result = await pullBusinessChanges();
+        if (result.applied > 0) {
+          console.log(`[Sync] Business pull applied ${result.applied} changes from cloud`);
+        }
+      } catch (pullErr) {
+        console.warn("[Sync] Business pull failed:", (pullErr as Error)?.message || pullErr);
       }
     }
 
