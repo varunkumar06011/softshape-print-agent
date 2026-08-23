@@ -5088,12 +5088,20 @@ export interface SettleOrderInput {
 
   cardAmount?: number;
 
+  upiAmount?: number;
+  otherAmount?: number;
   tipAmount?: number;
 
   cashTipAmount?: number;
 
   cardTipAmount?: number;
 
+  upiTipAmount?: number;
+  otherTipAmount?: number;
+  cashBill?: number;
+  cardBill?: number;
+  upiBill?: number;
+  otherBill?: number;
   discountPercent?: number;
 
   subtotal?: number;
@@ -5342,12 +5350,20 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
 
       cardAmount: input.cardAmount,
 
+      upiAmount: input.upiAmount,
+      otherAmount: input.otherAmount,
       tipAmount: input.tipAmount,
 
       cashTipAmount: input.cashTipAmount,
 
       cardTipAmount: input.cardTipAmount,
 
+      upiTipAmount: input.upiTipAmount,
+      otherTipAmount: input.otherTipAmount,
+      cashBill: input.cashBill,
+      cardBill: input.cardBill,
+      upiBill: input.upiBill,
+      otherBill: input.otherBill,
       discountPercent: input.discountPercent,
 
       subtotal: input.subtotal,
@@ -5488,8 +5504,17 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
 
     cardAmount: input.cardAmount ?? null,
 
+    upiAmount: input.upiAmount ?? null,
+    otherAmount: input.otherAmount ?? null,
     tipAmount: input.tipAmount ?? 0,
-
+    cashTipAmount: input.cashTipAmount ?? 0,
+    cardTipAmount: input.cardTipAmount ?? 0,
+    upiTipAmount: input.upiTipAmount ?? 0,
+    otherTipAmount: input.otherTipAmount ?? 0,
+    cashBill: input.cashBill ?? null,
+    cardBill: input.cardBill ?? null,
+    upiBill: input.upiBill ?? null,
+    otherBill: input.otherBill ?? null,
     discountPercent: input.discountPercent ?? 0,
 
     subtotal: input.subtotal ?? null,
@@ -6690,8 +6715,7 @@ export async function confirmPaymentEdge(
 
   transactionId: string,
 
-  paymentDetails: { paymentMethod?: string; cashAmount?: number; cardAmount?: number; tipAmount?: number; cashTipAmount?: number; cardTipAmount?: number },
-
+  paymentDetails: { paymentMethod?: string; cashAmount?: number; cardAmount?: number; upiAmount?: number; otherAmount?: number; tipAmount?: number; cashTipAmount?: number; cardTipAmount?: number; upiTipAmount?: number; otherTipAmount?: number },
   meta?: CommandMeta,
 
 ): Promise<{ success: boolean; error?: string }> {

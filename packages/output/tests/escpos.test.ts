@@ -149,9 +149,9 @@ describe('renderFinalBill', () => {
     expect(data).toContain('** CANCELLED **');
   });
 
-  it('renders reprint stamp when isReprint is true', () => {
+  it('renders reprint stamp only at the bottom when isReprint is true', () => {
     const data = renderFinalBill({ ...billData, isReprint: true }).blocks[0].data;
-    expect(data).toContain('REPRINT BILL');
+    expect(data).not.toContain('REPRINT BILL');
     expect(data).toContain('** REPRINT **');
   });
 
@@ -350,10 +350,11 @@ describe('renderXReport', () => {
     expect(data).toContain('TEST RESTAURANT');
     expect(data).toContain('1. SALES SUMMARY');
     expect(data).toContain('2. EXPENDITURE BREAKDOWN');
-    expect(data).toContain('3. CASH BALANCE');
+    expect(data).toContain('3. EXPECTED CASH');
     expect(data).toContain('4. CASH DENOMINATION BREAKDOWN');
     expect(data).toContain('TOTAL SALES');
-    expect(data).toContain('CASH BALANCE');
+    expect(data).toContain('EXPECTED CASH');
+    expect(data).toContain('VARIANCE');
     expect(data).toContain('End of Report');
   });
 });

@@ -52,15 +52,6 @@ export function renderFinalBill(data: BillData): RenderedOutput {
     cmds.push(separator("-"));
   }
 
-  if (data.isReprint) {
-    cmds.push(BOLD_ON);
-    cmds.push(SIZE_2X);
-    cmds.push('*** REPRINT BILL ***\n');
-    cmds.push(SIZE_NORMAL);
-    cmds.push(BOLD_OFF);
-    cmds.push(separator("-"));
-  }
-
   const rawTable = (data.tableNumber || 'N/A').toString();
   const tableNumeric = (data.sectionTag && data.sectionTag.startsWith('venue-'))
     ? rawTable
