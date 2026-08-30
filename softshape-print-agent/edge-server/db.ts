@@ -1018,6 +1018,8 @@ function initSchema(database: Database) {
 
       menu_type           TEXT DEFAULT 'FOOD',
 
+      pour_from_inventory_item_id TEXT,
+
       cloud_synced        INTEGER DEFAULT 0
 
     );
@@ -2029,6 +2031,17 @@ function runMigrations(database: Database) {
   }
 
   database.exec(`CREATE INDEX IF NOT EXISTS idx_menu_item_combo ON menu_item(restaurant_id, is_combo)`);
+
+
+
+  // ── v7: order_item.pour_from_inventory_item_id ───────────────────────────
+  // Stores the captain/cashier's bottle selection for liquor pegs (30/60/90ml).
+  // NULL = no selection (skipped) → falls back to largest-bottle-first logic.
+  if (!hasColumn("order_item", "pour_from_inventory_item_id")) {
+
+    database.exec(`ALTER TABLE order_item ADD COLUMN pour_from_inventory_item_id TEXT`);
+
+  }
 
 }
 

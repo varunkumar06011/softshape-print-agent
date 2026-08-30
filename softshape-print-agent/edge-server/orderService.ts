@@ -1360,6 +1360,8 @@ export interface CreateOrderInput {
 
     menuType?: string;
 
+    pourFromInventoryItemId?: string | null;
+
   }>;
 
   captainId?: string;
@@ -2086,11 +2088,11 @@ export async function createOrder(
 
       const orderItemId = crypto.randomUUID();
 
-      db.query(`INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, notes, menu_type, cloud_synced)
+      db.query(`INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, notes, menu_type, pour_from_inventory_item_id, cloud_synced)
 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
 
-      `).run(orderItemId, orderId, item.menuItemId, item.name, Number(item.price), item.quantity, item.notes || null, item.menuType || "FOOD");
+      `).run(orderItemId, orderId, item.menuItemId, item.name, Number(item.price), item.quantity, item.notes || null, item.menuType || "FOOD", item.pourFromInventoryItemId || null);
 
     }
 
@@ -2377,6 +2379,8 @@ export interface UpdateOrderItemsInput {
     notes?: string | null;
 
     menuType?: string;
+
+    pourFromInventoryItemId?: string | null;
 
   }>;
 
@@ -2818,11 +2822,11 @@ export async function updateOrderItems(
 
       newOrderItemIds.push(orderItemId);
 
-      db.query(`INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, notes, menu_type, cloud_synced)
+      db.query(`INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, notes, menu_type, pour_from_inventory_item_id, cloud_synced)
 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
 
-      `).run(orderItemId, orderId, item.menuItemId, item.name, Number(item.price), item.quantity, item.notes || null, item.menuType || "FOOD");
+      `).run(orderItemId, orderId, item.menuItemId, item.name, Number(item.price), item.quantity, item.notes || null, item.menuType || "FOOD", item.pourFromInventoryItemId || null);
 
     }
 
@@ -5943,9 +5947,9 @@ export async function transferItemsEdge(
 
       const newItemId = crypto.randomUUID();
 
-      db.query("INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, notes, menu_type, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)")
+      db.query("INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, notes, menu_type, pour_from_inventory_item_id, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
 
-        .run(newItemId, targetOrder.id, item.menu_item_id, item.name, item.price, effectiveQty, item.notes, item.menu_type);
+        .run(newItemId, targetOrder.id, item.menu_item_id, item.name, item.price, effectiveQty, item.notes, item.menu_type, item.pour_from_inventory_item_id || null);
 
 
 
@@ -6451,9 +6455,9 @@ export async function editBillEdge(
 
         billDelta += itemTotal;
 
-        db.query("INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, notes, menu_type, added_by_cashier, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0)")
+        db.query("INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, notes, menu_type, pour_from_inventory_item_id, added_by_cashier, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0)")
 
-          .run(newItemId, orderId, item.menuItemId || item.id || null, item.name, Number(item.price), item.quantity || 1, item.notes || null, item.menuType || "FOOD");
+          .run(newItemId, orderId, item.menuItemId || item.id || null, item.name, Number(item.price), item.quantity || 1, item.notes || null, item.menuType || "FOOD", item.pourFromInventoryItemId || null);
 
 
 
