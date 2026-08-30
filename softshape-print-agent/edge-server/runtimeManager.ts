@@ -511,6 +511,20 @@ class RuntimeManager {
     this._connectionCheckTimer = setInterval(() => {
       if (this._runtimeState === "STOPPING" || this._runtimeState === "STOPPED") return;
 
+      // ── Retry lock acquisition if we failed at startup ───────────────────
+      // The lock may have been held by a now-dead process. acquireInstanceLock()
+      // takes over stale locks automatically, so retrying here recovers without
+      // a restart. All start* functions are idempotent (guarded by null checks),
+      // so this is a no-op if services are already running.
+      const syncStatus = getSyncStatus();
+      if (!syncStatus.workerRunning) {
+        runtimeLog.info("Sync worker not running — retrying lock acquisition");
+        const lockResult = this.startBackgroundServices("lock-retry", isSessionValid());
+        if (lockResult.acquired) {
+          runtimeLog.info("Lock acquired on retry — background services started");
+        }
+      }
+
       const socketStatus = getSocketStatus();
       const wasOnline = this._connectionState === "ONLINE" || this._connectionState === "DEGRADED";
 
