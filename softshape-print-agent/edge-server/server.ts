@@ -1352,6 +1352,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       requestId: body.requestId,
       deviceId: body.deviceId,
       expectedRevision: body.expectedRevision,
+      settledAt: body.settledAt,
     });
     if (!result.success) return errorResponse(result.error || "Print bill failed", 400);
     return jsonResponse(result);
