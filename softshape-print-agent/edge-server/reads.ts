@@ -21,6 +21,30 @@ import { runtimeLog } from "./contract/logger.ts";
 
 const ACTIVE_ORDER_STATUSES = ["PENDING", "CONFIRMED", "PREPARING", "READY", "BILLING_REQUESTED"];
 
+// ── Brand grouping utilities (mirror of backend's barMatching.ts) ────────────
+// These MUST stay in sync with src/utils/barMatching.ts in the backend repo.
+// They are duplicated here because the edge server is a standalone codebase
+// with no shared dependency on the backend.
+
+function parseMlFromName(name: string): number | null {
+  if (!name) return null;
+  const ltrMatch = name.match(/(\d+)\s*l(?:tr|itre|iter)?\b/i);
+  if (ltrMatch) return parseInt(ltrMatch[1], 10) * 1000;
+  const mlMatch = name.match(/(\d+)\s*ml\b/i);
+  if (mlMatch) return parseInt(mlMatch[1], 10);
+  return null;
+}
+
+function normalizeProductBaseName(name: string): string {
+  return name.toLowerCase()
+    .replace(/\s*\(.*?\)\s*/g, ' ')
+    .replace(/\s*\d+\s*(?:ml|l(?:tr|itre|iter)?|l)\b/gi, ' ')
+    .replace(/\s*(full\s+bottle|bottle|tin|can)\s*/gi, ' ')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 // ── In-memory cache for static config reads ──────────────────────────────────
 // These tables only change on config sync, so we cache the query results
 // and invalidate them when a config sync completes. This eliminates redundant
@@ -553,6 +577,9 @@ export function getMenu(venueId?: string): any[] {
           isAvailable: !!a.is_available,
         })),
         venuePrices: allVenuePricesByItem[m.id] || {},
+        // Brand grouping fields — same source of truth as backend's barMatching.ts
+        brandKey: (() => { const s = parseMlFromName(m.name); return s !== null ? normalizeProductBaseName(m.name) : null; })(),
+        sizeMl: parseMlFromName(m.name),
       };
     });
 
@@ -671,6 +698,9 @@ export function getMenuItems(venueId?: string): any[] {
         printerName: m.printer_name || null,
         venuePrices: venueId ? (venuePriceMap.has(m.id) ? { [venueId]: venuePriceMap.get(m.id)! } : {}) : (allVenuePricesByItem[m.id] ?? {}),
         venueAvailabilities: venueAvailByItem[m.id] ?? {},
+        // Brand grouping fields — same source of truth as backend's barMatching.ts
+        brandKey: (() => { const s = parseMlFromName(m.name); return s !== null ? normalizeProductBaseName(m.name) : null; })(),
+        sizeMl: parseMlFromName(m.name),
       };
     });
 

@@ -4507,6 +4507,45 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     }
   }
 
+  // ── Bar inventory bottles-for-menu proxy ────────────────────────────────────
+  // Cashier/captain devices that logged in via PIN have an edge-local token,
+  // not a cloud JWT. Direct calls to /api/bar/inventory/bottles-for-menu/:id
+  // get 401. This proxy forwards to the cloud backend's
+  // /api/edge/bar/inventory/bottles-for-menu/:id endpoint (which accepts the
+  // agent session token), so PIN-logged-in devices can use the peg bottle picker.
+  // Inventory items are NOT synced to edge SQLite, so we must proxy to cloud.
+  if (url.pathname.startsWith("/api/edge/bar/inventory/bottles-for-menu/") && req.method === "GET") {
+    const backendUrl = getBackendUrl();
+    const sessionToken = getSessionToken();
+    if (!backendUrl || !sessionToken) {
+      return errorResponse("Edge server not registered with cloud", 503);
+    }
+    const restaurantId = getRestaurantId();
+    const searchParams = new URLSearchParams(url.search);
+    if (restaurantId && !searchParams.get("restaurantId")) {
+      searchParams.set("restaurantId", restaurantId);
+    }
+    const cloudUrl = `${backendUrl}${url.pathname}?${searchParams.toString()}`;
+    try {
+      const cloudRes = await cloudFetch(cloudUrl, {
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${sessionToken}`,
+          "Accept": "application/json",
+        },
+        timeout: 20_000,
+      });
+      const body = await cloudRes.text();
+      return new Response(body, {
+        status: cloudRes.status,
+        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+      });
+    } catch (err: any) {
+      console.warn(`[EdgeServer] Bottles-for-menu proxy error: ${err?.message}`);
+      return errorResponse("Cloud backend unreachable", 502);
+    }
+  }
+
   // ── 404 ─────────────────────────────────────────────────────────────────────
   return errorResponse("Not found", 404);
 }
