@@ -28,7 +28,7 @@ import { startSocketSync } from "./socketSync.ts";
 const SYNC_INTERVAL_MS = parseInt(process.env.EDGE_SYNC_INTERVAL_MS || "5000", 10);
 const CONFIG_PULL_INTERVAL_MS = parseInt(process.env.EDGE_CONFIG_PULL_INTERVAL_MS || "60000", 10);
 const BUSINESS_PULL_INTERVAL_MS = parseInt(process.env.EDGE_BUSINESS_PULL_INTERVAL_MS || "30000", 10);
-const MAX_BATCH_SIZE = 50;
+const MAX_BATCH_SIZE = 5;
 const MAX_ATTEMPTS = 5;
 const BACKOFF_BASE_MS = 5_000;   // 5 seconds
 const BACKOFF_MAX_MS = 60_000;   // 1 minute cap
