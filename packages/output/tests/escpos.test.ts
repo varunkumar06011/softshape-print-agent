@@ -350,11 +350,10 @@ describe('renderXReport', () => {
     expect(data).toContain('TEST RESTAURANT');
     expect(data).toContain('1. SALES SUMMARY');
     expect(data).toContain('2. EXPENDITURE BREAKDOWN');
-    expect(data).toContain('3. EXPECTED CASH');
+    expect(data).toContain('3. CASH BALANCE');
     expect(data).toContain('4. CASH DENOMINATION BREAKDOWN');
     expect(data).toContain('TOTAL SALES');
-    expect(data).toContain('EXPECTED CASH');
-    expect(data).toContain('VARIANCE');
+    expect(data).toContain('CASH BALANCE');
     expect(data).toContain('End of Report');
   });
 });
