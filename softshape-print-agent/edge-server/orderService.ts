@@ -34,6 +34,38 @@ import { lanBroadcast } from "./lanBroadcast.ts";
 
 
 
+// ─── Captain name resolution (local users table) ─────────────────────────────
+
+// Mirrors cloud utils/captainMap.ts. Resolves captain_id (UUID) → display name
+
+// for bill printing. In-memory cache, never invalidated (names rarely change).
+
+const captainNameCache = new Map<string, string>();
+
+function resolveCaptainName(captainId: string | null | undefined): string | null {
+
+  if (!captainId) return null;
+
+  const cached = captainNameCache.get(captainId);
+
+  if (cached) return cached;
+
+  const user = getDb().query("SELECT name FROM users WHERE id = ?").get(captainId) as { name?: string } | null;
+
+  if (user?.name) {
+
+    captainNameCache.set(captainId, user.name);
+
+    return user.name;
+
+  }
+
+  return null;
+
+}
+
+
+
 // ─── Phase 1: Command metadata + durable idempotency ─────────────────────────
 
 // Every edge business command carries CommandMeta for idempotency and optimistic
@@ -4498,7 +4530,7 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
 
     tableNumber: String(formattedTableNumber),
 
-    captain: order.captain_id || "N/A",
+    captain: resolveCaptainName(order.captain_id) || order.captain_id || "N/A",
 
     items: groupedBillItems,
 
