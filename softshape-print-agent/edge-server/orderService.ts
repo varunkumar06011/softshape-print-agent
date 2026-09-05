@@ -4453,9 +4453,9 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
   // Format date/time in IST
   // For reprints of settled orders, use the original settlement date/time
   // so the printed bill shows when it was actually settled, not today.
-  // Priority: settleData.settledAt (local DB) → input.settledAt (frontend) → now
+  // Priority: settleData.settledAt (local DB) → input.settledAt (frontend) → order.paid_at → now
   const now = new Date();
-  const settleTsRaw = settleData?.settledAt || (input as any).settledAt;
+  const settleTsRaw = settleData?.settledAt || (input as any).settledAt || order.paid_at;
   const settlementTs = settleTsRaw ? new Date(settleTsRaw) : null;
   const billDate = (settlementTs && !isNaN(settlementTs.getTime())) ? settlementTs : now;
   const dateStr = billDate.toLocaleDateString("en-IN", { day: "2-digit", month: "2-digit", year: "numeric", timeZone: "Asia/Kolkata" });
