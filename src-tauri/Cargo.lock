@@ -3453,7 +3453,7 @@ dependencies = [
 
 [[package]]
 name = "softshape-print-agent"
-version = "24.0.6"
+version = "24.0.7"
 dependencies = [
  "serde",
  "serde_json",
