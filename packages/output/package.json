@@ -1,6 +1,6 @@
 {
   "name": "@softshape/output",
-  "version": "23.12.31",
+  "version": "23.12.32",
   "private": true,
   "main": "./dist/index.js",
   "module": "./src/index.ts",
