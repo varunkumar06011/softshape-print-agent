@@ -1669,6 +1669,14 @@ function runMigrations(database: Database) {
 
   }
 
+  // section.is_default — added for section sync compatibility. CREATE TABLE
+  // IF NOT EXISTS does not add this column to databases created by older builds.
+  // Without this migration, onboarding fails while downloading sections with
+  // "table section has no column named is_default".
+  if (!hasColumn("section", "is_default")) {
+    database.exec(`ALTER TABLE section ADD COLUMN is_default INTEGER DEFAULT 0`);
+  }
+
 
 
   // venue.kot_enabled — added for KOT printing gate. If missing, SELECT v.kot_enabled
