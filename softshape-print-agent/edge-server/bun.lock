@@ -5,7 +5,7 @@
     "": {
       "name": "softshape-edge-server",
       "dependencies": {
-        "@softshape/output": "file:../../../packages/output",
+        "@softshape/output": "file:../../packages/output",
         "bcryptjs": "^2.4.3",
         "socket.io-client": "^4.7.5",
       },
@@ -118,7 +118,7 @@
 
     "@socket.io/component-emitter": ["@socket.io/component-emitter@3.1.2", "", {}, "sha512-9BCxFwvbGg/RsZK9tjXd8s4UcwR0MWeFQ1XEKIQVVvAGJyINdrqKMcTRyLoK8Rse1GjzLV9cwjWV1olXRWEXVA=="],
 
-    "@softshape/output": ["@softshape/output@file:../../../packages/output", { "dependencies": { "typescript": "^5.9.3" }, "devDependencies": { "vitest": "^2.1.0" } }],
+    "@softshape/output": ["@softshape/output@file:../../packages/output", { "dependencies": { "typescript": "^5.9.3" }, "devDependencies": { "vitest": "^2.1.0" } }],
 
     "@types/bcryptjs": ["@types/bcryptjs@2.4.6", "", {}, "sha512-9xlo6R2qDs5uixm0bcIqCeMCE6HiQsIyel9KQySStiyqNl2tnj2mP3DX1Nf56MD6KMenNNlBBsy3LJ7gUEQPXQ=="],
 
