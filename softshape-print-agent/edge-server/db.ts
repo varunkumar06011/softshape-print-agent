@@ -1008,7 +1008,9 @@ function initSchema(database: Database) {
 
     CREATE INDEX IF NOT EXISTS idx_order_revision ON order_record(revision);
 
-    CREATE INDEX IF NOT EXISTS idx_order_cloud_synced_version ON order_record(cloud_synced_version) WHERE revision > cloud_synced_version;
+    -- idx_order_cloud_synced_version is created in runMigrations() after ALTER TABLE
+    -- adds cloud_synced_version for pre-v11 DBs. Creating it here crashes on existing
+    -- databases where the column doesn't exist yet, because initSchema runs BEFORE runMigrations.
 
 
 
@@ -1492,7 +1494,9 @@ function initSchema(database: Database) {
 
     CREATE INDEX IF NOT EXISTS idx_expenditure_synced ON expenditure(cloud_synced) WHERE cloud_synced = 0;
 
-    CREATE INDEX IF NOT EXISTS idx_expenditure_sync_version ON expenditure(sync_version, cloud_synced_version) WHERE sync_version > cloud_synced_version;
+    -- idx_expenditure_sync_version is created in runMigrations() after ALTER TABLE
+    -- adds sync_version/cloud_synced_version for pre-v11 DBs. Same reason as
+    -- idx_expenditure_employee above — initSchema runs BEFORE runMigrations.
 
     -- idx_expenditure_employee and idx_expenditure_ledger are created in
 
@@ -1628,7 +1632,8 @@ function initSchema(database: Database) {
 
     CREATE INDEX IF NOT EXISTS idx_txn_record_synced ON transaction_record(cloud_synced) WHERE cloud_synced = 0;
 
-    CREATE INDEX IF NOT EXISTS idx_txn_record_sync_version ON transaction_record(sync_version, cloud_synced_version) WHERE sync_version > cloud_synced_version;
+    -- idx_txn_record_sync_version is created in runMigrations() after ALTER TABLE
+    -- adds sync_version/cloud_synced_version for pre-v11 DBs. initSchema runs BEFORE runMigrations.
 
   `);
 
