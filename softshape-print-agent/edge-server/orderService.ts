@@ -836,9 +836,21 @@ export async function dispatchPendingPrintJobs(): Promise<{ dispatched: number; 
 
     let dispatched = 0;
 
+    let suppressedKots = 0;
+
 
 
     for (const job of pending) {
+
+      if (isKotJobType(job.job_type)) {
+
+        updatePrintJobStatus(job.event_id, "failed", "Queued KOT requires explicit retry to prevent delayed duplicate printing");
+
+        suppressedKots++;
+
+        continue;
+
+      }
 
       const printerKey = job.printer_name || "__auto__";
 
@@ -904,7 +916,7 @@ export async function dispatchPendingPrintJobs(): Promise<{ dispatched: number; 
 
 
 
-    return { dispatched, remaining: pending.length - dispatched };
+    return { dispatched, remaining: pending.length - dispatched - suppressedKots };
 
   } finally {
 
@@ -7276,27 +7288,59 @@ export async function listTransactionsEdge(
 
   const settledOrders = db.query(orderQuery).all(...orderParams) as any[];
 
+  const settledOrderIds = new Set(settledOrders.map(order => order.id));
+
+  const paymentByOrderId = new Map<string, any>();
+
+  const paymentRows = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%'").all() as Array<{ value: string }>;
+
+  for (const row of paymentRows) {
+
+    try {
+
+      const payment = JSON.parse(row.value);
+
+      if (settledOrderIds.has(payment.orderId)) paymentByOrderId.set(payment.orderId, payment);
+
+    } catch {}
+
+  }
+
+  const itemsByOrderId = new Map<string, any[]>();
+
+  for (let i = 0; i < settledOrders.length; i += 500) {
+
+    const orderIds = settledOrders.slice(i, i + 500).map(order => order.id);
+
+    if (orderIds.length === 0) continue;
+
+    const placeholders = orderIds.map(() => "?").join(",");
+
+    const itemRows = db.query(
+
+      `SELECT order_id, name, quantity, cancelled_quantity, price, menu_type FROM order_item WHERE order_id IN (${placeholders}) AND removed_from_bill = 0 AND quantity > 0`,
+
+    ).all(...orderIds) as any[];
+
+    for (const item of itemRows) {
+
+      const items = itemsByOrderId.get(item.order_id) || [];
+
+      items.push(item);
+
+      itemsByOrderId.set(item.order_id, items);
+
+    }
+
+  }
+
 
 
   for (const order of settledOrders) {
 
-    // Look up payment details from edge_config
+    const paymentData = paymentByOrderId.get(order.id) || {};
 
-    const paymentRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
-
-    let paymentData: any = {};
-
-    if (paymentRow?.value) {
-
-      try { paymentData = JSON.parse(paymentRow.value); } catch {}
-
-    }
-
-
-
-    // Get items for this order
-
-    const items = db.query("SELECT name, quantity, cancelled_quantity, price, menu_type FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0").all(order.id) as any[];
+    const items = itemsByOrderId.get(order.id) || [];
 
 
 

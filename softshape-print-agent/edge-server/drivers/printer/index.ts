@@ -13,19 +13,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { BaseDriver } from "../types.ts";
-import { isPrintServiceReady, getPrintServiceStatus, startPrintService } from "../../printServiceManager.ts";
+import { isPrintServiceReady, getPrintServiceStatus } from "../../printServiceManager.ts";
 
 export class PrinterDriver extends BaseDriver {
   readonly name = "printer";
   readonly type = "printer" as const;
 
   async initialize(): Promise<void> {
-    const started = await startPrintService();
-    if (!started) {
-      this.setState("OFFLINE", "print service could not be started");
-      return;
-    }
-
     if (isPrintServiceReady()) {
       this.setState("READY");
     } else {

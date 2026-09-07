@@ -480,19 +480,59 @@ describe('Dead-letter reset logic', () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { getDb, setDb, closeDb, markUnsynced, nextOrderRevision, nextExpenditureRevision, nextTransactionRevision, migrateSyncQueueToRevisions, reclaimStalePrintingJobs } from "./db.ts";
+import { dispatchPendingPrintJobs, listTransactionsEdge } from "./orderService.ts";
+
+describe('transaction listing', () => {
+  beforeEach(() => {
+    const db = createTestDb();
+    db.exec(`
+      CREATE TABLE "table" (id TEXT PRIMARY KEY, number INTEGER, section_tag TEXT, section_id TEXT);
+      CREATE TABLE section (id TEXT PRIMARY KEY, name TEXT);
+      CREATE TABLE order_item (order_id TEXT, name TEXT, quantity INTEGER, cancelled_quantity INTEGER DEFAULT 0, price REAL, menu_type TEXT, removed_from_bill INTEGER DEFAULT 0);
+      CREATE INDEX idx_order_item_order ON order_item(order_id);
+    `);
+    const insertOrder = db.query("INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, paid_at, bill_number) VALUES (?, 'table-1', 'rest-1', 'SETTLED', ?, ?, ?)");
+    const insertPayment = db.query("INSERT INTO edge_config (key, value, updated_at) VALUES (?, ?, ?)");
+    const insertItem = db.query("INSERT INTO order_item (order_id, name, quantity, price) VALUES (?, 'Item', 1, ?)");
+    db.transaction(() => {
+      for (let i = 0; i < 2000; i++) {
+        const orderId = `order-${i}`;
+        insertOrder.run(orderId, i + 1, Date.now() - i, `B-${i}`);
+        insertPayment.run(`settle:txn-${i}`, JSON.stringify({ orderId, grandTotal: i + 1, paymentMethod: 'CASH' }), Date.now());
+        insertItem.run(orderId, i + 1);
+      }
+    })();
+    setDb(db);
+  });
+
+  afterEach(() => closeDb());
+
+  it('loads large transaction history without per-order payment scans', async () => {
+    const transactions = await listTransactionsEdge('rest-1', { limit: 2000 });
+    expect(transactions).toHaveLength(2000);
+    expect(transactions[0].items).toHaveLength(1);
+    expect(transactions[0].method).toBe('CASH');
+  });
+});
 
 describe('print job recovery', () => {
   beforeEach(() => {
     const db = createTestDb();
     db.exec(`CREATE TABLE print_job (
-      event_id TEXT PRIMARY KEY,
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id TEXT UNIQUE NOT NULL,
       job_type TEXT NOT NULL,
       status TEXT NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0,
       failed_at INTEGER,
       last_error TEXT,
+      acked_via TEXT,
+      printed_at INTEGER,
       updated_at INTEGER NOT NULL,
-      lease_until INTEGER
+      next_attempt_at INTEGER,
+      lease_until INTEGER,
+      printer_name TEXT,
+      escpos_data TEXT
     )`);
     setDb(db);
   });
@@ -506,6 +546,16 @@ describe('print job recovery', () => {
     expect(job.status).toBe('dead_letter');
     expect(job.failed_at).toBeGreaterThan(0);
     expect(job.updated_at).toBeGreaterThan(0);
+  });
+
+  it('does not automatically dispatch queued KOT jobs', async () => {
+    getDb().query("INSERT INTO print_job (event_id, job_type, status, attempts, updated_at, escpos_data) VALUES (?, 'KOT', 'queued', 0, ?, '[]')").run('kot-1', Date.now());
+    const result = await dispatchPendingPrintJobs();
+    const job = getDb().query("SELECT status, last_error FROM print_job WHERE event_id = 'kot-1'").get() as any;
+    expect(result.dispatched).toBe(0);
+    expect(result.remaining).toBe(0);
+    expect(job.status).toBe('failed');
+    expect(job.last_error).toContain('explicit retry');
   });
 });
 
