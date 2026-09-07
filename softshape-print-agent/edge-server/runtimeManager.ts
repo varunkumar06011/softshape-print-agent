@@ -345,9 +345,8 @@ class RuntimeManager {
 
     // ── Step 9: Deferred startup backup ─────────────────────────────────────
     // VACUUM INTO blocks the event loop — run it after READY so health probes
-    // succeed during startup. Schedule on next tick to avoid blocking the
-    // startup completion event.
-    setImmediate(() => {
+    // succeed during startup. Delay it so the Host can observe READY first.
+    setTimeout(() => {
       try {
         runDailyMaintenance(getDb());
         runtimeLog.info("Deferred startup backup complete");
@@ -356,7 +355,7 @@ class RuntimeManager {
           error: err?.stack || err,
         });
       }
-    });
+    }, 30_000);
   }
 
   private startBackgroundServices(reason: string, startCloudServices: boolean): ReturnType<typeof acquireInstanceLock> {

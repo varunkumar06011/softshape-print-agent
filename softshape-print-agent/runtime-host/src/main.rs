@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use softshape_host::{
-    is_heartbeat_stale, read_heartbeat_timestamp, try_acquire_lock, release_lock,
+    is_heartbeat_stale, is_healthy_response, read_heartbeat_timestamp, try_acquire_lock, release_lock,
     lock_file_path, HEARTBEAT_STALE_SECS,
 };
 
@@ -42,6 +42,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const RUNTIME_PORT: u16 = 3101;
 const WATCHDOG_INTERVAL_SECS: u64 = 10;
 const HEALTH_PROBE_TIMEOUT_SECS: u64 = 5;
+const HEALTH_FAILURE_LIMIT: u32 = 3;
 const CRASH_LIMIT: u32 = 5;
 const CRASH_WINDOW_SECS: u64 = 30;
 const UPDATE_CHECK_INTERVAL_SECS: u64 = 3600; // 1 hour
@@ -259,11 +260,9 @@ fn health_probe() -> bool {
     }
 
     let mut response = String::new();
-    if stream.read_to_string(&mut response).is_err() {
-        return false;
-    }
+    let _ = stream.read_to_string(&mut response);
 
-    response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200")
+    is_healthy_response(&response)
 }
 
 // ── Crash-loop guard ─────────────────────────────────────────────────────────
@@ -813,6 +812,7 @@ fn main() {
 
     let mut last_crash_time: Option<Instant> = None;
     let mut crash_window_start: Option<Instant> = None;
+    let mut consecutive_health_failures = 0u32;
     let mut last_update_check: Option<Instant> = Some(Instant::now()); // delay first check
 
     // Write initial heartbeat so the self-watchdog doesn't fire immediately
@@ -909,6 +909,7 @@ fn main() {
 
         // ── Process is still running — health probe ──────────────────────────
         if health_probe() {
+            consecutive_health_failures = 0;
             // Runtime is healthy — reset crash counter
             if last_crash_time.is_some() {
                 let elapsed = last_crash_time.unwrap().elapsed();
@@ -919,11 +920,21 @@ fn main() {
                 }
             }
         } else {
-            // Runtime is unresponsive — kill and respawn
-            log("Runtime health probe failed — killing and respawning");
-            let _ = child.kill();
-            let _ = child.wait();
-            // The next iteration will detect the exit and respawn
+            consecutive_health_failures += 1;
+            if consecutive_health_failures >= HEALTH_FAILURE_LIMIT {
+                log(&format!(
+                    "Runtime health probe failed {} consecutive times — killing and respawning",
+                    consecutive_health_failures
+                ));
+                let _ = child.kill();
+                let _ = child.wait();
+                consecutive_health_failures = 0;
+            } else {
+                log(&format!(
+                    "Runtime health probe failed ({}/{}) — keeping process alive",
+                    consecutive_health_failures, HEALTH_FAILURE_LIMIT
+                ));
+            }
         }
     }
 

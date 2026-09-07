@@ -479,7 +479,35 @@ describe('Dead-letter reset logic', () => {
 // v2 revision-based sync tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
-import { getDb, setDb, closeDb, markUnsynced, nextOrderRevision, nextExpenditureRevision, nextTransactionRevision, migrateSyncQueueToRevisions } from "./db.ts";
+import { getDb, setDb, closeDb, markUnsynced, nextOrderRevision, nextExpenditureRevision, nextTransactionRevision, migrateSyncQueueToRevisions, reclaimStalePrintingJobs } from "./db.ts";
+
+describe('print job recovery', () => {
+  beforeEach(() => {
+    const db = createTestDb();
+    db.exec(`CREATE TABLE print_job (
+      event_id TEXT PRIMARY KEY,
+      job_type TEXT NOT NULL,
+      status TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      failed_at INTEGER,
+      last_error TEXT,
+      updated_at INTEGER NOT NULL,
+      lease_until INTEGER
+    )`);
+    setDb(db);
+  });
+
+  afterEach(() => closeDb());
+
+  it('moves exhausted retrying jobs to dead_letter', () => {
+    getDb().query("INSERT INTO print_job (event_id, job_type, status, attempts, updated_at) VALUES (?, 'BILL', 'retrying', 10, ?)").run('job-1', Date.now());
+    expect(() => reclaimStalePrintingJobs()).not.toThrow();
+    const job = getDb().query("SELECT status, failed_at, updated_at FROM print_job WHERE event_id = 'job-1'").get() as any;
+    expect(job.status).toBe('dead_letter');
+    expect(job.failed_at).toBeGreaterThan(0);
+    expect(job.updated_at).toBeGreaterThan(0);
+  });
+});
 
 describe('v2 revision-based sync helpers', () => {
   beforeEach(() => {

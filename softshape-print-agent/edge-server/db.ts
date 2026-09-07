@@ -358,36 +358,6 @@ export function getDb(): Database {
 
 
 
-  // Enable incremental auto_vacuum so daily maintenance can reclaim free pages
-
-  // from deleted rows without a full VACUUM lock. For existing DBs where
-
-  // auto_vacuum is off (0), set it to INCREMENTAL (2) and run a one-time VACUUM.
-
-  try {
-
-    const av = db.query("PRAGMA auto_vacuum").get() as { auto_vacuum?: number } | undefined;
-
-    if (Number(av?.auto_vacuum || 0) !== 2) {
-
-      console.log("[DB] Enabling incremental auto_vacuum (one-time VACUUM)...");
-
-      db.exec("PRAGMA auto_vacuum = INCREMENTAL");
-
-      db.exec("VACUUM");
-
-      console.log("[DB] Incremental auto_vacuum enabled");
-
-    }
-
-  } catch (err) {
-
-    console.warn("[DB] Could not enable incremental auto_vacuum:", err);
-
-  }
-
-
-
   if (onDiskVersion !== CURRENT_SCHEMA_VERSION) {
 
     db.exec(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
@@ -3320,7 +3290,7 @@ export function reclaimStalePrintingJobs(): number {
 
      WHERE status = 'retrying' AND attempts >= ?`,
 
-  ).run(now, PRINT_JOB_MAX_ATTEMPTS);
+  ).run(now, now, PRINT_JOB_MAX_ATTEMPTS);
 
   if (deadLetterResult.changes > 0) {
 

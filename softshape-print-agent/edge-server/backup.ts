@@ -17,6 +17,7 @@ const MAX_BACKUP_DAYS = 7;
 const ORDER_RETENTION_DAYS = 90;
 
 let lastBackupDate = "";
+let lastPruneDate = "";
 
 // ── Periodic backup (every 30 minutes) ───────────────────────────────────────
 // Creates a VACUUM INTO backup without the full maintenance prune.
@@ -60,8 +61,8 @@ export function runPeriodicBackup(db: Database): void {
 // after the runtime reaches READY (see runtimeManager.ts Step 9).
 export function runStartupPrune(db: Database): void {
   const today = new Date().toISOString().slice(0, 10);
-  if (today === lastBackupDate) return;
-  lastBackupDate = today;
+  if (today === lastPruneDate) return;
+  lastPruneDate = today;
   try {
     pruneOldBackups();
   } catch (err) {
