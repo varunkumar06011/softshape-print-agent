@@ -55,6 +55,25 @@ export function runPeriodicBackup(db: Database): void {
   }
 }
 
+// Prune-only variant for startup — skips the VACUUM INTO backup which blocks
+// the event loop for several seconds on large databases. The full backup runs
+// after the runtime reaches READY (see runtimeManager.ts Step 9).
+export function runStartupPrune(db: Database): void {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today === lastBackupDate) return;
+  lastBackupDate = today;
+  try {
+    pruneOldBackups();
+  } catch (err) {
+    console.error("[Backup] Prune backups failed:", err);
+  }
+  try {
+    pruneOldOrders(db);
+  } catch (err) {
+    console.error("[Backup] Prune orders failed:", err);
+  }
+}
+
 export function runDailyMaintenance(db: Database): void {
   const today = new Date().toISOString().slice(0, 10);
   if (today === lastBackupDate) return;

@@ -37,7 +37,7 @@ import { startSocketSync, stopSocketSync, getSocketStatus, isInFallbackMode } fr
 import { startHeartbeat, stopHeartbeat } from "./socketSync.ts";
 import { startHeartbeatLoop, stopHeartbeatLoop, releaseInstanceLock, acquireInstanceLock } from "./instanceLock.ts";
 import { startPrintService, stopPrintService } from "./printServiceManager.ts";
-import { runDailyMaintenance, runPeriodicBackup } from "./backup.ts";
+import { runDailyMaintenance, runPeriodicBackup, runStartupPrune } from "./backup.ts";
 import { getRecoveryStatus } from "./db.ts";
 
 // ── Singleton ────────────────────────────────────────────────────────────────
@@ -235,13 +235,17 @@ class RuntimeManager {
 
     this.setRuntimeState("STARTING", "startup initiated");
 
-    // ── Step 1: Run startup maintenance (backup + prune) ──────────────────────
+    // ── Step 1: Run startup maintenance (prune only — backup deferred) ───────
+    // VACUUM INTO blocks the event loop for several seconds on large databases,
+    // which causes health probes to time out and the Runtime Host to kill the
+    // process. Defer the backup until after the runtime is READY (Step 9 below).
+    // Pruning is fast (indexed queries) and safe to run immediately.
     try {
-      runDailyMaintenance(getDb());
-      runtimeLog.info("Startup maintenance complete");
+      runStartupPrune(getDb());
+      runtimeLog.info("Startup prune complete (backup deferred until READY)");
     } catch (err: any) {
       this._startupError = err?.message || String(err);
-      runtimeLog.error("Startup maintenance failed (non-fatal)", {
+      runtimeLog.error("Startup prune failed (non-fatal)", {
         error: err?.stack || err,
       });
     }
@@ -338,6 +342,21 @@ class RuntimeManager {
     // ── Step 8: Start background timers ──────────────────────────────────────
     this.startMaintenanceTimers();
     this.startConnectionMonitor();
+
+    // ── Step 9: Deferred startup backup ─────────────────────────────────────
+    // VACUUM INTO blocks the event loop — run it after READY so health probes
+    // succeed during startup. Schedule on next tick to avoid blocking the
+    // startup completion event.
+    setImmediate(() => {
+      try {
+        runDailyMaintenance(getDb());
+        runtimeLog.info("Deferred startup backup complete");
+      } catch (err: any) {
+        runtimeLog.error("Deferred startup backup failed (non-fatal)", {
+          error: err?.stack || err,
+        });
+      }
+    });
   }
 
   private startBackgroundServices(reason: string, startCloudServices: boolean): ReturnType<typeof acquireInstanceLock> {

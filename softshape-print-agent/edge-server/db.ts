@@ -2172,6 +2172,8 @@ function runMigrations(database: Database) {
     database.exec(`ALTER TABLE order_record ADD COLUMN last_sync_error TEXT`);
   }
   database.exec(`CREATE INDEX IF NOT EXISTS idx_order_cloud_synced_version ON order_record(cloud_synced_version) WHERE revision > cloud_synced_version`);
+  // Index for reconcileWithCloud: SELECT id FROM order_record WHERE cloud_synced_version > 0 AND is_deleted = 0
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_order_synced_lookup ON order_record(cloud_synced_version) WHERE cloud_synced_version > 0 AND is_deleted = 0`);
 
   if (!hasColumn("transaction_record", "sync_version")) {
     database.exec(`ALTER TABLE transaction_record ADD COLUMN sync_version INTEGER NOT NULL DEFAULT 1`);
@@ -2189,6 +2191,8 @@ function runMigrations(database: Database) {
     database.exec(`ALTER TABLE transaction_record ADD COLUMN last_sync_error TEXT`);
   }
   database.exec(`CREATE INDEX IF NOT EXISTS idx_txn_record_sync_version ON transaction_record(sync_version, cloud_synced_version) WHERE sync_version > cloud_synced_version`);
+  // Index for reconcileWithCloud: SELECT id FROM transaction_record WHERE cloud_synced_version > 0
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_txn_record_synced_lookup ON transaction_record(cloud_synced_version) WHERE cloud_synced_version > 0`);
 
   if (!hasColumn("expenditure", "sync_version")) {
     database.exec(`ALTER TABLE expenditure ADD COLUMN sync_version INTEGER NOT NULL DEFAULT 1`);
@@ -2206,6 +2210,8 @@ function runMigrations(database: Database) {
     database.exec(`ALTER TABLE expenditure ADD COLUMN last_sync_error TEXT`);
   }
   database.exec(`CREATE INDEX IF NOT EXISTS idx_expenditure_sync_version ON expenditure(sync_version, cloud_synced_version) WHERE sync_version > cloud_synced_version`);
+  // Index for reconcileWithCloud: SELECT id FROM expenditure WHERE cloud_synced_version > 0
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_expenditure_synced_lookup ON expenditure(cloud_synced_version) WHERE cloud_synced_version > 0`);
 
 }
 
@@ -3555,7 +3561,13 @@ export function migrateSyncQueueToRevisions(): { migrated: boolean; pendingConve
 
   let syncedMarked = 0;
 
+  // Wrap all UPDATEs in a single transaction to avoid 1680+ individual fsyncs
 
+  // that block the event loop for ~8 seconds on existing databases.
+
+  db.query("BEGIN").run();
+
+  try {
 
   // 1. Orders pending in sync_queue → set cloud_synced_version = revision - 1
 
@@ -3685,6 +3697,18 @@ export function migrateSyncQueueToRevisions(): { migrated: boolean; pendingConve
     "INSERT INTO edge_config (key, value, updated_at) VALUES ('v11_revision_sync_migrated', '1', ?) ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = ?",
 
   ).run(Date.now(), Date.now());
+
+
+
+  db.query("COMMIT").run();
+
+  } catch (err) {
+
+    try { db.query("ROLLBACK").run(); } catch {}
+
+    throw err;
+
+  }
 
 
 
