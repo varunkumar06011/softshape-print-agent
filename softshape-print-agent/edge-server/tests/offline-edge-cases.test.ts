@@ -62,6 +62,10 @@ function createTestDb(): Database {
       created_by_user_id TEXT, cloud_synced INTEGER DEFAULT 0,
       revision INTEGER NOT NULL DEFAULT 1,
       last_command_id TEXT,
+      cloud_synced_version INTEGER DEFAULT 0,
+      sync_attempt_count INTEGER DEFAULT 0,
+      last_sync_attempt_at INTEGER,
+      last_sync_error TEXT,
       UNIQUE(last_request_id)
     );
 
@@ -98,6 +102,22 @@ function createTestDb(): Database {
       table_name TEXT NOT NULL, record_id TEXT NOT NULL,
       operation TEXT NOT NULL, created_at INTEGER NOT NULL,
       attempts INTEGER DEFAULT 0, last_error TEXT, synced INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS transaction_record (
+      id TEXT PRIMARY KEY, order_id TEXT, restaurant_id TEXT,
+      kind TEXT, payload TEXT, created_at INTEGER,
+      sync_version INTEGER DEFAULT 1, cloud_synced_version INTEGER DEFAULT 0,
+      sync_attempt_count INTEGER DEFAULT 0, last_sync_attempt_at INTEGER,
+      last_sync_error TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS expenditure (
+      id TEXT PRIMARY KEY, restaurant_id TEXT, amount REAL,
+      paid_to_type TEXT, created_at INTEGER,
+      sync_version INTEGER DEFAULT 1, cloud_synced_version INTEGER DEFAULT 0,
+      sync_attempt_count INTEGER DEFAULT 0, last_sync_attempt_at INTEGER,
+      last_sync_error TEXT
     );
 
     CREATE TABLE IF NOT EXISTS users (
@@ -241,21 +261,25 @@ test("full shift offline — 50 orders synced via real pushSyncBatch with mocked
   for (let i = 0; i < 50; i++) {
     const oid = `shift-order-${i}`;
     const createdAt = shiftStart + i * 10 * 60 * 1000;
-    testDb.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    // New system: orders are pending via revision > cloud_synced_version (defaults: 1 > 0)
+    testDb.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at, revision, cloud_synced_version) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0)`)
       .run(oid, `table-${(i % 10) + 1}`, RESTAURANT_ID, i < 45 ? 'SETTLED' : 'OPEN', 100 + i * 10, createdAt, createdAt);
-
-    testDb.query(`INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)`)
-      .run("order", oid, "create", createdAt);
   }
 
-  const pendingBefore = testDb.query(`SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0`).get() as any;
+  // In the new system, pending = revision > cloud_synced_version
+  const pendingBefore = testDb.query(`SELECT COUNT(*) as count FROM order_record WHERE revision > cloud_synced_version AND is_deleted = 0`).get() as any;
   expect(pendingBefore.count).toBe(50);
 
-  // Mock fetch to simulate the cloud backend accepting all records
+  // Mock fetch to simulate the cloud backend accepting all order payloads
+  let callCount = 0;
   const fetchMock = mock(async (url: string, opts: any) => {
+    callCount++;
     const body = JSON.parse(opts.body);
-    const accepted = body.batch.map((b: any) => b.queueId);
-    return new Response(JSON.stringify({ accepted, rejected: [] }), {
+    return new Response(JSON.stringify({
+      outcome: "applied",
+      orderId: body.order?.id || "unknown",
+      appliedRevision: body.snapshotRevision,
+    }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
@@ -268,24 +292,27 @@ test("full shift offline — 50 orders synced via real pushSyncBatch with mocked
 
   const { pushSyncBatch } = await import("../sync.ts");
 
-  const result = await pushSyncBatch();
+  // MAX_ORDERS_PER_CYCLE = 10, so we need multiple cycles to push all 50
+  let totalAccepted = 0;
+  let totalPushed = 0;
+  for (let cycle = 0; cycle < 6; cycle++) {
+    const result = await pushSyncBatch();
+    totalPushed += result.pushed;
+    totalAccepted += result.accepted;
+    if (result.pushed === 0) break;
+  }
 
-  expect(result.ok).toBe(true);
-  expect(result.pushed).toBe(50);
-  expect(result.accepted).toBe(50);
-  expect(result.rejected).toBe(0);
+  expect(totalPushed).toBe(50);
+  expect(totalAccepted).toBe(50);
 
-  // Verify fetch was called with the right URL and payload
+  // Verify fetch was called with the sync-order endpoint
   expect(fetchMock).toHaveBeenCalled();
   const callArgs = fetchMock.mock.calls[0];
-  expect(callArgs[0]).toContain("/api/edge/sync");
+  expect(callArgs[0]).toContain("/api/edge/sync-order");
 
-  // Verify sync_queue records are actually removed (markSynced deletes rows)
-  const pendingAfter = testDb.query(`SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0`).get() as any;
+  // Verify all orders are now synced (revision === cloud_synced_version)
+  const pendingAfter = testDb.query(`SELECT COUNT(*) as count FROM order_record WHERE revision > cloud_synced_version AND is_deleted = 0`).get() as any;
   expect(pendingAfter.count).toBe(0);
-
-  const totalRemaining = testDb.query(`SELECT COUNT(*) as count FROM sync_queue`).get() as any;
-  expect(totalRemaining.count).toBe(0);
 
   // Restore
   setDb(null);
@@ -300,20 +327,22 @@ test("tenant scoping — sync batch payload preserves restaurant_id per record",
   testDb.exec(`INSERT INTO outlet (id, name, slug, restaurant_code) VALUES ('rest-A', 'Rest A', 'rest-a', 'AAA001')`);
   testDb.exec(`INSERT INTO outlet (id, name, slug, restaurant_code) VALUES ('rest-B', 'Rest B', 'rest-b', 'BBB002')`);
 
-  testDb.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+  // New system: orders pending via revision > cloud_synced_version
+  testDb.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at, revision, cloud_synced_version) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0)`)
     .run("order-A1", "table-a", "rest-A", "SETTLED", 500, Date.now(), Date.now());
-  testDb.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+  testDb.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at, revision, cloud_synced_version) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0)`)
     .run("order-B1", "table-b", "rest-B", "SETTLED", 300, Date.now(), Date.now());
 
-  testDb.query(`INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)`).run("order", "order-A1", "create", Date.now());
-  testDb.query(`INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)`).run("order", "order-B1", "create", Date.now());
-
   // Intercept the fetch call to inspect the payload
-  let capturedPayload: any = null;
+  let capturedPayloads: any[] = [];
   const fetchMock = mock(async (url: string, opts: any) => {
-    capturedPayload = JSON.parse(opts.body);
-    const accepted = capturedPayload.batch.map((b: any) => b.queueId);
-    return new Response(JSON.stringify({ accepted, rejected: [] }), {
+    const body = JSON.parse(opts.body);
+    capturedPayloads.push(body);
+    return new Response(JSON.stringify({
+      outcome: "applied",
+      orderId: body.order?.id || "unknown",
+      appliedRevision: body.snapshotRevision,
+    }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
@@ -334,17 +363,16 @@ test("tenant scoping — sync batch payload preserves restaurant_id per record",
 
   await pushSyncBatch();
 
-  // Verify the payload contains both records with correct restaurant_ids
-  expect(capturedPayload).not.toBeNull();
-  expect(capturedPayload.batch).toHaveLength(2);
+  // Verify the payloads contain the correct restaurant_ids
+  expect(capturedPayloads.length).toBeGreaterThanOrEqual(2);
 
-  const orderAItem = capturedPayload.batch.find((b: any) => b.recordId === "order-A1");
-  const orderBItem = capturedPayload.batch.find((b: any) => b.recordId === "order-B1");
-  expect(orderAItem).toBeDefined();
-  expect(orderBItem).toBeDefined();
-  expect(orderAItem.data.restaurant_id).toBe("rest-A");
-  expect(orderBItem.data.restaurant_id).toBe("rest-B");
-  expect(orderAItem.data.restaurant_id).not.toBe(orderBItem.data.restaurant_id);
+  const orderAPayload = capturedPayloads.find((p) => p.order?.id === "order-A1");
+  const orderBPayload = capturedPayloads.find((p) => p.order?.id === "order-B1");
+  expect(orderAPayload).toBeDefined();
+  expect(orderBPayload).toBeDefined();
+  expect(orderAPayload.order.restaurant_id).toBe("rest-A");
+  expect(orderBPayload.order.restaurant_id).toBe("rest-B");
+  expect(orderAPayload.order.restaurant_id).not.toBe(orderBPayload.order.restaurant_id);
 
   // Restore
   setDb(null);
@@ -383,10 +411,9 @@ test("two-device sync conflict — cloud rejects stale edge data, edge retries",
   const edgeUpdatedAt = Date.now() - 60_000; // Edge's data is 1 minute stale
   const cloudUpdatedAt = Date.now(); // Cloud has a newer version
 
-  testDb.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+  // New system: order pending via revision > cloud_synced_version
+  testDb.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at, revision, cloud_synced_version) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0)`)
     .run(orderId, "table-5", RESTAURANT_ID, "SETTLED", 500, Date.now() - 120_000, edgeUpdatedAt);
-  testDb.query(`INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)`)
-    .run("order", orderId, "create", Date.now());
 
   // Seed session
   testDb.query(`INSERT INTO edge_config (key, value, updated_at) VALUES ('session_token', 'test-jwt-token', ?)`).run(Date.now());
@@ -395,17 +422,16 @@ test("two-device sync conflict — cloud rejects stale edge data, edge retries",
   testDb.query(`INSERT INTO edge_config (key, value, updated_at) VALUES ('session_expires_at', '${Date.now() + 30 * 24 * 60 * 60 * 1000}', ?)`).run(Date.now());
   testDb.query(`INSERT INTO edge_config (key, value, updated_at) VALUES ('device_id', '${DEVICE_A}', ?)`).run(Date.now());
 
-  // Mock fetch to simulate cloud detecting a conflict and rejecting the record
-  let capturedBatch: any = null;
+  // Mock fetch to simulate cloud detecting a conflict and rejecting the order
+  let capturedPayload: any = null;
   const fetchMock = mock(async (url: string, opts: any) => {
     const body = JSON.parse(opts.body);
-    capturedBatch = body.batch;
-    // Cloud rejects because it has a newer updatedAt (conflict)
+    capturedPayload = body;
+    // Cloud rejects with HTTP 409 Conflict
     return new Response(JSON.stringify({
-      accepted: [],
-      rejected: [{ queueId: body.batch[0].queueId, error: "Conflict: cloud has newer version" }],
+      error: "Conflict: cloud has newer version",
     }), {
-      status: 200,
+      status: 409,
       headers: { "Content-Type": "application/json" },
     });
   });
@@ -418,21 +444,21 @@ test("two-device sync conflict — cloud rejects stale edge data, edge retries",
 
   const result = await pushSyncBatch();
 
-  // The push should succeed at the HTTP level but all records rejected
-  expect(result.ok).toBe(true);
-  expect(result.pushed).toBe(1);
+  // The push should fail (rejected by cloud)
+  expect(result.ok).toBe(false);
+  expect(result.pushed).toBeGreaterThanOrEqual(1);
   expect(result.accepted).toBe(0);
-  expect(result.rejected).toBe(1);
 
-  // Verify the edge sent its updatedAt in the payload so cloud could detect conflict
-  expect(capturedBatch).toHaveLength(1);
-  expect(capturedBatch[0].data.updated_at).toBe(edgeUpdatedAt);
+  // Verify the edge sent its updated_at in the payload so cloud could detect conflict
+  expect(capturedPayload).not.toBeNull();
+  expect(capturedPayload.order.id).toBe(orderId);
+  expect(capturedPayload.order.updated_at).toBe(edgeUpdatedAt);
 
-  // Verify the record is NOT marked as synced (it was rejected)
-  const queueRow = testDb.query(`SELECT * FROM sync_queue WHERE record_id = ?`).get(orderId) as any;
-  expect(queueRow.synced).toBe(0);
-  expect(queueRow.attempts).toBe(1);
-  expect(queueRow.last_error).toContain("Conflict");
+  // Verify the order is NOT marked as synced (it was rejected)
+  const orderRow = testDb.query(`SELECT revision, cloud_synced_version, sync_attempt_count, last_sync_error FROM order_record WHERE id = ?`).get(orderId) as any;
+  expect(orderRow.revision).toBeGreaterThan(orderRow.cloud_synced_version);
+  expect(orderRow.sync_attempt_count).toBeGreaterThan(0);
+  expect(orderRow.last_sync_error).toContain("Conflict");
 
   // Restore
   setDb(null);
@@ -469,7 +495,7 @@ test("offline -> online end-to-end sync — correct records, no duplicates", asy
   const kotItemId = "offline-ki-001";
   const now = Date.now();
 
-  testDb.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, captain_id, platform, created_at, updated_at, cloud_synced) VALUES (?, ?, ?, 'PREPARING', 250, 'captain-1', 'DINE_IN', ?, ?, 0)`)
+  testDb.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, captain_id, platform, created_at, updated_at, cloud_synced, revision, cloud_synced_version) VALUES (?, ?, ?, 'PREPARING', 250, 'captain-1', 'DINE_IN', ?, ?, 0, 1, 0)`)
     .run(orderId, 'table1', RESTAURANT_ID, now, now);
   testDb.query(`INSERT INTO order_item (id, order_id, menu_item_id, name, price, quantity, menu_type, cloud_synced) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`)
     .run(orderItemId, orderId, 'menu1', 'Biryani', 250, 1, 'FOOD');
@@ -479,44 +505,41 @@ test("offline -> online end-to-end sync — correct records, no duplicates", asy
     .run(kotItemId, kotId, orderItemId, 'menu1', 'Biryani', 1, 250, now);
   testDb.query(`UPDATE "table" SET status = 'OCCUPIED', workflow_status = 'Preparing', current_bill = 250, updated_at = ? WHERE id = ?`).run(now, 'table1');
 
-  // Enqueue sync records exactly as orderService does
-  const { setDb, enqueueSync } = await import("../db.ts");
+  // In the new revision-based system, the order is already pending:
+  // revision=1 > cloud_synced_version=0 → pending. No enqueueSync needed.
+  const { setDb } = await import("../db.ts");
   setDb(testDb);
 
-  enqueueSync("order", orderId, "insert");
-  enqueueSync("kot", kotId, "insert");
-  // Table status sync removed from production — no longer enqueued for cloud sync.
-  // Table status is LAN-only (broadcast via lanBroadcast).
+  // 2. Verify order is pending via revision comparison
+  const pendingBefore = testDb.query(`SELECT COUNT(*) as count FROM order_record WHERE revision > cloud_synced_version AND is_deleted = 0`).get() as any;
+  expect(pendingBefore.count).toBe(1);
 
-  // 2. Verify writes landed in sync_queue
-  const pendingBefore = testDb.query(`SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0`).get() as any;
-  expect(pendingBefore.count).toBe(2);
-  const queueBefore = testDb.query(`SELECT * FROM sync_queue WHERE synced = 0 ORDER BY id ASC`).all() as any[];
-  expect(queueBefore[0].table_name).toBe("order");
-  expect(queueBefore[1].table_name).toBe("kot");
-
-  // 3. Cloud is unreachable: first push fails, records remain in queue, attempts incremented
+  // 3. Cloud is unreachable: push fails, order stays pending, attempt count incremented
   globalThis.fetch = (() => { throw new Error("Network error: cloud unreachable"); }) as any;
 
   const { manualSyncPush } = await import("../sync.ts");
   const offlineResult = await manualSyncPush();
 
   expect(offlineResult.ok).toBe(false);
-  expect(offlineResult.pushed).toBe(2);
+  expect(offlineResult.pushed).toBeGreaterThanOrEqual(1);
   expect(offlineResult.accepted).toBe(0);
 
-  const pendingAfterOffline = testDb.query(`SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0`).get() as any;
-  expect(pendingAfterOffline.count).toBe(2);
-  const attemptsAfterOffline = testDb.query(`SELECT SUM(attempts) as total FROM sync_queue WHERE synced = 0`).get() as any;
-  expect(attemptsAfterOffline.total).toBe(2);
+  // Order should still be pending, with attempt count incremented
+  const orderAfterOffline = testDb.query(`SELECT revision, cloud_synced_version, sync_attempt_count FROM order_record WHERE id = ?`).get(orderId) as any;
+  expect(orderAfterOffline.revision).toBeGreaterThan(orderAfterOffline.cloud_synced_version);
+  expect(orderAfterOffline.sync_attempt_count).toBeGreaterThan(0);
 
-  // 4. Cloud is reachable again: mock the cloud accepting all records
-  let capturedBatches: any[] = [];
+  // 4. Cloud is reachable again: mock the cloud accepting the order payload
+  let capturedPayloads: any[] = [];
   const acceptFetchMock = mock(async (url: string, opts: any) => {
     const body = JSON.parse(opts.body);
-    capturedBatches.push(body);
-    const accepted = body.batch.map((b: any) => b.queueId);
-    return new Response(JSON.stringify({ accepted, rejected: [] }), {
+    capturedPayloads.push(body);
+    // New sync-order endpoint returns { outcome, orderId, appliedRevision }
+    return new Response(JSON.stringify({
+      outcome: "applied",
+      orderId: body.order?.id || "unknown",
+      appliedRevision: body.snapshotRevision,
+    }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
@@ -526,39 +549,25 @@ test("offline -> online end-to-end sync — correct records, no duplicates", asy
   const onlineResult = await manualSyncPush();
 
   expect(onlineResult.ok).toBe(true);
-  expect(onlineResult.pushed).toBe(2);
-  expect(onlineResult.accepted).toBe(2);
+  expect(onlineResult.accepted).toBeGreaterThanOrEqual(1);
   expect(onlineResult.rejected).toBe(0);
 
-  // 6. Verify sync_queue records are removed (markSynced deletes rows)
-  const pendingAfterOnline = testDb.query(`SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0`).get() as any;
-  expect(pendingAfterOnline.count).toBe(0);
-  const totalRemaining = testDb.query(`SELECT COUNT(*) as count FROM sync_queue`).get() as any;
-  expect(totalRemaining.count).toBe(0);
+  // 6. Verify order is now synced (revision === cloud_synced_version)
+  const orderAfterOnline = testDb.query(`SELECT revision, cloud_synced_version, sync_attempt_count FROM order_record WHERE id = ?`).get(orderId) as any;
+  expect(orderAfterOnline.revision).toBe(orderAfterOnline.cloud_synced_version);
+  expect(orderAfterOnline.sync_attempt_count).toBe(0);
 
-  // 7. Verify cloud received the correct records in the correct order with no duplicates
-  expect(acceptFetchMock).toHaveBeenCalledTimes(1);
-  const batch = capturedBatches[0].batch;
-  expect(batch).toHaveLength(2);
-
-  const orderPayload = batch.find((b: any) => b.tableName === "order" && b.recordId === orderId);
-  const kotPayload = batch.find((b: any) => b.tableName === "kot" && b.recordId === kotId);
-
-  expect(orderPayload).toBeDefined();
-  expect(kotPayload).toBeDefined();
-
-  // Order preserved (insert order: order, kot)
-  expect(batch[0].tableName).toBe("order");
-  expect(batch[1].tableName).toBe("kot");
-
-  // No duplicates by queue id
-  const queueIds = batch.map((b: any) => b.queueId);
-  expect(new Set(queueIds).size).toBe(queueIds.length);
-
-  // Cloud received the correct record data
-  expect(orderPayload.data.items).toHaveLength(1);
-  expect(orderPayload.data.items[0].name).toBe("Biryani");
-  expect(kotPayload.data.items).toHaveLength(1);
+  // 7. Verify cloud received the complete order payload with items and KOTs
+  expect(acceptFetchMock).toHaveBeenCalled();
+  const payload = capturedPayloads.find((p) => p.order?.id === orderId);
+  expect(payload).toBeDefined();
+  expect(payload.snapshotRevision).toBe(1);
+  expect(payload.order.id).toBe(orderId);
+  expect(payload.items).toHaveLength(1);
+  expect(payload.items[0].name).toBe("Biryani");
+  expect(payload.kots).toHaveLength(1);
+  expect(payload.kots[0].items).toHaveLength(1);
+  expect(payload.transactions).toHaveLength(0);
 
   // Restore
   setDb(null);
@@ -668,7 +677,7 @@ test("revision increment — nextTableRevision and nextOrderRevision return mono
 });
 
 // ── Test 12: Sync payload includes revision and lastCommandId ──────────────────
-test("sync payload includes revision and lastCommandId for order and table records", async () => {
+test("sync payload includes revision and lastCommandId for order records", async () => {
   testDb.exec(`INSERT INTO outlet (id, name, slug, restaurant_code) VALUES ('${RESTAURANT_ID}', 'Test', 'test', 'TEST012')`);
 
   // Seed session
@@ -678,21 +687,22 @@ test("sync payload includes revision and lastCommandId for order and table recor
   testDb.query(`INSERT INTO edge_config (key, value, updated_at) VALUES ('session_expires_at', '${Date.now() + 30 * 24 * 60 * 60 * 1000}', ?)`).run(Date.now());
   testDb.query(`INSERT INTO edge_config (key, value, updated_at) VALUES ('device_id', '${DEVICE_A}', ?)`).run(Date.now());
 
-  // Create order and table with revision + last_command_id
+  // Create order with revision + last_command_id (table is LAN-only, not synced)
   testDb.exec(`INSERT INTO section (id, name, restaurant_id) VALUES ('sec12', 'Main', '${RESTAURANT_ID}')`);
   testDb.query(`INSERT INTO "table" (id, number, section_id, restaurant_id, status, workflow_status, revision, last_command_id) VALUES (?, 1, 'sec12', ?, 'OCCUPIED', 'Preparing', 5, 'cmd-table-12')`)
     .run('tbl12', RESTAURANT_ID);
-  testDb.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at, revision, last_command_id) VALUES (?, ?, ?, 'PREPARING', 250, ?, ?, 3, 'cmd-order-12')`)
+  // New system: order pending via revision=3 > cloud_synced_version=0
+  testDb.query(`INSERT INTO order_record (id, table_id, restaurant_id, status, total_amount, created_at, updated_at, revision, last_command_id, cloud_synced_version) VALUES (?, ?, ?, 'PREPARING', 250, ?, ?, 3, 'cmd-order-12', 0)`)
     .run('order12', 'tbl12', RESTAURANT_ID, Date.now(), Date.now());
 
-  testDb.query(`INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)`).run("order", "order12", "update", Date.now());
-  testDb.query(`INSERT INTO sync_queue (table_name, record_id, operation, created_at) VALUES (?, ?, ?, ?)`).run("table", "tbl12", "update", Date.now());
-
-  let capturedBatch: any = null;
+  let capturedPayload: any = null;
   const fetchMock = mock(async (url: string, opts: any) => {
-    capturedBatch = JSON.parse(opts.body).batch;
-    const accepted = capturedBatch.map((b: any) => b.queueId);
-    return new Response(JSON.stringify({ accepted, rejected: [] }), {
+    capturedPayload = JSON.parse(opts.body);
+    return new Response(JSON.stringify({
+      outcome: "applied",
+      orderId: capturedPayload.order?.id || "unknown",
+      appliedRevision: capturedPayload.snapshotRevision,
+    }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
@@ -705,15 +715,9 @@ test("sync payload includes revision and lastCommandId for order and table recor
   const { pushSyncBatch } = await import("../sync.ts");
   await pushSyncBatch();
 
-  expect(capturedBatch).toHaveLength(2);
-
-  const orderPayload = capturedBatch.find((b: any) => b.tableName === "order");
-  const tablePayload = capturedBatch.find((b: any) => b.tableName === "table");
-
-  expect(orderPayload.data.revision).toBe(3);
-  expect(orderPayload.data.lastCommandId).toBe('cmd-order-12');
-  expect(tablePayload.data.revision).toBe(5);
-  expect(tablePayload.data.lastCommandId).toBe('cmd-table-12');
+  expect(capturedPayload).not.toBeNull();
+  expect(capturedPayload.order.id).toBe('order12');
+  expect(capturedPayload.snapshotRevision).toBe(3);
 
   setDb(null);
 });

@@ -31,6 +31,7 @@
 //   PATCH /api/edge/menu/items/:id     — full edit (name, price, printer, GST, etc.)
 //   PATCH /api/edge/menu/items/:id/availability       — toggle availability
 //   PATCH /api/edge/menu/items/:id/venue-availability — toggle per-venue availability
+//   PATCH /api/edge/menu/items/:id/section-availability — toggle per-section availability
 //   PATCH /api/edge/menu/items/:id/menu-type          — toggle FOOD ↔ LIQUOR
 //   DELETE /api/edge/menu/items/:id    — soft-delete menu item
 //   GET  /api/edge/venues       — venues with floors and sections
@@ -56,12 +57,12 @@
 //   WS   /events                — Runtime event bus (§3)
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enqueueSync, getRecoveryStatus, updatePrintJobStatus, getPendingPrintJobs, getOrderSyncStatus, getPrintJobByEventId, cancelPrintJob, reprintPrintJob, getPrintJobsByOrder, insertSyncAudit, getSyncAuditRecords, createPrintJob, claimPrintJob, getKolkataDateString, getSyncMetrics, getSyncAlerts } from "./db.ts";
+import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enqueueSync, markUnsynced, getRecoveryStatus, updatePrintJobStatus, getPendingPrintJobs, getOrderSyncStatus, getPrintJobByEventId, cancelPrintJob, reprintPrintJob, getPrintJobsByOrder, insertSyncAudit, getSyncAuditRecords, createPrintJob, claimPrintJob, getKolkataDateString, getSyncMetrics, getSyncAlerts } from "./db.ts";
 import os from "os";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getSessionToken, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { pullIncrementalChanges } from "./config.ts";
 import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, printWalkinBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
-import { createMenuItemEdge, updateMenuItemEdge, deleteMenuItemEdge, toggleAvailabilityEdge, toggleVenueAvailabilityEdge, toggleMenuTypeEdge } from "./menuService.ts";
+import { createMenuItemEdge, updateMenuItemEdge, deleteMenuItemEdge, toggleAvailabilityEdge, toggleVenueAvailabilityEdge, toggleSectionAvailabilityEdge, toggleMenuTypeEdge } from "./menuService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders } from "./reads.ts";
 import { getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
 import { getSocketStatus } from "./socketSync.ts";
@@ -351,10 +352,31 @@ function normalizeBeverageName(name: string): string {
   return BEVERAGE_ALIASES[normalized] || normalized;
 }
 
-function getReportCategory(menuType: string | null | undefined, name: string): 'Liquor' | 'Food' | 'Beverages' {
-  if (String(menuType || '').toUpperCase() === 'LIQUOR') return 'Liquor';
+function getReportCategory(
+  menuType: string | null | undefined,
+  name: string,
+  reportCategory?: string | null,
+  categoryName?: string | null,
+): 'Liquor' | 'Food' | 'Beverages' | 'Combo' {
+  // 1. Priority: admin-set reportCategory (sales category) — same as cloud backend.
+  if (reportCategory && ['Food', 'Beverages', 'Liquor', 'Combo'].includes(reportCategory)) {
+    return reportCategory as 'Liquor' | 'Food' | 'Beverages' | 'Combo';
+  }
+
+  // 2. Fallback: derive from the MenuItem's Category.name.
+  const catName = String(categoryName || '').trim().toLowerCase();
+  if (catName === 'liquor') return 'Liquor';
+  if (catName === 'beverages' || catName === 'beverage') return 'Beverages';
+  if (catName === 'food') return 'Food';
+
+  // 3. Fallback: derive from menuType. LIQUOR/BAR items are always Liquor sales.
+  if (String(menuType || '').toUpperCase() === 'LIQUOR' || String(menuType || '').toUpperCase() === 'BAR') return 'Liquor';
+
+  // 4. Fallback: beverage keyword matching on the item name.
   const normalizedName = normalizeBeverageName(name);
   if (BEVERAGE_KEYWORDS.some((k) => normalizedName.includes(k))) return 'Beverages';
+
+  // 5. Last resort: default to Food.
   return 'Food';
 }
 
@@ -375,12 +397,24 @@ interface EdgeTxnRecord {
   tableNumber: string | null;
   billNumber: string | null;
   captainId: string | null;
-  items: Array<{ menuItemId: string | null; name: string; price: number; quantity: number; menuType: string }>;
+  items: Array<{ menuItemId: string | null; name: string; price: number; quantity: number; menuType: string; reportCategory: string | null; categoryName: string | null }>;
 }
 
 function collectEdgeTransactions(restaurantId: string, startTs: number, endTs: number): EdgeTxnRecord[] {
   const db = getDb();
   const records: EdgeTxnRecord[] = [];
+
+  // Pre-load every menu item's admin-set sales category (report_category) and
+  // its Category.name for this restaurant so report classification matches the
+  // cloud backend's getReportCategory priority (reportCategory → category name
+  // → menuType → name keywords) instead of guessing from menuType + name only.
+  const menuItemRows = db.query(
+    "SELECT mi.id AS mi_id, mi.report_category, c.name AS category_name FROM menu_item mi LEFT JOIN category c ON c.id = mi.category_id WHERE mi.restaurant_id = ?"
+  ).all(restaurantId) as any[];
+  const menuItemMeta = new Map<string, { reportCategory: string | null; categoryName: string | null }>();
+  for (const r of menuItemRows) {
+    menuItemMeta.set(r.mi_id, { reportCategory: r.report_category || null, categoryName: r.category_name || null });
+  }
 
   // 1. Settled orders
   const orders = db.query(
@@ -408,13 +442,18 @@ function collectEdgeTransactions(restaurantId: string, startTs: number, endTs: n
       tableNumber: null,
       billNumber: order.bill_number || null,
       captainId: order.captain_id || null,
-      items: items.map(i => ({
-        menuItemId: i.menu_item_id || null,
-        name: i.name || "Unknown",
-        price: Number(i.price) || 0,
-        quantity: Number(i.quantity) || 0,
-        menuType: String(i.menu_type || "FOOD"),
-      })),
+      items: items.map(i => {
+        const meta = i.menu_item_id ? menuItemMeta.get(i.menu_item_id) : null;
+        return {
+          menuItemId: i.menu_item_id || null,
+          name: i.name || "Unknown",
+          price: Number(i.price) || 0,
+          quantity: Number(i.quantity) || 0,
+          menuType: String(i.menu_type || "FOOD"),
+          reportCategory: meta?.reportCategory ?? null,
+          categoryName: meta?.categoryName ?? null,
+        };
+      }),
     });
   }
 
@@ -440,13 +479,19 @@ function collectEdgeTransactions(restaurantId: string, startTs: number, endTs: n
         tableNumber: null,
         billNumber: txn.billNumber || null,
         captainId: txn.captainId || null,
-        items: items.map((i: any) => ({
-          menuItemId: i.menuItemId || i.id || null,
-          name: i.name || i.n || "Unknown",
-          price: Number(i.price ?? i.p ?? 0),
-          quantity: Number(i.quantity ?? i.q ?? 0),
-          menuType: String(i.menuType || "FOOD"),
-        })),
+        items: items.map((i: any) => {
+          const mid = i.menuItemId || i.id || null;
+          const meta = mid ? menuItemMeta.get(mid) : null;
+          return {
+            menuItemId: mid,
+            name: i.name || i.n || "Unknown",
+            price: Number(i.price ?? i.p ?? 0),
+            quantity: Number(i.quantity ?? i.q ?? 0),
+            menuType: String(i.menuType || "FOOD"),
+            reportCategory: meta?.reportCategory ?? null,
+            categoryName: meta?.categoryName ?? null,
+          };
+        }),
       });
     } catch {}
   }
@@ -2293,7 +2338,9 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
           body.paidToType === "OTHER" ? (body.ledgerCategoryId || null) : null,
           body.entryType || "EXPENSE");
 
-    enqueueSync("expenditure", id, "insert");
+    // Sync: new expenditure has sync_version=1, cloud_synced_version=0 → pending.
+
+    // (enqueueSync removed — revision-based sync handles pending state)
 
     // Instant print
     const outlet = getOutletSettings();
@@ -2667,8 +2714,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
           .run(now, orderRev, order.id);
         // Delete order items
         db.query("DELETE FROM order_item WHERE order_id = ?").run(order.id);
-        // Enqueue sync for the cancelled order
-        enqueueSync("order", order.id, "update");
+        // Sync: revision was bumped above → order is pending. No enqueue needed.
       }
 
       // 2. Reset table to Free + increment table revision
@@ -2788,6 +2834,11 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       if (id === "venue-availability" && parts.length >= 5) {
         const itemId = parts[parts.length - 2];
         const r = toggleVenueAvailabilityEdge(itemId, body.venueId);
+        return r.success ? jsonResponse(r) : jsonResponse(r, r.statusCode || 400);
+      }
+      if (id === "section-availability" && parts.length >= 5) {
+        const itemId = parts[parts.length - 2];
+        const r = toggleSectionAvailabilityEdge(itemId, body.sectionId);
         return r.success ? jsonResponse(r) : jsonResponse(r, r.statusCode || 400);
       }
       if (id === "menu-type" && parts.length >= 5) {
@@ -2999,17 +3050,31 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       "SELECT COUNT(*) as count, COALESCE(SUM(total), 0) as total, COALESCE(SUM(CASE WHEN status = 'SETTLED' THEN 1 ELSE 0 END), 0) as settled FROM order_record WHERE restaurant_id = ? AND created_at >= ?"
     ).get(restaurantId, startOfDayMs) as any;
 
-    // Check for pending sync records
-    const pending = db.query(
-      "SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0 AND attempts < 5"
+    // Check for pending sync records (revision-based: revision > cloud_synced_version)
+    const pendingOrders = db.query(
+      "SELECT COUNT(*) as count FROM order_record WHERE revision > cloud_synced_version AND is_deleted = 0"
     ).get() as any;
-
-    // Check for dead-lettered records
-    const deadLetters = db.query(
-      "SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0 AND attempts >= 5"
+    const pendingExpenditures = db.query(
+      "SELECT COUNT(*) as count FROM expenditure WHERE sync_version > cloud_synced_version"
     ).get() as any;
+    const pendingWalkins = db.query(
+      "SELECT COUNT(*) as count FROM transaction_record WHERE kind = 'walkin' AND sync_version > cloud_synced_version"
+    ).get() as any;
+    const pendingCount = (pendingOrders.count || 0) + (pendingExpenditures.count || 0) + (pendingWalkins.count || 0);
 
-    const canClose = pending.count === 0 && deadLetters.count === 0;
+    // Check for stuck records (high attempt count = effectively dead-lettered)
+    const stuckOrders = db.query(
+      "SELECT COUNT(*) as count FROM order_record WHERE revision > cloud_synced_version AND is_deleted = 0 AND sync_attempt_count > 10"
+    ).get() as any;
+    const stuckExpenditures = db.query(
+      "SELECT COUNT(*) as count FROM expenditure WHERE sync_version > cloud_synced_version AND sync_attempt_count > 10"
+    ).get() as any;
+    const stuckWalkins = db.query(
+      "SELECT COUNT(*) as count FROM transaction_record WHERE kind = 'walkin' AND sync_version > cloud_synced_version AND sync_attempt_count > 10"
+    ).get() as any;
+    const stuckCount = (stuckOrders.count || 0) + (stuckExpenditures.count || 0) + (stuckWalkins.count || 0);
+
+    const canClose = pendingCount === 0;
 
     return jsonResponse({
       success: true,
@@ -3020,12 +3085,12 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         totalOrders: todayOrders.count,
         settledOrders: todayOrders.settled,
         totalRevenue: Number(todayOrders.total),
-        pendingSync: pending.count,
-        deadLetterRecords: deadLetters.count,
+        pendingSync: pendingCount,
+        deadLetterRecords: stuckCount,
       },
       message: canClose
         ? "All records synced. Ready to close day."
-        : `${pending.count} records still syncing. ${deadLetters.count} failed records need attention. Please wait for sync to complete or retry failed records.`,
+        : `${pendingCount} records still syncing. ${stuckCount} stuck records need attention. Please wait for sync to complete or retry failed records.`,
     });
   }
 
@@ -3056,137 +3121,116 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     return jsonResponse({ success: true, ...result });
   }
 
-  // ── POST /api/edge/sync/backfill — re-enqueue missing transaction syncs ────
-  // Scans all settled orders and re-enqueues transaction sync records that are
-  // missing from sync_queue (dequeued as rejected/conflict, dead-lettered, or
-  // never enqueued). Also handles walk-in transactions.
+  // ── POST /api/edge/sync/backfill — reset stuck pending records ─────────────
+  // In the revision-based sync system, "backfill" means: find records that are
+  // pending (revision > cloud_synced_version) and have high attempt counts or
+  // old timestamps, and reset their attempt counters so the worker retries them
+  // with a fresh state. Also marks any settled-order transactions that are not
+  // yet pending as unsynced (covers the case where a settle record exists in
+  // edge_config but the transaction_record was never marked unsynced).
   //
   // Query params:
-  //   ?dry-run=1 — return what would be re-enqueued without making changes
+  //   ?dry-run=1 — return what would be reset without making changes
   if (url.pathname === "/api/edge/sync/backfill" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const dryRun = url.searchParams.get("dry-run") === "1";
     const db = getDb();
 
+    let enqueued = 0;
+    let skippedSynced = 0;
+    const details: any[] = [];
+
+    // 1. Settled orders with settle records — ensure transaction_record is pending
     const settledOrders = db.query(
-      `SELECT id, restaurant_id, paid_at, bill_number
-       FROM order_record
+      `SELECT id, paid_at, bill_number FROM order_record
        WHERE status = 'SETTLED'
        AND NOT EXISTS (SELECT 1 FROM edge_config WHERE key = 'txn_deleted:' || order_record.id)
        ORDER BY paid_at DESC`
     ).all() as any[];
 
-    let enqueued = 0;
-    let skippedQueued = 0;
-    let skippedSynced = 0;
-    let skippedNoSettle = 0;
-    const details: any[] = [];
-
     for (const order of settledOrders) {
       const settleRow = db.query(
         `SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?`
       ).get(order.id) as { value: string } | null;
-
-      if (!settleRow) {
-        skippedNoSettle++;
-        continue;
-      }
+      if (!settleRow) { skippedSynced++; continue; }
 
       let settleData: any;
-      try { settleData = JSON.parse(settleRow.value); } catch { skippedNoSettle++; continue; }
+      try { settleData = JSON.parse(settleRow.value); } catch { skippedSynced++; continue; }
       const localTxnId = settleData.localTxnId;
-      if (!localTxnId) { skippedNoSettle++; continue; }
+      if (!localTxnId) { skippedSynced++; continue; }
 
-      const pendingRow = db.query(
-        `SELECT id, synced, attempts FROM sync_queue WHERE table_name = 'transaction' AND record_id = ? ORDER BY id DESC LIMIT 1`
+      // Check if transaction_record exists and is already synced
+      const txnRow = db.query(
+        "SELECT sync_version, cloud_synced_version FROM transaction_record WHERE id = ?"
       ).get(localTxnId) as any;
 
-      if (pendingRow) {
-        if (pendingRow.synced === 1) {
-          const auditRow = db.query(
-            `SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'transaction' ORDER BY audited_at DESC LIMIT 1`
-          ).get(pendingRow.id) as any;
-
-          if (auditRow && ["rejected", "conflict"].includes(auditRow.outcome)) {
-            if (!dryRun) {
-              enqueueSync("transaction", localTxnId, "insert");
-            }
-            enqueued++;
-            details.push({ orderId: order.id, localTxnId, grandTotal: settleData.grandTotal, reason: `was ${auditRow.outcome}` });
-          } else if (auditRow?.outcome === "duplicate") {
-            // Cloud already has this transaction — skip to avoid infinite re-enqueue cycle.
-            skippedSynced++;
-          } else {
-            skippedSynced++;
-          }
-        } else if (pendingRow.attempts >= 5) {
-          // Dead-lettered (synced=0, attempts>=5) — sync worker won't retry.
-          // Re-enqueue so it gets a fresh attempt.
-          if (!dryRun) {
-            enqueueSync("transaction", localTxnId, "insert");
-          }
-          enqueued++;
-          details.push({ orderId: order.id, localTxnId, grandTotal: settleData.grandTotal, reason: "was dead-lettered" });
-        } else {
-          skippedQueued++;
-        }
+      if (!txnRow) {
+        // No transaction_record — mark unsynced to force creation + sync
+        if (!dryRun) { markUnsynced("transaction", localTxnId); }
+        enqueued++;
+        details.push({ orderId: order.id, localTxnId, grandTotal: settleData.grandTotal, reason: "no transaction_record" });
+      } else if (txnRow.sync_version <= txnRow.cloud_synced_version) {
+        // Already synced — skip
+        skippedSynced++;
       } else {
+        // Pending but maybe stuck — reset attempt counter
         if (!dryRun) {
-          enqueueSync("transaction", localTxnId, "insert");
+          db.query("UPDATE transaction_record SET sync_attempt_count = 0, last_sync_error = NULL WHERE id = ?").run(localTxnId);
         }
         enqueued++;
-        details.push({ orderId: order.id, localTxnId, grandTotal: settleData.grandTotal, reason: "missing from queue" });
+        details.push({ orderId: order.id, localTxnId, grandTotal: settleData.grandTotal, reason: "pending transaction reset" });
       }
     }
 
-    // Walk-in transactions
-    const walkinRows = db.query(`SELECT key, value FROM edge_config WHERE key LIKE 'walkin_txn:%'`).all() as any[];
+    // 2. Walk-in transactions — reset stuck ones
+    const walkinRows = db.query(`SELECT key FROM edge_config WHERE key LIKE 'walkin_txn:%'`).all() as any[];
     let walkinEnqueued = 0;
 
     for (const row of walkinRows) {
       const localId = row.key.replace("walkin_txn:", "");
-      const pendingRow = db.query(
-        `SELECT id, synced, attempts FROM sync_queue WHERE table_name = 'walkin_transaction' AND record_id = ? ORDER BY id DESC LIMIT 1`
+      const txnRow = db.query(
+        "SELECT sync_version, cloud_synced_version, sync_attempt_count FROM transaction_record WHERE id = ?"
       ).get(localId) as any;
 
-      if (pendingRow) {
-        if (pendingRow.synced === 0) {
-          if (pendingRow.attempts >= 5) {
-            // Dead-lettered walk-in — re-enqueue for fresh attempt
-            if (!dryRun) {
-              enqueueSync("walkin_transaction", localId, "insert");
-            }
-            walkinEnqueued++;
-            details.push({ localTxnId: localId, reason: "walk-in was dead-lettered" });
-          } else {
-            skippedQueued++;
-          }
-        } else {
-          // Synced — check if it was rejected/conflict/duplicate
-          const auditRow = db.query(
-            `SELECT outcome FROM sync_audit WHERE queue_id = ? AND table_name = 'walkin_transaction' ORDER BY audited_at DESC LIMIT 1`
-          ).get(pendingRow.id) as any;
-          if (auditRow && ["rejected", "conflict"].includes(auditRow.outcome)) {
-            if (!dryRun) {
-              enqueueSync("walkin_transaction", localId, "insert");
-            }
-            walkinEnqueued++;
-            details.push({ localTxnId: localId, reason: `walk-in was ${auditRow.outcome}` });
-          } else if (auditRow?.outcome === "duplicate") {
-            // Cloud already has this transaction — skip to avoid infinite re-enqueue cycle.
-            skippedSynced++;
-          } else {
-            skippedSynced++;
-          }
+      if (!txnRow) {
+        if (!dryRun) { markUnsynced("walkin", localId); }
+        walkinEnqueued++;
+        details.push({ localTxnId: localId, reason: "walk-in no transaction_record" });
+      } else if (txnRow.sync_version <= txnRow.cloud_synced_version) {
+        skippedSynced++;
+      } else {
+        if (!dryRun) {
+          db.query("UPDATE transaction_record SET sync_attempt_count = 0, last_sync_error = NULL WHERE id = ?").run(localId);
         }
-        continue;
+        walkinEnqueued++;
+        details.push({ localTxnId: localId, reason: "walk-in pending reset" });
       }
+    }
 
+    // 3. Pending orders with high attempt counts — reset
+    const stuckOrders = db.query(
+      `SELECT id FROM order_record WHERE revision > cloud_synced_version AND is_deleted = 0 AND sync_attempt_count > 5`
+    ).all() as any[];
+    let ordersReset = 0;
+    for (const o of stuckOrders) {
       if (!dryRun) {
-        enqueueSync("walkin_transaction", localId, "insert");
+        db.query("UPDATE order_record SET sync_attempt_count = 0, last_sync_error = NULL WHERE id = ?").run(o.id);
       }
-      walkinEnqueued++;
-      details.push({ localTxnId: localId, reason: "walk-in missing from queue" });
+      ordersReset++;
+      details.push({ orderId: o.id, reason: "stuck order reset" });
+    }
+
+    // 4. Pending expenditures with high attempt counts — reset
+    const stuckExps = db.query(
+      `SELECT id FROM expenditure WHERE sync_version > cloud_synced_version AND sync_attempt_count > 5`
+    ).all() as any[];
+    let expsReset = 0;
+    for (const e of stuckExps) {
+      if (!dryRun) {
+        db.query("UPDATE expenditure SET sync_attempt_count = 0, last_sync_error = NULL WHERE id = ?").run(e.id);
+      }
+      expsReset++;
+      details.push({ expenditureId: e.id, reason: "stuck expenditure reset" });
     }
 
     return jsonResponse({
@@ -3194,11 +3238,11 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       dryRun,
       summary: {
         settledOrdersScanned: settledOrders.length,
-        transactionsReEnqueued: enqueued,
-        walkinReEnqueued: walkinEnqueued,
-        skippedAlreadyQueued: skippedQueued,
+        transactionsReset: enqueued,
+        walkinsReset: walkinEnqueued,
+        ordersReset,
+        expendituresReset: expsReset,
         skippedAlreadySynced: skippedSynced,
-        skippedNoSettleRecord: skippedNoSettle,
       },
       details: details.slice(0, 50),
     });
@@ -4209,7 +4253,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const catMap = new Map<string, { itemCount: number; totalQuantity: number; totalRevenue: number }>();
     for (const t of txns) {
       for (const item of t.items) {
-        const cat = getReportCategory(item.menuType, item.name);
+        const cat = getReportCategory(item.menuType, item.name, item.reportCategory, item.categoryName);
         const discountFactor = t.discountPercent > 0 ? (1 - t.discountPercent / 100) : 1;
         const revenue = Math.round(item.price * item.quantity * discountFactor * 100) / 100;
         const entry = catMap.get(cat) || { itemCount: 0, totalQuantity: 0, totalRevenue: 0 };
@@ -4252,14 +4296,14 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
 
     const itemMap = new Map<string, {
       id: string; name: string; category: string; menuType: string;
-      reportCategory: "Liquor" | "Food" | "Beverages";
+      reportCategory: "Liquor" | "Food" | "Beverages" | "Combo";
       quantitySold: number; unitPrice: number; totalRevenue: number; orderIds: Set<string>;
     }>();
 
     for (const t of txns) {
       const discountFactor = t.discountPercent > 0 ? (1 - t.discountPercent / 100) : 1;
       for (const item of t.items) {
-        const reportCategory = getReportCategory(item.menuType, item.name);
+        const reportCategory = getReportCategory(item.menuType, item.name, item.reportCategory, item.categoryName);
         const key = reportCategory === "Beverages" ? normalizeBeverageName(item.name) : item.name;
         const revenue = Math.round(item.price * item.quantity * discountFactor * 100) / 100;
         const existing = itemMap.get(key);
@@ -4287,12 +4331,14 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     if (outletType === "food") workingItems = workingItems.filter(it => it.reportCategory === "Food");
     else if (outletType === "liquor") workingItems = workingItems.filter(it => it.reportCategory === "Liquor");
     else if (outletType === "beverages") workingItems = workingItems.filter(it => it.reportCategory === "Beverages");
+    else if (outletType === "combo") workingItems = workingItems.filter(it => it.reportCategory === "Combo");
 
     const totalRevenueAll = workingItems.reduce((s, it) => s + it.totalRevenue, 0);
     const totalQuantityAll = workingItems.reduce((s, it) => s + it.quantitySold, 0);
     const foodRevenue = workingItems.filter(i => i.reportCategory === "Food").reduce((s, i) => s + i.totalRevenue, 0);
     const liquorRevenue = workingItems.filter(i => i.reportCategory === "Liquor").reduce((s, i) => s + i.totalRevenue, 0);
     const beveragesRevenue = workingItems.filter(i => i.reportCategory === "Beverages").reduce((s, i) => s + i.totalRevenue, 0);
+    const comboRevenue = workingItems.filter(i => i.reportCategory === "Combo").reduce((s, i) => s + i.totalRevenue, 0);
 
     const items = workingItems
       .map(it => ({
@@ -4318,6 +4364,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         foodRevenue: round2(foodRevenue),
         liquorRevenue: round2(liquorRevenue),
         beveragesRevenue: round2(beveragesRevenue),
+        comboRevenue: round2(comboRevenue),
       },
       dateRange: { startDate, endDate },
     }, 200, { "Cache-Control": "no-store" });

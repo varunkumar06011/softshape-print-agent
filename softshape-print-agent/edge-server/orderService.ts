@@ -24,7 +24,7 @@
 
 
 
-import { getDb, getNextKotNumber, enqueueSync, getKolkataDateString, createPrintJob, updatePrintJobStatus, getPendingPrintJobs, claimPrintJob, reclaimStalePrintingJobs, getPrintJobByEventId, cancelPrintJob, lookupCommand, recordCommand, nextTableRevision, nextOrderRevision, upsertTransactionRecord } from "./db.ts";
+import { getDb, getNextKotNumber, enqueueSync, markUnsynced, getKolkataDateString, createPrintJob, updatePrintJobStatus, getPendingPrintJobs, claimPrintJob, reclaimStalePrintingJobs, getPrintJobByEventId, cancelPrintJob, lookupCommand, recordCommand, nextTableRevision, nextOrderRevision, upsertTransactionRecord } from "./db.ts";
 
 import { buildFoodKOT, buildLiquorKOT, buildCancelKOT, buildFinalBill, type PrintItem, type OrderData, type BillData } from "./escpos.ts";
 
@@ -2200,11 +2200,11 @@ export async function createOrder(
 
 
 
-    // 7. Enqueue sync records for cloud push
+    // 7. Sync records — new revision-based system: order is created with
+    // revision=1, cloud_synced_version=0 → already pending. KOTs and items
+    // are part of the order payload, so no separate enqueue needed.
 
-    enqueueSync("order", orderId, "insert");
-
-    enqueueSync("kot", kotId, "insert");
+    // (enqueueSync calls removed — revision > cloud_synced_version handles pending state)
 
     // Table status sync removed — table status is LAN-only (broadcast via lanBroadcast).
 
@@ -2964,19 +2964,13 @@ export async function updateOrderItems(
 
 
 
-    // 7. Enqueue sync records
+    // 7. Sync records — revision-based: nextOrderRevision() was called above
+    // and the order revision was UPDATEd, so the order is already pending.
+    // KOTs and items are part of the order payload — no separate enqueue needed.
 
-    enqueueSync("order", orderId, "update");
-
-    enqueueSync("kot", kotId, "insert");
+    // (enqueueSync calls removed — revision bump handles pending state)
 
     // Table status sync removed — LAN-only.
-
-    for (const oiId of newOrderItemIds) {
-
-      enqueueSync("order_item", oiId, "insert");
-
-    }
 
 
 
@@ -3344,25 +3338,13 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
 
 
 
-    // 6. Enqueue sync records
+    // 6. Sync records — revision-based: nextOrderRevision() was called above
+    // and the order revision was UPDATEd, so the order is already pending.
+    // Items, KOTs, and kot_items are part of the order payload.
 
-    enqueueSync("order_item", orderItemId, "update");
-
-    enqueueSync("order", orderId, "update");
+    // (enqueueSync calls removed — revision bump handles pending state)
 
     // Table status sync removed — LAN-only.
-
-    for (const kotItemId of cancelledKotItemIds) {
-
-      enqueueSync("kot_item", kotItemId, "update");
-
-    }
-
-    for (const kotId of cancelledKotIds) {
-
-      enqueueSync("kot", kotId, "update");
-
-    }
 
 
 
@@ -4002,7 +3984,7 @@ export async function requestBillingEdge(
 
 
 
-    enqueueSync("order", orderId, "update");
+    // Sync: revision was bumped above → order is pending. No enqueue needed.
 
     // Table status sync removed — LAN-only.
 
@@ -4176,11 +4158,11 @@ export async function printBillEdge(input: PrintBillInput): Promise<{ success: b
 
   }
 
-  // Always enqueue sync after bill print so the cloud receives the bill_number,
+  // Sync: if a new bill number was assigned, nextOrderRevision() was called
+  // above and the order is already pending. If the bill number already existed,
+  // no data changed — no sync needed.
 
-  // even if a prior sync cycle pushed the order before the number was assigned.
-
-  enqueueSync("order", orderId, "update");
+  // (enqueueSync removed — revision bump handles pending state)
 
 
 
@@ -5448,15 +5430,16 @@ export async function settleOrderEdge(input: SettleOrderInput): Promise<{ succes
 
 
 
-    // Enqueue sync — always enqueue a transaction record so the cloud
+    // Sync — revision-based: order revision was bumped above (nextOrderRevision),
+    // so the order is already pending. The transaction_record was created by
+    // upsertTransactionRecord above; mark it unsynced so the new sync worker
+    // picks it up as part of the order payload.
 
-    // receives the settlement payment and creates a cloud Transaction.
-
-    enqueueSync("order", orderId, "update");
+    // (enqueueSync("order",...) removed — revision bump handles pending state)
 
     // Table status sync removed — LAN-only.
 
-    enqueueSync("transaction", localTxnId, "insert");
+    markUnsynced("transaction", localTxnId);
 
 
 
@@ -5707,7 +5690,7 @@ export async function swapTableEdge(
 
         .run(targetTableId, now, newOrderRev, meta?.requestId || null, activeOrder.id);
 
-      enqueueSync("order", activeOrder.id, "update");
+      // Sync: revision was bumped above → order is pending. No enqueue needed.
 
     }
 
@@ -5729,11 +5712,7 @@ export async function swapTableEdge(
 
         .run(targetTableId, sourceTableId);
 
-      for (const k of sourceKotIds) {
-
-        enqueueSync("kot", k.id, "update");
-
-      }
+      // KOTs are part of the order payload — order revision bump covers them.
 
     }
 
@@ -5949,7 +5928,7 @@ export async function transferItemsEdge(
 
         .run(newOrderId, targetTableId, restaurantId, now, now, meta?.requestId || null);
 
-      enqueueSync("order", newOrderId, "insert");
+      // New order created with revision=1, cloud_synced_version=0 → already pending.
 
       targetOrder = { id: newOrderId, table_id: targetTableId, total_amount: 0 };
 
@@ -5999,9 +5978,8 @@ export async function transferItemsEdge(
 
       transferredAmount += Number(item.price) * effectiveQty;
 
-      enqueueSync("order_item", newItemId, "insert");
-
-      enqueueSync("order_item", itemId, "update");
+      // Order items are part of the order payload — source/target order
+      // revisions are bumped below, covering these items. No enqueue needed.
 
     }
 
@@ -6081,7 +6059,8 @@ export async function transferItemsEdge(
 
         }
 
-        enqueueSync("kot", newKotId, "insert");
+        // KOT is part of the target order payload — target order revision
+        // was bumped above, covering this KOT. No enqueue needed.
 
 
 
@@ -6221,9 +6200,8 @@ export async function transferItemsEdge(
 
 
 
-    enqueueSync("order", sourceOrder.id, "update");
-
-    enqueueSync("order", targetOrder.id, "update");
+    // Sync: both source and target order revisions were bumped above
+    // (nextOrderRevision calls) → both are pending. No enqueue needed.
 
     // Table status sync removed — LAN-only (transfer is a transient operation).
 
@@ -6417,7 +6395,7 @@ export async function editBillEdge(
 
           .run(editedBy || "Cashier", now, itemId, orderId);
 
-        enqueueSync("order_item", itemId, "update");
+        // Order item is part of the order payload — order revision bumped below.
 
       }
 
@@ -6451,7 +6429,7 @@ export async function editBillEdge(
 
           .run(Number(item.price) * qtyDiff, now, orderId);
 
-        enqueueSync("order_item", itemId, "update");
+        // Order item is part of the order payload — order revision bumped below.
 
       }
 
@@ -6511,7 +6489,7 @@ export async function editBillEdge(
 
           .run(itemTotal, now, orderId);
 
-        enqueueSync("order_item", newItemId, "insert");
+        // Order item is part of the order payload — order revision bumped below.
 
       }
 
@@ -6543,7 +6521,7 @@ export async function editBillEdge(
 
 
 
-      enqueueSync("kot", addedKotId, "insert");
+      // KOT is part of the order payload — order revision bumped below.
 
     }
 
@@ -6573,7 +6551,7 @@ export async function editBillEdge(
 
     db.query("UPDATE order_record SET updated_at = ?, revision = ?, last_command_id = ? WHERE id = ?").run(now, newOrderRev, meta?.requestId || null, orderId);
 
-    enqueueSync("order", orderId, "update");
+    // Sync: revision was bumped above → order is pending. No enqueue needed.
 
     return { newOrderRev, newTableRev };
 
@@ -6786,9 +6764,9 @@ export async function confirmPaymentEdge(
 
 
 
-  // Enqueue sync for the payment confirmation
+  // Sync: mark the transaction as unsynced so the new worker picks it up.
 
-  enqueueSync("transaction", transactionId, "update");
+  markUnsynced("transaction", transactionId);
 
 
 
@@ -6894,7 +6872,7 @@ export async function updateOrderStatusEdge(
 
 
 
-    enqueueSync("order", orderId, "update");
+    // Sync: revision was bumped above → order is pending. No enqueue needed.
 
     return { newOrderRev, newTableRev };
 
@@ -6998,7 +6976,7 @@ export async function markOrderPaidEdge(
 
       .run(now, now, newOrderRev, meta?.requestId || null, orderId);
 
-    enqueueSync("order", orderId, "update");
+    // Sync: revision was bumped above → order is pending. No enqueue needed.
 
     return { newOrderRev };
 
@@ -7186,7 +7164,9 @@ export async function saveTransactionEdge(
 
 
 
-  enqueueSync("walkin_transaction", localId, "insert");
+  // Sync: mark the walk-in transaction as unsynced so the new worker picks it up.
+
+  markUnsynced("walkin", localId);
 
 
 

@@ -772,6 +772,8 @@ function initSchema(database: Database) {
 
       show_in_menu    INTEGER DEFAULT 1,
 
+      report_category TEXT,
+
       updated_at      INTEGER,
 
       synced_at       INTEGER NOT NULL DEFAULT (unixepoch())
@@ -922,6 +924,20 @@ function initSchema(database: Database) {
 
 
 
+    -- Section Menu Item Availability
+    CREATE TABLE IF NOT EXISTS section_menu_item_availability (
+      id              TEXT PRIMARY KEY,
+      section_id      TEXT NOT NULL,
+      menu_item_id    TEXT NOT NULL,
+      restaurant_id   TEXT NOT NULL,
+      is_available    INTEGER DEFAULT 1,
+      UNIQUE(section_id, menu_item_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_smaa_section ON section_menu_item_availability(section_id);
+
+
+
     -- Orders
 
     CREATE TABLE IF NOT EXISTS order_record (
@@ -970,6 +986,16 @@ function initSchema(database: Database) {
 
       is_extra_table      INTEGER DEFAULT 0,           -- 0 = parent/main table order, 1 = extra table order
 
+      -- v11: revision-based sync state (new sync system)
+
+      cloud_synced_version    INTEGER NOT NULL DEFAULT 0,
+
+      sync_attempt_count      INTEGER NOT NULL DEFAULT 0,
+
+      last_sync_attempt_at    INTEGER,
+
+      last_sync_error         TEXT,
+
       UNIQUE(last_request_id)  -- idempotency: one order per requestId
 
     );
@@ -981,6 +1007,8 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_order_cloud_synced ON order_record(cloud_synced) WHERE cloud_synced = 0;
 
     CREATE INDEX IF NOT EXISTS idx_order_revision ON order_record(revision);
+
+    CREATE INDEX IF NOT EXISTS idx_order_cloud_synced_version ON order_record(cloud_synced_version) WHERE revision > cloud_synced_version;
 
 
 
@@ -1444,13 +1472,27 @@ function initSchema(database: Database) {
 
       ledger_category_id TEXT,                -- FK to ledger_category.id (OTHER type)
 
-      entry_type        TEXT DEFAULT 'EXPENSE' -- ASSET | LIABILITY | GROCERY | EXPENSE | LIABILITY_PAYMENT
+      entry_type        TEXT DEFAULT 'EXPENSE', -- ASSET | LIABILITY | GROCERY | EXPENSE | LIABILITY_PAYMENT
+
+      -- v11: revision-based sync state (new sync system)
+
+      sync_version          INTEGER NOT NULL DEFAULT 1,
+
+      cloud_synced_version  INTEGER NOT NULL DEFAULT 0,
+
+      sync_attempt_count    INTEGER NOT NULL DEFAULT 0,
+
+      last_sync_attempt_at  INTEGER,
+
+      last_sync_error       TEXT
 
     );
 
     CREATE INDEX IF NOT EXISTS idx_expenditure_date ON expenditure(date);
 
     CREATE INDEX IF NOT EXISTS idx_expenditure_synced ON expenditure(cloud_synced) WHERE cloud_synced = 0;
+
+    CREATE INDEX IF NOT EXISTS idx_expenditure_sync_version ON expenditure(sync_version, cloud_synced_version) WHERE sync_version > cloud_synced_version;
 
     -- idx_expenditure_employee and idx_expenditure_ledger are created in
 
@@ -1564,7 +1606,19 @@ function initSchema(database: Database) {
 
       created_at      INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
 
-      synced_at       INTEGER
+      synced_at       INTEGER,
+
+      -- v11: revision-based sync state (new sync system)
+
+      sync_version          INTEGER NOT NULL DEFAULT 1,
+
+      cloud_synced_version  INTEGER NOT NULL DEFAULT 0,
+
+      sync_attempt_count    INTEGER NOT NULL DEFAULT 0,
+
+      last_sync_attempt_at  INTEGER,
+
+      last_sync_error       TEXT
 
     );
 
@@ -1573,6 +1627,8 @@ function initSchema(database: Database) {
     CREATE INDEX IF NOT EXISTS idx_txn_record_order ON transaction_record(order_id);
 
     CREATE INDEX IF NOT EXISTS idx_txn_record_synced ON transaction_record(cloud_synced) WHERE cloud_synced = 0;
+
+    CREATE INDEX IF NOT EXISTS idx_txn_record_sync_version ON transaction_record(sync_version, cloud_synced_version) WHERE sync_version > cloud_synced_version;
 
   `);
 
@@ -2043,6 +2099,83 @@ function runMigrations(database: Database) {
 
   }
 
+
+
+  // ── v10: menu_item.report_category — admin-set sales category for reports ──
+
+  // Mirrors the cloud MenuItem.reportCategory field so the edge server can
+
+  // classify items into Food / Beverages / Liquor using the admin-configured
+
+  // sales category instead of guessing from menuType + item name keywords.
+
+  if (!hasColumn("menu_item", "report_category")) {
+
+    database.exec(`ALTER TABLE menu_item ADD COLUMN report_category TEXT`);
+
+  }
+
+  // ── v11: Revision-based sync columns ────────────────────────────────────────
+  // The new sync system replaces sync_queue dependency tracking with per-record
+  // revision-based versioning. cloud_synced_version tracks the last successfully
+  // synced revision; sync_version > cloud_synced_version means "pending".
+  // Failure-visibility columns (sync_attempt_count, last_sync_attempt_at,
+  // last_sync_error) give operators insight into stuck records without a
+  // dead-letter queue.
+  //
+  // All columns are additive — no destructive operations. Existing rows default
+  // to cloud_synced_version = 0 (treated as "never synced"); the one-time
+  // migration in migrateSyncQueueToRevisions() reconciles this against the old
+  // sync_queue state so already-synced records stay synced.
+
+  if (!hasColumn("order_record", "cloud_synced_version")) {
+    database.exec(`ALTER TABLE order_record ADD COLUMN cloud_synced_version INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!hasColumn("order_record", "sync_attempt_count")) {
+    database.exec(`ALTER TABLE order_record ADD COLUMN sync_attempt_count INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!hasColumn("order_record", "last_sync_attempt_at")) {
+    database.exec(`ALTER TABLE order_record ADD COLUMN last_sync_attempt_at INTEGER`);
+  }
+  if (!hasColumn("order_record", "last_sync_error")) {
+    database.exec(`ALTER TABLE order_record ADD COLUMN last_sync_error TEXT`);
+  }
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_order_cloud_synced_version ON order_record(cloud_synced_version) WHERE revision > cloud_synced_version`);
+
+  if (!hasColumn("transaction_record", "sync_version")) {
+    database.exec(`ALTER TABLE transaction_record ADD COLUMN sync_version INTEGER NOT NULL DEFAULT 1`);
+  }
+  if (!hasColumn("transaction_record", "cloud_synced_version")) {
+    database.exec(`ALTER TABLE transaction_record ADD COLUMN cloud_synced_version INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!hasColumn("transaction_record", "sync_attempt_count")) {
+    database.exec(`ALTER TABLE transaction_record ADD COLUMN sync_attempt_count INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!hasColumn("transaction_record", "last_sync_attempt_at")) {
+    database.exec(`ALTER TABLE transaction_record ADD COLUMN last_sync_attempt_at INTEGER`);
+  }
+  if (!hasColumn("transaction_record", "last_sync_error")) {
+    database.exec(`ALTER TABLE transaction_record ADD COLUMN last_sync_error TEXT`);
+  }
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_txn_record_sync_version ON transaction_record(sync_version, cloud_synced_version) WHERE sync_version > cloud_synced_version`);
+
+  if (!hasColumn("expenditure", "sync_version")) {
+    database.exec(`ALTER TABLE expenditure ADD COLUMN sync_version INTEGER NOT NULL DEFAULT 1`);
+  }
+  if (!hasColumn("expenditure", "cloud_synced_version")) {
+    database.exec(`ALTER TABLE expenditure ADD COLUMN cloud_synced_version INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!hasColumn("expenditure", "sync_attempt_count")) {
+    database.exec(`ALTER TABLE expenditure ADD COLUMN sync_attempt_count INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!hasColumn("expenditure", "last_sync_attempt_at")) {
+    database.exec(`ALTER TABLE expenditure ADD COLUMN last_sync_attempt_at INTEGER`);
+  }
+  if (!hasColumn("expenditure", "last_sync_error")) {
+    database.exec(`ALTER TABLE expenditure ADD COLUMN last_sync_error TEXT`);
+  }
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_expenditure_sync_version ON expenditure(sync_version, cloud_synced_version) WHERE sync_version > cloud_synced_version`);
+
 }
 
 
@@ -2392,6 +2525,87 @@ export function nextOrderRevision(orderId: string): number {
   const row = db.query("SELECT revision FROM order_record WHERE id = ?").get(orderId) as { revision?: number } | null;
 
   return (row?.revision ?? 0) + 1;
+
+}
+
+
+
+// ── v11: Revision-based sync helpers ─────────────────────────────────────────
+// nextExpenditureRevision / nextTransactionRevision mirror nextOrderRevision but
+// for the sync_version columns on expenditure / transaction_record. The caller
+// must UPDATE the row with the new value within the same logical mutation.
+
+export function nextExpenditureRevision(expenditureId: string): number {
+
+  const db = getDb();
+
+  const row = db.query("SELECT sync_version FROM expenditure WHERE id = ?").get(expenditureId) as { sync_version?: number } | null;
+
+  return (row?.sync_version ?? 0) + 1;
+
+}
+
+
+
+export function nextTransactionRevision(txnId: string): number {
+
+  const db = getDb();
+
+  const row = db.query("SELECT sync_version FROM transaction_record WHERE id = ?").get(txnId) as { sync_version?: number } | null;
+
+  return (row?.sync_version ?? 0) + 1;
+
+}
+
+
+
+// markUnsynced(table, id) — bump the revision/sync_version of a record so the
+// new sync worker picks it up (sync_version > cloud_synced_version → pending).
+//
+// For orders: bump revision via nextOrderRevision(). Most write paths already
+// call nextOrderRevision() inside their mutation transaction, so this is often
+// a no-op for orders — but it's the safety net for any write path that changes
+// order-payload data without explicitly bumping revision.
+//
+// For transactions / walkins: bump transaction_record.sync_version.
+// For expenditures: bump expenditure.sync_version.
+//
+// This replaces enqueueSync() for business data. Config data (tables, sections,
+// menu, users, outlets) still uses enqueueSync() — config sync is unchanged.
+
+export function markUnsynced(table: "order" | "transaction" | "walkin" | "expenditure", id: string): void {
+
+  const db = getDb();
+
+  if (table === "order") {
+
+    const newRev = nextOrderRevision(id);
+
+    db.query("UPDATE order_record SET revision = ? WHERE id = ?").run(newRev, id);
+
+    return;
+
+  }
+
+  if (table === "transaction" || table === "walkin") {
+
+    const newRev = nextTransactionRevision(id);
+
+    db.query("UPDATE transaction_record SET sync_version = ? WHERE id = ?").run(newRev, id);
+
+    return;
+
+  }
+
+  if (table === "expenditure") {
+
+    const newRev = nextExpenditureRevision(id);
+
+    db.query("UPDATE expenditure SET sync_version = ? WHERE id = ?").run(newRev, id);
+
+    return;
+
+  }
 
 }
 
@@ -3270,6 +3484,182 @@ export function setDb(testDb: Database | null): void {
   }
 
   db = testDb;
+
+}
+
+
+
+// ── v11: One-time migration from sync_queue to revision-based sync state ──────
+//
+// Converts the old sync_queue pending state into the new revision-based state so
+// that records that were pending in the old queue remain pending in the new
+// system, and records that were already synced stay synced.
+//
+// Idempotent: guarded by the `v11_revision_sync_migrated` edge_config flag.
+// Runs once on edge startup after runMigrations(). No data is deleted — the old
+// sync_queue / sync_audit / sync_metrics tables are left intact (the new sync
+// worker simply does not read from or write to sync_queue).
+//
+// No destructive operations, no data loss, no manual pushing.
+
+export function migrateSyncQueueToRevisions(): { migrated: boolean; pendingConverted: number; syncedMarked: number } {
+
+  const db = getDb();
+
+
+
+  // Guard: only run once
+
+  const alreadyMigrated = db.query("SELECT value FROM edge_config WHERE key = 'v11_revision_sync_migrated'").get() as { value: string } | null;
+
+  if (alreadyMigrated?.value === "1") {
+
+    return { migrated: false, pendingConverted: 0, syncedMarked: 0 };
+
+  }
+
+
+
+  let pendingConverted = 0;
+
+  let syncedMarked = 0;
+
+
+
+  // 1. Orders pending in sync_queue → set cloud_synced_version = revision - 1
+
+  //    (so revision > cloud_synced_version → pending → new worker re-pushes them)
+
+  const pendingOrders = db.query(
+
+    "SELECT record_id FROM sync_queue WHERE table_name = 'order' AND synced = 0",
+
+  ).all() as Array<{ record_id: string }>;
+
+  for (const row of pendingOrders) {
+
+    const result = db.query(
+
+      "UPDATE order_record SET cloud_synced_version = MAX(0, revision - 1) WHERE id = ? AND cloud_synced_version = 0",
+
+    ).run(row.record_id);
+
+    if ((result.changes || 0) > 0) pendingConverted++;
+
+  }
+
+
+
+  // 2. Transactions / walkins pending in sync_queue → cloud_synced_version = sync_version - 1
+
+  const pendingTxns = db.query(
+
+    "SELECT record_id FROM sync_queue WHERE table_name IN ('transaction', 'walkin_transaction') AND synced = 0",
+
+  ).all() as Array<{ record_id: string }>;
+
+  for (const row of pendingTxns) {
+
+    const result = db.query(
+
+      "UPDATE transaction_record SET cloud_synced_version = MAX(0, sync_version - 1) WHERE id = ? AND cloud_synced_version = 0",
+
+    ).run(row.record_id);
+
+    if ((result.changes || 0) > 0) pendingConverted++;
+
+  }
+
+
+
+  // 3. Expenditures pending in sync_queue → cloud_synced_version = sync_version - 1
+
+  const pendingExps = db.query(
+
+    "SELECT record_id FROM sync_queue WHERE table_name = 'expenditure' AND synced = 0",
+
+  ).all() as Array<{ record_id: string }>;
+
+  for (const row of pendingExps) {
+
+    const result = db.query(
+
+      "UPDATE expenditure SET cloud_synced_version = MAX(0, sync_version - 1) WHERE id = ? AND cloud_synced_version = 0",
+
+    ).run(row.record_id);
+
+    if ((result.changes || 0) > 0) pendingConverted++;
+
+  }
+
+
+
+  // 4. Records NOT in sync_queue (already synced via old system) → mark synced.
+  //    Important: exclude IDs that have pending (synced=0) rows in sync_queue,
+  //    otherwise a pending record with revision === 1 or sync_version === 1 would
+  //    incorrectly be marked as already synced (cloud_synced_version === revision).
+
+  //    Orders: cloud_synced_version = revision
+
+  const syncedOrdersResult = db.query(
+
+    `UPDATE order_record
+     SET cloud_synced_version = revision
+     WHERE cloud_synced_version = 0
+       AND revision > 0
+       AND id NOT IN (SELECT record_id FROM sync_queue WHERE table_name = 'order' AND synced = 0)`,
+
+  ).run();
+
+  syncedMarked += syncedOrdersResult.changes || 0;
+
+
+
+  //    Transactions: cloud_synced_version = sync_version
+
+  const syncedTxnsResult = db.query(
+
+    `UPDATE transaction_record
+     SET cloud_synced_version = sync_version
+     WHERE cloud_synced_version = 0
+       AND sync_version > 0
+       AND id NOT IN (SELECT record_id FROM sync_queue WHERE table_name IN ('transaction', 'walkin_transaction') AND synced = 0)`,
+
+  ).run();
+
+  syncedMarked += syncedTxnsResult.changes || 0;
+
+
+
+  //    Expenditures: cloud_synced_version = sync_version
+
+  const syncedExpsResult = db.query(
+
+    `UPDATE expenditure
+     SET cloud_synced_version = sync_version
+     WHERE cloud_synced_version = 0
+       AND sync_version > 0
+       AND id NOT IN (SELECT record_id FROM sync_queue WHERE table_name = 'expenditure' AND synced = 0)`,
+
+  ).run();
+
+  syncedMarked += syncedExpsResult.changes || 0;
+
+
+
+  // 5. Set migration_completed flag
+
+  db.query(
+
+    "INSERT INTO edge_config (key, value, updated_at) VALUES ('v11_revision_sync_migrated', '1', ?) ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = ?",
+
+  ).run(Date.now(), Date.now());
+
+
+
+  console.log(`[DB] v11 revision-sync migration complete — ${pendingConverted} pending records converted, ${syncedMarked} already-synced records marked`);
+
+  return { migrated: true, pendingConverted, syncedMarked };
 
 }
 

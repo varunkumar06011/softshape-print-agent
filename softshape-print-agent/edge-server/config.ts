@@ -30,6 +30,7 @@ const MENU_RELATED_TABLES = new Set([
   "menu_item_addon",
   "venue_price",
   "venue_menu_item_availability",
+  "section_menu_item_availability",
   "category",
 ]);
 
@@ -62,6 +63,7 @@ interface ConfigResponse {
   comboComponents?: any[];
   venuePrices?: any[];
   venueAvailability?: any[];
+  sectionAvailability?: any[];
   users?: any[];
   ledgerCategories?: any[];
   employees?: any[];
@@ -94,6 +96,7 @@ function computeLocalConfigChecksum(db: ReturnType<typeof getDb>, restaurantIds:
     { name: "combo_component", quoted: false },
     { name: "venue_price", quoted: false },
     { name: "venue_menu_item_availability", quoted: false },
+    { name: "section_menu_item_availability", quoted: false },
     { name: "users", quoted: false },
     { name: "ledger_category", quoted: false },
     { name: "employee", quoted: false },
@@ -153,6 +156,8 @@ function validateReferentialIntegrity(db: ReturnType<typeof getDb>, restaurantId
     { table: "venue_price", column: "venue_id", refTable: "venue", refColumn: "id" },
     { table: "venue_menu_item_availability", column: "menu_item_id", refTable: "menu_item", refColumn: "id" },
     { table: "venue_menu_item_availability", column: "venue_id", refTable: "venue", refColumn: "id" },
+    { table: "section_menu_item_availability", column: "menu_item_id", refTable: "menu_item", refColumn: "id" },
+    { table: "section_menu_item_availability", column: "section_id", refTable: "section", refColumn: "id" },
     { table: "section", column: "floor_id", refTable: "floor", refColumn: "id" },
     { table: "section", column: "venue_id", refTable: "venue", refColumn: "id" },
     { table: "floor", column: "venue_id", refTable: "venue", refColumn: "id" },
@@ -240,6 +245,7 @@ function verifyCounts(
     { cloudKey: "comboComponents", table: "combo_component", scopeColumn: "restaurant_id" },
     { cloudKey: "venuePrices", table: "venue_price", scopeColumn: "restaurant_id" },
     { cloudKey: "venueAvailability", table: "venue_menu_item_availability", scopeColumn: "restaurant_id" },
+    { cloudKey: "sectionAvailability", table: "section_menu_item_availability", scopeColumn: "restaurant_id" },
     { cloudKey: "users", table: "users", scopeColumn: "outlet_id" },
     { cloudKey: "ledgerCategories", table: "ledger_category", scopeColumn: "restaurant_id" },
     { cloudKey: "employees", table: "employee", scopeColumn: "restaurant_id" },
@@ -350,7 +356,7 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
       "taxProfiles", "priceProfiles", "priceProfileItems",
       "venues", "floors", "sections", "tables",
       "categories", "menuItems", "menuVariants", "menuAddons", "comboComponents",
-      "venuePrices", "venueAvailability", "users",
+      "venuePrices", "venueAvailability", "sectionAvailability", "users",
       "ledgerCategories", "employees",
     ];
     for (const field of arrayFields) {
@@ -393,6 +399,7 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
     // in-service operational state during config refresh.
     const rid = config.outlet.id;
     db.query(`DELETE FROM venue_menu_item_availability WHERE restaurant_id = ?`).run(rid);
+    db.query(`DELETE FROM section_menu_item_availability WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM venue_price WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM menu_item_addon WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM combo_component WHERE restaurant_id = ?`).run(rid);
@@ -562,15 +569,15 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
 
     // ── Menu Items ────────────────────────────────────────────────────────────
     for (const m of config.menuItems ?? []) {
-      db.query(`INSERT INTO menu_item (id, name, description, image_url, is_veg, is_available, sort_order, category_id, restaurant_id, base_price, unit, is_deleted, deleted_at, printer_target, printer_name, menu_type, gst_enabled, is_special, special_channel, special_active, special_expires_at, is_combo, show_in_menu, updated_at, synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+      db.query(`INSERT INTO menu_item (id, name, description, image_url, is_veg, is_available, sort_order, category_id, restaurant_id, base_price, unit, is_deleted, deleted_at, printer_target, printer_name, menu_type, gst_enabled, is_special, special_channel, special_active, special_expires_at, is_combo, show_in_menu, report_category, updated_at, synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, image_url=excluded.image_url,
         is_veg=excluded.is_veg, is_available=excluded.is_available, sort_order=excluded.sort_order,
         category_id=excluded.category_id, base_price=excluded.base_price, unit=excluded.unit,
         is_deleted=excluded.is_deleted, deleted_at=excluded.deleted_at, printer_target=excluded.printer_target,
         printer_name=excluded.printer_name, menu_type=excluded.menu_type, gst_enabled=excluded.gst_enabled,
         is_special=excluded.is_special, special_channel=excluded.special_channel, special_active=excluded.special_active,
-        special_expires_at=excluded.special_expires_at, is_combo=excluded.is_combo, show_in_menu=excluded.show_in_menu, updated_at=excluded.updated_at, synced_at=unixepoch()
+        special_expires_at=excluded.special_expires_at, is_combo=excluded.is_combo, show_in_menu=excluded.show_in_menu, report_category=excluded.report_category, updated_at=excluded.updated_at, synced_at=unixepoch()
       `).run(
         m.id, m.name, m.description || null, m.imageUrl || null,
         m.isVeg !== false ? 1 : 0, m.isAvailable !== false ? 1 : 0, m.sortOrder || 0,
@@ -581,6 +588,7 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
         m.specialChannel || "BOTH", m.specialActive !== false ? 1 : 0,
         m.specialExpiresAt ? new Date(m.specialExpiresAt).getTime() : null,
         m.isCombo ? 1 : 0, m.showInMenu !== false ? 1 : 0,
+        m.reportCategory || null,
         // Persist the cloud's updatedAt (ms epoch) so the edge→cloud conflict
         // check has a meaningful baseline to compare against on the next push.
         m.updatedAt ? new Date(m.updatedAt).getTime() : null
@@ -630,6 +638,15 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(venue_id, menu_item_id) DO UPDATE SET is_available=excluded.is_available
       `).run(va.id, va.venueId, va.menuItemId, va.restaurantId, va.isAvailable !== false ? 1 : 0);
+      totalRows++;
+    }
+
+    // ── Section Menu Item Availability ────────────────────────────────────────
+    for (const sa of config.sectionAvailability ?? []) {
+      db.query(`INSERT INTO section_menu_item_availability (id, section_id, menu_item_id, restaurant_id, is_available)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(section_id, menu_item_id) DO UPDATE SET is_available=excluded.is_available
+      `).run(sa.id, sa.sectionId, sa.menuItemId, sa.restaurantId, sa.isAvailable !== false ? 1 : 0);
       totalRows++;
     }
 
@@ -1124,15 +1141,15 @@ function applyChange(db: any, change: any): boolean {
 
     // ── Menu Item ───────────────────────────────────────────────────────────
     case "menu_item":
-      db.query(`INSERT INTO menu_item (id, name, description, image_url, is_veg, is_available, sort_order, category_id, restaurant_id, base_price, unit, is_deleted, deleted_at, printer_target, printer_name, menu_type, gst_enabled, is_special, special_channel, special_active, special_expires_at, is_combo, show_in_menu, updated_at, synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+      db.query(`INSERT INTO menu_item (id, name, description, image_url, is_veg, is_available, sort_order, category_id, restaurant_id, base_price, unit, is_deleted, deleted_at, printer_target, printer_name, menu_type, gst_enabled, is_special, special_channel, special_active, special_expires_at, is_combo, show_in_menu, report_category, updated_at, synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
         ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, image_url=excluded.image_url,
         is_veg=excluded.is_veg, is_available=excluded.is_available, sort_order=excluded.sort_order,
         category_id=excluded.category_id, base_price=excluded.base_price, unit=excluded.unit,
         is_deleted=excluded.is_deleted, deleted_at=excluded.deleted_at, printer_target=excluded.printer_target,
         printer_name=excluded.printer_name, menu_type=excluded.menu_type, gst_enabled=excluded.gst_enabled,
         is_special=excluded.is_special, special_channel=excluded.special_channel, special_active=excluded.special_active,
-        special_expires_at=excluded.special_expires_at, is_combo=excluded.is_combo, show_in_menu=excluded.show_in_menu, updated_at=excluded.updated_at, synced_at=unixepoch()
+        special_expires_at=excluded.special_expires_at, is_combo=excluded.is_combo, show_in_menu=excluded.show_in_menu, report_category=excluded.report_category, updated_at=excluded.updated_at, synced_at=unixepoch()
       `).run(
         row.id, row.name, row.description || null, row.imageUrl || null,
         row.isVeg !== false ? 1 : 0, row.isAvailable !== false ? 1 : 0, row.sortOrder || 0,
@@ -1143,6 +1160,7 @@ function applyChange(db: any, change: any): boolean {
         row.specialChannel || "BOTH", row.specialActive !== false ? 1 : 0,
         row.specialExpiresAt ? new Date(row.specialExpiresAt).getTime() : null,
         row.isCombo ? 1 : 0, row.showInMenu !== false ? 1 : 0,
+        row.reportCategory || null,
         // Persist the cloud's updatedAt (ms epoch) so the edge→cloud conflict
         // check has a meaningful baseline to compare against on the next push.
         row.updatedAt ? new Date(row.updatedAt).getTime() : null
@@ -1189,6 +1207,14 @@ function applyChange(db: any, change: any): boolean {
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(venue_id, menu_item_id) DO UPDATE SET is_available=excluded.is_available
       `).run(row.id, row.venueId, row.menuItemId, row.restaurantId, row.isAvailable !== false ? 1 : 0);
+      return true;
+
+    // ── Section Menu Item Availability ───────────────────────────────────────
+    case "section_menu_item_availability":
+      db.query(`INSERT INTO section_menu_item_availability (id, section_id, menu_item_id, restaurant_id, is_available)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(section_id, menu_item_id) DO UPDATE SET is_available=excluded.is_available
+      `).run(row.id, row.sectionId, row.menuItemId, row.restaurantId, row.isAvailable !== false ? 1 : 0);
       return true;
 
     // ── User ─────────────────────────────────────────────────────────────────
@@ -1251,6 +1277,7 @@ const TABLE_NAME_MAP: Record<string, string> = {
   combo_component: "combo_component",
   venue_price: "venue_price",
   venue_menu_item_availability: "venue_menu_item_availability",
+  section_menu_item_availability: "section_menu_item_availability",
   user: "users",
   ledger_category: "ledger_category",
   employee: "employee",

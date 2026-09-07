@@ -33,7 +33,12 @@ function createTestDb(): Database {
       cloud_synced INTEGER DEFAULT 0,
       revision INTEGER NOT NULL DEFAULT 1,
       is_extra_table INTEGER DEFAULT 0,
-      platform TEXT DEFAULT 'DINE_IN'
+      platform TEXT DEFAULT 'DINE_IN',
+      is_deleted INTEGER DEFAULT 0,
+      cloud_synced_version INTEGER DEFAULT 0,
+      sync_attempt_count INTEGER DEFAULT 0,
+      last_sync_attempt_at INTEGER,
+      last_sync_error TEXT
     )
   `).run();
 
@@ -467,5 +472,250 @@ describe('Dead-letter reset logic', () => {
       `SELECT attempts FROM sync_queue WHERE table_name = 'transaction' AND record_id = 'txn-1'`,
     ).get() as any;
     expect(row.attempts).toBe(3);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// v2 revision-based sync tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+import { getDb, setDb, closeDb, markUnsynced, nextOrderRevision, nextExpenditureRevision, nextTransactionRevision, migrateSyncQueueToRevisions } from "./db.ts";
+
+describe('v2 revision-based sync helpers', () => {
+  beforeEach(() => {
+    const db = createTestDb();
+    db.query(`
+      CREATE TABLE IF NOT EXISTS order_record (
+        id TEXT PRIMARY KEY,
+        table_id TEXT NOT NULL,
+        restaurant_id TEXT NOT NULL,
+        status TEXT DEFAULT 'PREPARING',
+        total_amount REAL DEFAULT 0,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        paid_at INTEGER,
+        bill_number TEXT,
+        cloud_synced INTEGER DEFAULT 0,
+        revision INTEGER NOT NULL DEFAULT 1,
+        is_extra_table INTEGER DEFAULT 0,
+        platform TEXT DEFAULT 'DINE_IN',
+        is_deleted INTEGER DEFAULT 0,
+        cloud_synced_version INTEGER DEFAULT 0,
+        sync_attempt_count INTEGER DEFAULT 0,
+        last_sync_attempt_at INTEGER,
+        last_sync_error TEXT,
+        last_request_id TEXT
+      )
+    `).run();
+    db.query(`
+      CREATE TABLE IF NOT EXISTS order_item (
+        id TEXT PRIMARY KEY,
+        order_id TEXT NOT NULL,
+        menu_item_id TEXT,
+        name TEXT,
+        price REAL DEFAULT 0,
+        quantity REAL DEFAULT 1,
+        notes TEXT,
+        menu_type TEXT DEFAULT 'FOOD',
+        cancelled_quantity REAL DEFAULT 0,
+        removed_from_bill INTEGER DEFAULT 0,
+        pour_from_inventory_item_id TEXT
+      )
+    `).run();
+    db.query(`
+      CREATE TABLE IF NOT EXISTS kot (
+        id TEXT PRIMARY KEY,
+        restaurant_id TEXT,
+        table_id TEXT,
+        order_id TEXT,
+        kot_number INTEGER,
+        counter_date TEXT,
+        captain_id TEXT,
+        created_at INTEGER,
+        device_id TEXT
+      )
+    `).run();
+    db.query(`
+      CREATE TABLE IF NOT EXISTS kot_item (
+        id TEXT PRIMARY KEY,
+        kot_id TEXT,
+        order_item_id TEXT,
+        menu_item_id TEXT,
+        name TEXT,
+        quantity REAL DEFAULT 1,
+        price REAL DEFAULT 0,
+        notes TEXT,
+        status TEXT DEFAULT 'SENT'
+      )
+    `).run();
+    db.query(`
+      CREATE TABLE IF NOT EXISTS transaction_record (
+        id TEXT PRIMARY KEY,
+        order_id TEXT,
+        restaurant_id TEXT,
+        kind TEXT,
+        payload TEXT,
+        sync_version INTEGER DEFAULT 1,
+        cloud_synced_version INTEGER DEFAULT 0,
+        sync_attempt_count INTEGER DEFAULT 0,
+        last_sync_attempt_at INTEGER,
+        last_sync_error TEXT,
+        created_at INTEGER
+      )
+    `).run();
+    db.query(`
+      CREATE TABLE IF NOT EXISTS expenditure (
+        id TEXT PRIMARY KEY,
+        restaurant_id TEXT,
+        amount REAL,
+        paid_to_type TEXT,
+        created_at INTEGER,
+        sync_version INTEGER DEFAULT 1,
+        cloud_synced_version INTEGER DEFAULT 0,
+        sync_attempt_count INTEGER DEFAULT 0,
+        last_sync_attempt_at INTEGER,
+        last_sync_error TEXT
+      )
+    `).run();
+    db.query(`
+      CREATE TABLE IF NOT EXISTS edge_config (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at INTEGER
+      )
+    `).run();
+    setDb(db);
+  });
+
+  afterEach(() => {
+    closeDb();
+  });
+
+  it('markUnsynced("order") bumps order revision', () => {
+    const db = getDb();
+    db.query("INSERT INTO order_record (id, table_id, restaurant_id, status, revision, cloud_synced_version) VALUES (?, ?, ?, 'PREPARING', 1, 0)").run('o-1', 't-1', 'r-1');
+    markUnsynced('order', 'o-1');
+    const row = db.query("SELECT revision, cloud_synced_version FROM order_record WHERE id = ?").get('o-1') as any;
+    expect(row.revision).toBe(2);
+    expect(row.cloud_synced_version).toBe(0);
+  });
+
+  it('markUnsynced("transaction") bumps sync_version', () => {
+    const db = getDb();
+    db.query("INSERT INTO transaction_record (id, order_id, restaurant_id, kind, sync_version, cloud_synced_version) VALUES (?, ?, ?, 'settle', 1, 0)").run('txn-1', 'o-1', 'r-1');
+    markUnsynced('transaction', 'txn-1');
+    const row = db.query("SELECT sync_version, cloud_synced_version FROM transaction_record WHERE id = ?").get('txn-1') as any;
+    expect(row.sync_version).toBe(2);
+    expect(row.cloud_synced_version).toBe(0);
+  });
+
+  it('markUnsynced("expenditure") bumps sync_version', () => {
+    const db = getDb();
+    db.query("INSERT INTO expenditure (id, restaurant_id, amount, sync_version, cloud_synced_version) VALUES (?, ?, ?, ?, ?)").run('e-1', 'r-1', 100, 1, 0);
+    markUnsynced('expenditure', 'e-1');
+    const row = db.query("SELECT sync_version, cloud_synced_version FROM expenditure WHERE id = ?").get('e-1') as any;
+    expect(row.sync_version).toBe(2);
+    expect(row.cloud_synced_version).toBe(0);
+  });
+
+  it('nextExpenditureRevision returns current + 1', () => {
+    const db = getDb();
+    db.query("INSERT INTO expenditure (id, restaurant_id, amount, sync_version) VALUES (?, ?, ?, ?)").run('e-1', 'r-1', 100, 5);
+    expect(nextExpenditureRevision('e-1')).toBe(6);
+  });
+
+  it('nextTransactionRevision returns current + 1', () => {
+    const db = getDb();
+    db.query("INSERT INTO transaction_record (id, restaurant_id, kind, sync_version) VALUES (?, ?, ?, ?)").run('txn-1', 'r-1', 'settle', 3);
+    expect(nextTransactionRevision('txn-1')).toBe(4);
+  });
+});
+
+describe('v2 sync migration (sync_queue → revision-based)', () => {
+  beforeEach(() => {
+    const db = createTestDb();
+    db.query(`
+      CREATE TABLE IF NOT EXISTS order_record (
+        id TEXT PRIMARY KEY,
+        table_id TEXT NOT NULL,
+        restaurant_id TEXT NOT NULL,
+        status TEXT DEFAULT 'PREPARING',
+        total_amount REAL DEFAULT 0,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        is_deleted INTEGER DEFAULT 0,
+        cloud_synced INTEGER DEFAULT 0,
+        revision INTEGER NOT NULL DEFAULT 1,
+        cloud_synced_version INTEGER DEFAULT 0
+      )
+    `).run();
+    db.query(`
+      CREATE TABLE IF NOT EXISTS transaction_record (
+        id TEXT PRIMARY KEY,
+        order_id TEXT,
+        restaurant_id TEXT,
+        kind TEXT,
+        sync_version INTEGER DEFAULT 1,
+        cloud_synced_version INTEGER DEFAULT 0
+      )
+    `).run();
+    db.query(`
+      CREATE TABLE IF NOT EXISTS expenditure (
+        id TEXT PRIMARY KEY,
+        restaurant_id TEXT,
+        amount REAL,
+        sync_version INTEGER DEFAULT 1,
+        cloud_synced_version INTEGER DEFAULT 0
+      )
+    `).run();
+    db.query(`
+      CREATE TABLE IF NOT EXISTS edge_config (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at INTEGER
+      )
+    `).run();
+    setDb(db);
+  });
+
+  afterEach(() => {
+    closeDb();
+  });
+
+  it('keeps revision=1 pending order truly pending (not marked as synced)', () => {
+    const db = getDb();
+    db.query("INSERT INTO order_record (id, table_id, restaurant_id, revision, cloud_synced_version) VALUES (?, ?, ?, 1, 0)").run('o-1', 't-1', 'r-1');
+    db.query("INSERT INTO sync_queue (table_name, record_id, operation, synced, created_at) VALUES ('order', 'o-1', 'insert', 0, ?)").run(Date.now());
+
+    migrateSyncQueueToRevisions();
+
+    const row = db.query("SELECT revision, cloud_synced_version FROM order_record WHERE id = ?").get('o-1') as any;
+    expect(row.cloud_synced_version).toBe(0); // pending: 1 > 0
+    expect(row.revision).toBe(1);
+  });
+
+  it('migrates pending sync_queue orders into revision-based pending state', () => {
+    const db = getDb();
+    db.query("INSERT INTO order_record (id, table_id, restaurant_id, revision, cloud_synced_version) VALUES (?, ?, ?, 5, 0)").run('o-1', 't-1', 'r-1');
+    db.query("INSERT INTO sync_queue (table_name, record_id, operation, synced, created_at) VALUES ('order', 'o-1', 'insert', 0, ?)").run(Date.now());
+
+    const result = migrateSyncQueueToRevisions();
+    expect(result.migrated).toBe(true);
+    expect(result.pendingConverted).toBeGreaterThan(0);
+
+    const row = db.query("SELECT revision, cloud_synced_version FROM order_record WHERE id = ?").get('o-1') as any;
+    expect(row.cloud_synced_version).toBe(row.revision - 1);
+    expect(row.cloud_synced_version).toBeLessThan(row.revision);
+  });
+
+  it('does not run twice (idempotent)', () => {
+    const db = getDb();
+    db.query("INSERT INTO order_record (id, table_id, restaurant_id, revision, cloud_synced_version) VALUES (?, ?, ?, 1, 0)").run('o-1', 't-1', 'r-1');
+    db.query("INSERT INTO sync_queue (table_name, record_id, operation, synced, created_at) VALUES ('order', 'o-1', 'insert', 0, ?)").run(Date.now());
+
+    const first = migrateSyncQueueToRevisions();
+    const second = migrateSyncQueueToRevisions();
+    expect(first.migrated).toBe(true);
+    expect(second.migrated).toBe(false);
   });
 });

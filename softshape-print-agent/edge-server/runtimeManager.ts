@@ -30,7 +30,7 @@ import { runtimeLog } from "./contract/logger.ts";
 import { emitEvent } from "./eventBus.ts";
 import { EVENT_NAMES } from "./contract/events.ts";
 import { getDeviceId, getRestaurantId, isSessionValid, isLocalReady, loadSession } from "./auth.ts";
-import { getDb, getSyncState, setSyncState } from "./db.ts";
+import { getDb, getSyncState, setSyncState, migrateSyncQueueToRevisions } from "./db.ts";
 import { downloadFullConfig, type ConfigSyncResult } from "./config.ts";
 import { startSyncWorker, stopSyncWorker, getSyncStatus } from "./sync.ts";
 import { startSocketSync, stopSocketSync, getSocketStatus, isInFallbackMode } from "./socketSync.ts";
@@ -242,6 +242,24 @@ class RuntimeManager {
     } catch (err: any) {
       this._startupError = err?.message || String(err);
       runtimeLog.error("Startup maintenance failed (non-fatal)", {
+        error: err?.stack || err,
+      });
+    }
+
+    // ── Step 1b: One-time migration from sync_queue to revision-based sync ──
+    // Converts pending sync_queue entries to revision-based state so the new
+    // sync worker picks them up. Idempotent (guarded by edge_config flag).
+    // No data is deleted — old sync_queue tables are left intact.
+    try {
+      const migrationResult = migrateSyncQueueToRevisions();
+      if (migrationResult.migrated) {
+        runtimeLog.info("Revision-sync migration completed", {
+          pendingConverted: migrationResult.pendingConverted,
+          syncedMarked: migrationResult.syncedMarked,
+        });
+      }
+    } catch (err: any) {
+      runtimeLog.error("Revision-sync migration failed (non-fatal — new worker will still run)", {
         error: err?.stack || err,
       });
     }

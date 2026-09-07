@@ -533,6 +533,7 @@ function upsertOrderFromSync(db: any, row: any): boolean {
 
   const existing = db.query("SELECT updated_at, cloud_synced, table_id FROM order_record WHERE id = ?").get(orderId) as any;
   const incomingUpdatedAt = Number(row.updated_at || row.updatedAt || Date.now());
+  const incomingRevision = Number(row.revision || 1);
 
   if (existing) {
     // Skip if local is same or newer
@@ -541,9 +542,11 @@ function upsertOrderFromSync(db: any, row: any): boolean {
     // table_id is critical — without it, a table transfer on Edge A
     // (Table 5 → Table 8) won't propagate to Edge B, leaving Edge B
     // showing the order on the wrong table.
+    // Set cloud_synced_version = revision so the push worker doesn't
+    // re-push an order that came from cloud (via pull or socket sync).
     db.query(`UPDATE order_record SET
       table_id = ?, status = ?, total_amount = ?, captain_id = ?, bill_number = ?,
-      billing_requested = ?, revision = ?, updated_at = ?, cloud_synced = 1
+      billing_requested = ?, revision = ?, cloud_synced_version = ?, updated_at = ?, cloud_synced = 1
       WHERE id = ?`).run(
       row.table_id || row.tableId || existing.table_id,
       row.status || "PREPARING",
@@ -551,17 +554,20 @@ function upsertOrderFromSync(db: any, row: any): boolean {
       row.captain_id || row.captainId || null,
       row.bill_number || row.billNumber || null,
       row.billing_requested || 0,
-      Number(row.revision || 1),
+      incomingRevision,
+      incomingRevision,
       incomingUpdatedAt,
       orderId,
     );
   } else {
-    // Insert new order from remote edge
+    // Insert new order from remote edge.
+    // Set revision and cloud_synced_version to the same value so the push
+    // worker recognizes this as already synced (it came from cloud).
     db.query(`INSERT INTO order_record
       (id, table_id, restaurant_id, status, total_amount, captain_id, platform,
        created_by_user_id, last_request_id, created_at, updated_at, cloud_synced,
-       is_extra_table, bill_number, billing_requested)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`).run(
+       is_extra_table, bill_number, billing_requested, revision, cloud_synced_version)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`).run(
       orderId,
       row.table_id || row.tableId,
       row.restaurant_id || row.restaurantId,
@@ -576,6 +582,8 @@ function upsertOrderFromSync(db: any, row: any): boolean {
       row.is_extra_table || row.isExtraTable ? 1 : 0,
       row.bill_number || row.billNumber || null,
       row.billing_requested || 0,
+      incomingRevision,
+      incomingRevision,
     );
   }
 

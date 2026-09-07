@@ -30,6 +30,7 @@ export interface MenuEditResult {
   statusCode?: number;
   isAvailable?: boolean;
   venueId?: string;
+  sectionId?: string;
   menuType?: string;
 }
 
@@ -39,7 +40,7 @@ function emitMenuChanged(): void {
   try {
     emitEvent({
       event: EVENT_NAMES.CONFIG_CHANGED,
-      data: { tables: ["menu_item", "venue_price", "venue_menu_item_availability"], source: "socket" },
+      data: { tables: ["menu_item", "venue_price", "venue_menu_item_availability", "section_menu_item_availability"], source: "socket" },
     });
   } catch (err) {
     runtimeLog.warn("[menuService] emitEvent failed (non-fatal)", { error: String(err) });
@@ -132,6 +133,32 @@ function upsertVenueAvailability(restaurantId: string, itemId: string, venueAvai
   }
 }
 
+// Upsert section_menu_item_availability rows for an item. Same transaction
+// wrapping as upsertVenueAvailability for atomicity + throughput.
+function upsertSectionAvailability(restaurantId: string, itemId: string, sectionAvail: Record<string, any>): void {
+  const db = getDb();
+  if (!sectionAvail || typeof sectionAvail !== "object") return;
+  const entries = Object.entries(sectionAvail);
+  if (entries.length === 0) return;
+
+  const stmt = db.query(`
+    INSERT INTO section_menu_item_availability (id, section_id, menu_item_id, restaurant_id, is_available)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(section_id, menu_item_id) DO UPDATE SET is_available = excluded.is_available
+  `);
+  db.exec("BEGIN");
+  try {
+    for (const [sectionId, isAvailable] of entries) {
+      const id = `smaa-${sectionId}-${itemId}`;
+      stmt.run(id, sectionId, itemId, restaurantId, isAvailable ? 1 : 0);
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
 // ── Create ───────────────────────────────────────────────────────────────────
 
 export function createMenuItemEdge(data: any): MenuEditResult {
@@ -155,8 +182,8 @@ export function createMenuItemEdge(data: any): MenuEditResult {
       id, name, description, image_url, is_veg, is_available, sort_order,
       category_id, restaurant_id, base_price, unit, is_deleted,
       printer_target, printer_name, menu_type, gst_enabled,
-      is_special, special_channel, special_active, special_expires_at, updated_at, synced_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+      is_special, special_channel, special_active, special_expires_at, report_category, updated_at, synced_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
   `).run(
     id,
     data.name,
@@ -177,11 +204,13 @@ export function createMenuItemEdge(data: any): MenuEditResult {
     data.specialChannel || "BOTH",
     data.specialActive === false ? 0 : 1,
     data.specialExpiresAt ? Number(new Date(data.specialExpiresAt).getTime()) : null,
+    data.reportCategory || null,
     Date.now(),
   );
 
   upsertVenuePrices(restaurantId, id, data.venuePrices);
   upsertVenueAvailability(restaurantId, id, data.venueAvailabilities);
+  upsertSectionAvailability(restaurantId, id, data.sectionAvailabilities);
 
   enqueueSync("menu_item", id, "create");
   invalidateReadCache();
@@ -218,6 +247,7 @@ export function updateMenuItemEdge(id: string, data: any): MenuEditResult {
   if (data.isSpecial !== undefined) { sets.push("is_special = ?"); params.push(data.isSpecial ? 1 : 0); }
   if (data.specialChannel !== undefined) { sets.push("special_channel = ?"); params.push(data.specialChannel); }
   if (data.specialActive !== undefined) { sets.push("special_active = ?"); params.push(data.specialActive ? 1 : 0); }
+  if (data.reportCategory !== undefined) { sets.push("report_category = ?"); params.push(data.reportCategory || null); }
   if (data.specialExpiresAt !== undefined) {
     sets.push("special_expires_at = ?");
     params.push(data.specialExpiresAt ? Number(new Date(data.specialExpiresAt).getTime()) : null);
@@ -265,6 +295,7 @@ export function updateMenuItemEdge(id: string, data: any): MenuEditResult {
 
   if (data.venuePrices !== undefined) upsertVenuePrices(restaurantId, id, data.venuePrices);
   if (data.venueAvailabilities !== undefined) upsertVenueAvailability(restaurantId, id, data.venueAvailabilities);
+  if (data.sectionAvailabilities !== undefined) upsertSectionAvailability(restaurantId, id, data.sectionAvailabilities);
 
   enqueueSync("menu_item", id, "update");
   invalidateReadCache();
@@ -350,6 +381,39 @@ export function toggleVenueAvailabilityEdge(id: string, venueId: string): MenuEd
   emitMenuChanged();
 
   return { success: true, id, venueId, isAvailable: !!newValue };
+}
+
+// ── Section availability toggle ──────────────────────────────────────────────
+
+export function toggleSectionAvailabilityEdge(id: string, sectionId: string): MenuEditResult {
+  const restaurantId = getRestaurantId();
+  if (!restaurantId) return { success: false, error: "No restaurant ID in session", statusCode: 500 };
+  if (!id || !sectionId) return { success: false, error: "id and sectionId are required", statusCode: 400 };
+
+  const db = getDb();
+  const row = db.query("SELECT is_available FROM section_menu_item_availability WHERE menu_item_id = ? AND section_id = ? AND restaurant_id = ?").get(id, sectionId, restaurantId) as any;
+  // If no row exists, the item is available by default — toggling makes it unavailable.
+  const currentValue = row ? !!row.is_available : true;
+  const newValue = currentValue ? 0 : 1;
+
+  const smaaId = `smaa-${sectionId}-${id}`;
+  db.query(`
+    INSERT INTO section_menu_item_availability (id, section_id, menu_item_id, restaurant_id, is_available)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(section_id, menu_item_id) DO UPDATE SET is_available = excluded.is_available
+  `).run(smaaId, sectionId, id, restaurantId, newValue);
+
+  // Bump the parent menu_item row's updated_at + synced_at so the sync payload
+  // carries a meaningful timestamp for the cloud conflict check.
+  db.query("UPDATE menu_item SET updated_at = ?, synced_at = unixepoch() WHERE id = ? AND restaurant_id = ?")
+    .run(Date.now(), id, restaurantId);
+
+  // Enqueue a menu_item sync so the cloud receives the updated availability map.
+  enqueueSync("menu_item", id, "update");
+  invalidateReadCache();
+  emitMenuChanged();
+
+  return { success: true, id, sectionId, isAvailable: !!newValue };
 }
 
 // ── Menu type toggle (FOOD ↔ LIQUOR) ─────────────────────────────────────────
