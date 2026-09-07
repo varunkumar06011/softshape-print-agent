@@ -357,26 +357,25 @@ function getReportCategory(
   name: string,
   reportCategory?: string | null,
   categoryName?: string | null,
+  categoryReportCategory?: string | null,
 ): 'Liquor' | 'Food' | 'Beverages' | 'Combo' {
-  // 1. Priority: admin-set reportCategory (sales category) — same as cloud backend.
+  // 1. Priority: Category.reportCategory — the parent sales-category bucket
+  //    the admin assigned to this item's category (Petpooja-style: the category
+  //    you pick at item setup IS the report bucket). Single source of truth.
+  const catRC = String(categoryReportCategory || '').trim();
+  if (catRC && ['Food', 'Beverages', 'Liquor', 'Combo'].includes(catRC)) {
+    return catRC as 'Liquor' | 'Food' | 'Beverages' | 'Combo';
+  }
+
+  // 2. Fallback: admin-set reportCategory on the MenuItem (legacy override).
   if (reportCategory && ['Food', 'Beverages', 'Liquor', 'Combo'].includes(reportCategory)) {
     return reportCategory as 'Liquor' | 'Food' | 'Beverages' | 'Combo';
   }
 
-  // 2. Fallback: derive from the MenuItem's Category.name.
-  const catName = String(categoryName || '').trim().toLowerCase();
-  if (catName === 'liquor') return 'Liquor';
-  if (catName === 'beverages' || catName === 'beverage') return 'Beverages';
-  if (catName === 'food') return 'Food';
-
   // 3. Fallback: derive from menuType. LIQUOR/BAR items are always Liquor sales.
   if (String(menuType || '').toUpperCase() === 'LIQUOR' || String(menuType || '').toUpperCase() === 'BAR') return 'Liquor';
 
-  // 4. Fallback: beverage keyword matching on the item name.
-  const normalizedName = normalizeBeverageName(name);
-  if (BEVERAGE_KEYWORDS.some((k) => normalizedName.includes(k))) return 'Beverages';
-
-  // 5. Last resort: default to Food.
+  // 4. Last resort: default to Food.
   return 'Food';
 }
 
@@ -397,7 +396,7 @@ interface EdgeTxnRecord {
   tableNumber: string | null;
   billNumber: string | null;
   captainId: string | null;
-  items: Array<{ menuItemId: string | null; name: string; price: number; quantity: number; menuType: string; reportCategory: string | null; categoryName: string | null }>;
+  items: Array<{ menuItemId: string | null; name: string; price: number; quantity: number; menuType: string; reportCategory: string | null; categoryName: string | null; categoryReportCategory: string | null }>;
 }
 
 function collectEdgeTransactions(restaurantId: string, startTs: number, endTs: number): EdgeTxnRecord[] {
@@ -405,15 +404,15 @@ function collectEdgeTransactions(restaurantId: string, startTs: number, endTs: n
   const records: EdgeTxnRecord[] = [];
 
   // Pre-load every menu item's admin-set sales category (report_category) and
-  // its Category.name for this restaurant so report classification matches the
-  // cloud backend's getReportCategory priority (reportCategory → category name
-  // → menuType → name keywords) instead of guessing from menuType + name only.
+  // its Category's report_category + name for this restaurant so report
+  // classification matches the cloud backend's getReportCategory priority
+  // (Category.reportCategory → MenuItem.reportCategory → menuType → default Food).
   const menuItemRows = db.query(
-    "SELECT mi.id AS mi_id, mi.report_category, c.name AS category_name FROM menu_item mi LEFT JOIN category c ON c.id = mi.category_id WHERE mi.restaurant_id = ?"
+    "SELECT mi.id AS mi_id, mi.report_category, c.name AS category_name, c.report_category AS category_report_category FROM menu_item mi LEFT JOIN category c ON c.id = mi.category_id WHERE mi.restaurant_id = ?"
   ).all(restaurantId) as any[];
-  const menuItemMeta = new Map<string, { reportCategory: string | null; categoryName: string | null }>();
+  const menuItemMeta = new Map<string, { reportCategory: string | null; categoryName: string | null; categoryReportCategory: string | null }>();
   for (const r of menuItemRows) {
-    menuItemMeta.set(r.mi_id, { reportCategory: r.report_category || null, categoryName: r.category_name || null });
+    menuItemMeta.set(r.mi_id, { reportCategory: r.report_category || null, categoryName: r.category_name || null, categoryReportCategory: r.category_report_category || null });
   }
 
   // 1. Settled orders
@@ -452,6 +451,7 @@ function collectEdgeTransactions(restaurantId: string, startTs: number, endTs: n
           menuType: String(i.menu_type || "FOOD"),
           reportCategory: meta?.reportCategory ?? null,
           categoryName: meta?.categoryName ?? null,
+          categoryReportCategory: meta?.categoryReportCategory ?? null,
         };
       }),
     });
@@ -490,6 +490,7 @@ function collectEdgeTransactions(restaurantId: string, startTs: number, endTs: n
             menuType: String(i.menuType || "FOOD"),
             reportCategory: meta?.reportCategory ?? null,
             categoryName: meta?.categoryName ?? null,
+            categoryReportCategory: meta?.categoryReportCategory ?? null,
           };
         }),
       });
@@ -1636,6 +1637,16 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
 
     const db = getDb();
 
+    // Pre-load menu item metadata (reportCategory + category reportCategory + category name)
+    // so item classification uses the same getReportCategory priority chain as cloud.
+    const menuItemRows = db.query(
+      "SELECT mi.id AS mi_id, mi.report_category, c.name AS category_name, c.report_category AS category_report_category FROM menu_item mi LEFT JOIN category c ON c.id = mi.category_id WHERE mi.restaurant_id = ?"
+    ).all(restaurantId) as any[];
+    const menuItemMeta = new Map<string, { reportCategory: string | null; categoryName: string | null; categoryReportCategory: string | null }>();
+    for (const r of menuItemRows) {
+      menuItemMeta.set(r.mi_id, { reportCategory: r.report_category || null, categoryName: r.category_name || null, categoryReportCategory: r.category_report_category || null });
+    }
+
     // Resolve section filter to table IDs
     let sectionTableIds: string[] = [];
     if (sectionName) {
@@ -1676,7 +1687,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
 
     // Process settled orders
     for (const order of settledOrders) {
-      const items = db.query("SELECT name, price, quantity, menu_type FROM order_item WHERE order_id = ? AND removed_from_bill = 0").all(order.id) as any[];
+      const items = db.query("SELECT menu_item_id, name, price, quantity, menu_type FROM order_item WHERE order_id = ? AND removed_from_bill = 0").all(order.id) as any[];
       // Get discount from settle record
       const settleRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
       let discountPercent = 0;
@@ -1691,8 +1702,9 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         const quantity = Number(item.quantity || 0);
         const price = Number(item.price || 0);
         const revenue = Math.round(price * quantity * discountFactor * 100) / 100;
-        const rawType = String(item.menu_type || "FOOD").toUpperCase();
-        const type = rawType === "LIQUOR" || rawType === "BAR" ? "liquor" : "food";
+        const meta = item.menu_item_id ? menuItemMeta.get(item.menu_item_id) : null;
+        const reportCat = getReportCategory(item.menu_type, name, meta?.reportCategory ?? null, meta?.categoryName ?? null, meta?.categoryReportCategory ?? null);
+        const type = reportCat.toLowerCase();
 
         if (itemMap.has(key)) {
           const existing = itemMap.get(key)!;
@@ -1717,8 +1729,10 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         const quantity = Number(item.quantity || item.q || 0);
         const price = Number(item.price || item.p || 0);
         const revenue = Math.round(price * quantity * discountFactor * 100) / 100;
-        const rawType = String(item.menuType || "FOOD").toUpperCase();
-        const type = rawType === "LIQUOR" || rawType === "BAR" ? "liquor" : "food";
+        const mid = item.menuItemId || item.id || null;
+        const meta = mid ? menuItemMeta.get(mid) : null;
+        const reportCat = getReportCategory(item.menuType, name, meta?.reportCategory ?? null, meta?.categoryName ?? null, meta?.categoryReportCategory ?? null);
+        const type = reportCat.toLowerCase();
 
         if (itemMap.has(key)) {
           const existing = itemMap.get(key)!;
@@ -3630,9 +3644,9 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         const template = menuTemplate || { categories: [] };
         for (const cat of template.categories || []) {
           const categoryId = crypto.randomUUID();
-          db.query(`INSERT INTO category (id, name, restaurant_id, sort_order, is_active)
-                    VALUES (?, ?, ?, ?, 1)`)
-            .run(categoryId, cat.name, restaurantId, cat.sortOrder || 0);
+          db.query(`INSERT INTO category (id, name, restaurant_id, sort_order, is_active, report_category)
+                    VALUES (?, ?, ?, ?, 1, ?)`)
+            .run(categoryId, cat.name, restaurantId, cat.sortOrder || 0, cat.reportCategory || null);
           enqueueSync('category', categoryId, 'create');
 
           for (const item of cat.items || []) {
@@ -3965,8 +3979,8 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const restaurantId = getRestaurantId();
     const categoryId = crypto.randomUUID();
 
-    db.query("INSERT INTO category (id, name, restaurant_id, sort_order, is_active, printer_target) VALUES (?, ?, ?, 0, 1, ?)")
-      .run(categoryId, body.name, restaurantId, body.printerTarget || null);
+    db.query("INSERT INTO category (id, name, restaurant_id, sort_order, is_active, printer_target, report_category) VALUES (?, ?, ?, 0, 1, ?, ?)")
+      .run(categoryId, body.name, restaurantId, body.printerTarget || null, body.reportCategory || null);
     enqueueSync("category", categoryId, "create");
 
     return jsonResponse({ success: true, id: categoryId });
@@ -3987,6 +4001,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     if (body.name !== undefined) { updates.push("name = ?"); values.push(body.name); }
     if (body.sortOrder !== undefined) { updates.push("sort_order = ?"); values.push(Number(body.sortOrder)); }
     if (body.printerTarget !== undefined) { updates.push("printer_target = ?"); values.push(body.printerTarget); }
+    if (body.reportCategory !== undefined) { updates.push("report_category = ?"); values.push(body.reportCategory || null); }
 
     if (updates.length === 0) return errorResponse("No fields to update", 400);
 
@@ -4253,7 +4268,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const catMap = new Map<string, { itemCount: number; totalQuantity: number; totalRevenue: number }>();
     for (const t of txns) {
       for (const item of t.items) {
-        const cat = getReportCategory(item.menuType, item.name, item.reportCategory, item.categoryName);
+        const cat = getReportCategory(item.menuType, item.name, item.reportCategory, item.categoryName, item.categoryReportCategory);
         const discountFactor = t.discountPercent > 0 ? (1 - t.discountPercent / 100) : 1;
         const revenue = Math.round(item.price * item.quantity * discountFactor * 100) / 100;
         const entry = catMap.get(cat) || { itemCount: 0, totalQuantity: 0, totalRevenue: 0 };
@@ -4303,7 +4318,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     for (const t of txns) {
       const discountFactor = t.discountPercent > 0 ? (1 - t.discountPercent / 100) : 1;
       for (const item of t.items) {
-        const reportCategory = getReportCategory(item.menuType, item.name, item.reportCategory, item.categoryName);
+        const reportCategory = getReportCategory(item.menuType, item.name, item.reportCategory, item.categoryName, item.categoryReportCategory);
         const key = reportCategory === "Beverages" ? normalizeBeverageName(item.name) : item.name;
         const revenue = Math.round(item.price * item.quantity * discountFactor * 100) / 100;
         const existing = itemMap.get(key);

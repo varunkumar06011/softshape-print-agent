@@ -714,6 +714,8 @@ function initSchema(database: Database) {
 
       printer_target  TEXT,
 
+      report_category TEXT,
+
       synced_at       INTEGER NOT NULL DEFAULT (unixepoch())
 
     );
@@ -2117,6 +2119,22 @@ function runMigrations(database: Database) {
   if (!hasColumn("menu_item", "report_category")) {
 
     database.exec(`ALTER TABLE menu_item ADD COLUMN report_category TEXT`);
+
+  }
+
+
+
+  // ── category.report_category — parent sales-category bucket (Food/Beverages/Liquor) ──
+
+  // Mirrors the cloud Category.reportCategory field so the edge server can
+
+  // classify items by their category's parent bucket, matching the cloud
+
+  // backend's getReportCategory priority chain.
+
+  if (!hasColumn("category", "report_category")) {
+
+    database.exec(`ALTER TABLE category ADD COLUMN report_category TEXT`);
 
   }
 

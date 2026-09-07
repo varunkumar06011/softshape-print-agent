@@ -560,10 +560,10 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
 
     // ── Categories ────────────────────────────────────────────────────────────
     for (const c of config.categories ?? []) {
-      db.query(`INSERT INTO category (id, name, sort_order, is_active, restaurant_id, printer_target, synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, unixepoch())
-        ON CONFLICT(id) DO UPDATE SET name=excluded.name, sort_order=excluded.sort_order, is_active=excluded.is_active, printer_target=excluded.printer_target, synced_at=unixepoch()
-      `).run(c.id, c.name, c.sortOrder || 0, c.isActive !== false ? 1 : 0, c.restaurantId, c.printerTarget || null);
+      db.query(`INSERT INTO category (id, name, sort_order, is_active, restaurant_id, printer_target, report_category, synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch())
+        ON CONFLICT(id) DO UPDATE SET name=excluded.name, sort_order=excluded.sort_order, is_active=excluded.is_active, printer_target=excluded.printer_target, report_category=excluded.report_category, synced_at=unixepoch()
+      `).run(c.id, c.name, c.sortOrder || 0, c.isActive !== false ? 1 : 0, c.restaurantId, c.printerTarget || null, c.reportCategory || null);
       totalRows++;
     }
 
@@ -1133,10 +1133,10 @@ function applyChange(db: any, change: any): boolean {
 
     // ── Category ────────────────────────────────────────────────────────────
     case "category":
-      db.query(`INSERT INTO category (id, name, sort_order, is_active, restaurant_id, printer_target, synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, unixepoch())
-        ON CONFLICT(id) DO UPDATE SET name=excluded.name, sort_order=excluded.sort_order, is_active=excluded.is_active, printer_target=excluded.printer_target, synced_at=unixepoch()
-      `).run(row.id, row.name, row.sortOrder || 0, row.isActive !== false ? 1 : 0, row.restaurantId, row.printerTarget || null);
+      db.query(`INSERT INTO category (id, name, sort_order, is_active, restaurant_id, printer_target, report_category, synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch())
+        ON CONFLICT(id) DO UPDATE SET name=excluded.name, sort_order=excluded.sort_order, is_active=excluded.is_active, printer_target=excluded.printer_target, report_category=excluded.report_category, synced_at=unixepoch()
+      `).run(row.id, row.name, row.sortOrder || 0, row.isActive !== false ? 1 : 0, row.restaurantId, row.printerTarget || null, row.reportCategory || null);
       return true;
 
     // ── Menu Item ───────────────────────────────────────────────────────────
