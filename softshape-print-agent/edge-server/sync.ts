@@ -33,10 +33,10 @@ const CONFIG_PULL_INTERVAL_MS = parseInt(process.env.EDGE_CONFIG_PULL_INTERVAL_M
 const BUSINESS_PULL_INTERVAL_MS = parseInt(process.env.EDGE_BUSINESS_PULL_INTERVAL_MS || "30000", 10);
 const RECONCILE_INTERVAL_MS = 5 * 60_000; // every 5 minutes
 const WAL_CHECKPOINT_INTERVAL_MS = 5 * 60_000; // every 5 minutes
-const MAX_ORDERS_PER_CYCLE = 10;
+const MAX_ORDERS_PER_CYCLE = 50;
 const BACKOFF_BASE_MS = 5_000;
 const BACKOFF_MAX_MS = 60_000;
-const STUCK_RECORD_THRESHOLD = 10; // sync_attempt_count > 10 → stuck
+const STUCK_RECORD_THRESHOLD = 100; // sync_attempt_count > 100 → stuck (was 10, too aggressive)
 const STUCK_RECORD_AGE_MS = 30 * 60_000; // pending > 30 min → stuck
 
 let syncRunning = false;
@@ -227,8 +227,8 @@ async function pushOrder(order: PendingOrder): Promise<{ ok: boolean; duplicate?
         snapshotRevision: built.snapshotRevision,
         ...built.payload,
       }),
-      connectTimeout: 45_000,
-      bodyTimeout: 90_000,
+      connectTimeout: 15_000,
+      bodyTimeout: 30_000,
     });
 
     if (res.status === 401) {
@@ -331,8 +331,8 @@ async function pushExpenditure(exp: PendingExpenditure): Promise<{ ok: boolean; 
         snapshotRevision: exp.sync_version,
         expenditure: expenditurePayload,
       }),
-      connectTimeout: 30_000,
-      bodyTimeout: 60_000,
+      connectTimeout: 15_000,
+      bodyTimeout: 30_000,
     });
 
     if (res.status === 401) return { ok: false, error: "401" };
@@ -415,8 +415,8 @@ async function pushWalkin(walkin: PendingWalkin): Promise<{ ok: boolean; error?:
         snapshotRevision: walkin.sync_version,
         transaction: { id: walkin.id, ...payload },
       }),
-      connectTimeout: 30_000,
-      bodyTimeout: 60_000,
+      connectTimeout: 15_000,
+      bodyTimeout: 30_000,
     });
 
     if (res.status === 401) return { ok: false, error: "401" };
@@ -821,15 +821,22 @@ async function runSyncCycle(): Promise<void> {
       }
     }
 
-    // Periodic reconciliation (every 5 minutes) — detects cloud-missing records
-    if (now - lastReconcileAt >= RECONCILE_INTERVAL_MS) {
-      lastReconcileAt = now;
-      try {
-        await reconcileWithCloud();
-      } catch (reconErr) {
-        console.warn("[Sync] Reconciliation failed:", (reconErr as Error)?.message || reconErr);
-      }
-    }
+    // Reconciliation disabled — reconcileWithCloud() fetches up to 100k cloud
+    // records and iterates every local record, blocking the edge server's
+    // single-threaded event loop for 30+ seconds. This causes /health to hang,
+    // which triggers the frontend's 19s LAN discovery cascade, freezing the UI.
+    // The revision-based sync system (revision > cloud_synced_version) already
+    // guarantees that unsynced records are retried every cycle — reconciliation
+    // is only needed to detect cloud-side data loss, which is rare at this scale.
+    // Re-enable manually via POST /api/edge/sync/reconcile if needed.
+    // if (now - lastReconcileAt >= RECONCILE_INTERVAL_MS) {
+    //   lastReconcileAt = now;
+    //   try {
+    //     await reconcileWithCloud();
+    //   } catch (reconErr) {
+    //     console.warn("[Sync] Reconciliation failed:", (reconErr as Error)?.message || reconErr);
+    //   }
+    // }
   } catch (err) {
     consecutiveFailures++;
     console.error("[Sync] Worker cycle error:", err);
@@ -848,6 +855,30 @@ function scheduleNextCycle(delay: number): void {
 
 export function startSyncWorker(): void {
   if (syncTimer) return;
+
+  // Reset dead-lettered records on startup. After prolonged connectivity
+  // issues, records accumulate sync_attempt_count > STUCK_RECORD_THRESHOLD
+  // and are excluded from collectUnsyncedOrders(). Resetting gives every
+  // unsynced record a fresh retry when the edge server starts.
+  try {
+    const db = getDb();
+    const orderReset = db.query(
+      "UPDATE order_record SET sync_attempt_count = 0, last_sync_error = NULL WHERE revision > cloud_synced_version AND sync_attempt_count > 0",
+    ).run();
+    const expReset = db.query(
+      "UPDATE expenditure SET sync_attempt_count = 0, last_sync_error = NULL WHERE sync_version > cloud_synced_version AND sync_attempt_count > 0",
+    ).run();
+    const walkinReset = db.query(
+      "UPDATE transaction_record SET sync_attempt_count = 0, last_sync_error = NULL WHERE kind = 'walkin' AND sync_version > cloud_synced_version AND sync_attempt_count > 0",
+    ).run();
+    const totalReset = (orderReset.changes || 0) + (expReset.changes || 0) + (walkinReset.changes || 0);
+    if (totalReset > 0) {
+      console.log(`[Sync] Startup reset: cleared dead-letter status on ${totalReset} stuck record(s) — they will retry syncing`);
+    }
+  } catch (err) {
+    console.warn("[Sync] Startup reset failed:", err);
+  }
+
   const initialDelay = consecutiveFailures > 0 ? getBackoffDelay() : 5_000;
   console.log(`[Sync] Worker started (v2 revision-based) — initial delay: ${initialDelay}ms, base interval: ${SYNC_INTERVAL_MS}ms`);
   scheduleNextCycle(initialDelay);
@@ -881,7 +912,7 @@ export function getSyncStatus(): {
   const pendingExpenditures = (db.query("SELECT COUNT(*) as c FROM expenditure WHERE sync_version > cloud_synced_version").get() as any)?.c || 0;
   const pendingWalkins = (db.query("SELECT COUNT(*) as c FROM transaction_record WHERE kind = 'walkin' AND sync_version > cloud_synced_version").get() as any)?.c || 0;
 
-  // Stuck records: sync_attempt_count > 10 or pending for more than 30 minutes
+  // Stuck records: sync_attempt_count > STUCK_RECORD_THRESHOLD or pending > 30 min
   const stuckOrders = db.query(
     `SELECT id, sync_attempt_count, last_sync_error, created_at, last_sync_attempt_at
      FROM order_record

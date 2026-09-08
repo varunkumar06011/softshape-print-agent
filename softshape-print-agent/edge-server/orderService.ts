@@ -7718,7 +7718,25 @@ export async function listItemsSoldEdge(
 
   // Aggregate items
 
-  const itemMap = new Map<string, { name: string; quantity: number; revenue: number; type: string; orderCount: number }>();
+  // Fetch the outlet's GST settings so food revenue can be shown with GST.
+  let effectiveGstRate = 0;
+  try {
+    const outletRow = db.query("SELECT gst_rate, gst_category, gst_registered FROM outlet WHERE id = ?").get(restaurantId) as any;
+    if (outletRow) {
+      const registered = Number(outletRow.gst_registered ?? 1) === 1;
+      if (registered) {
+        const rate = Number(outletRow.gst_rate ?? 0);
+        if (rate > 0) {
+          effectiveGstRate = rate;
+        } else {
+          const cat = String(outletRow.gst_category || "NON_AC").toUpperCase();
+          effectiveGstRate = cat === "AC" ? 18 : 5;
+        }
+      }
+    }
+  } catch {}
+
+  const itemMap = new Map<string, { name: string; quantity: number; revenue: number; revenueWithGst: number; type: string; orderCount: number }>();
 
 
 
@@ -7740,8 +7758,6 @@ export async function listItemsSoldEdge(
 
       const revenue = Math.round(price * quantity * 100) / 100;
 
-
-
       let type = edgeGetAnalyticsType(item);
 
       if (type === "food" || type === "beverages") {
@@ -7756,7 +7772,10 @@ export async function listItemsSoldEdge(
 
       }
 
-
+      // Food items carry GST; liquor and beverages do not.
+      const withGst = type === "food" && effectiveGstRate > 0
+        ? Math.round(revenue * (1 + effectiveGstRate / 100) * 100) / 100
+        : revenue;
 
       if (itemMap.has(key)) {
 
@@ -7766,11 +7785,13 @@ export async function listItemsSoldEdge(
 
         existing.revenue += revenue;
 
+        existing.revenueWithGst += withGst;
+
         existing.orderCount += 1;
 
       } else {
 
-        itemMap.set(key, { name, quantity, revenue, type, orderCount: 1 });
+        itemMap.set(key, { name, quantity, revenue, revenueWithGst: withGst, type, orderCount: 1 });
 
       }
 
@@ -7789,6 +7810,8 @@ export async function listItemsSoldEdge(
       quantity: data.quantity,
 
       revenue: Math.round(data.revenue * 100) / 100,
+
+      revenueWithGst: Math.round(data.revenueWithGst * 100) / 100,
 
       type: data.type,
 
