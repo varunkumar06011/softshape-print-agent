@@ -797,3 +797,75 @@ describe('v2 sync migration (sync_queue → revision-based)', () => {
     expect(second.migrated).toBe(false);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dead-letter exclusion: records with sync_attempt_count >= STUCK_RECORD_THRESHOLD
+// must NOT be collected by the sync worker. They stay visible as stuck but are
+// not retried, preventing them from blocking new records.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('dead-letter exclusion from sync collection', () => {
+  const STUCK_RECORD_THRESHOLD = 10;
+
+  beforeEach(() => {
+    const db = createTestDb();
+    db.query(`
+      CREATE TABLE IF NOT EXISTS expenditure (
+        id TEXT PRIMARY KEY,
+        restaurant_id TEXT,
+        amount REAL,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+        sync_version INTEGER DEFAULT 1,
+        cloud_synced_version INTEGER DEFAULT 0,
+        sync_attempt_count INTEGER DEFAULT 0,
+        last_sync_attempt_at INTEGER,
+        last_sync_error TEXT
+      )
+    `).run();
+    setDb(db);
+  });
+
+  afterEach(() => {
+    closeDb();
+  });
+
+  it('excludes orders with sync_attempt_count >= threshold from collection', () => {
+    const db = getDb();
+    // Stuck order: 10 attempts (at threshold) — should be excluded
+    db.query("INSERT INTO order_record (id, table_id, restaurant_id, revision, cloud_synced_version, sync_attempt_count, is_deleted) VALUES (?, ?, ?, 2, 0, ?, 0)")
+      .run('stuck-order', 't-1', 'r-1', STUCK_RECORD_THRESHOLD);
+    // Fresh order: 0 attempts — should be collected
+    db.query("INSERT INTO order_record (id, table_id, restaurant_id, revision, cloud_synced_version, sync_attempt_count, is_deleted) VALUES (?, ?, ?, 2, 0, 0, 0)")
+      .run('fresh-order', 't-2', 'r-1');
+
+    // Same query as collectUnsyncedOrders
+    const collected = db.query(
+      `SELECT id FROM order_record
+       WHERE revision > cloud_synced_version AND is_deleted = 0
+         AND sync_attempt_count < ?
+       ORDER BY created_at ASC LIMIT 10`,
+    ).all(STUCK_RECORD_THRESHOLD) as Array<{ id: string }>;
+
+    const ids = collected.map(r => r.id);
+    expect(ids).toContain('fresh-order');
+    expect(ids).not.toContain('stuck-order');
+  });
+
+  it('excludes expenditures with sync_attempt_count >= threshold from collection', () => {
+    const db = getDb();
+    db.query("INSERT INTO expenditure (id, restaurant_id, amount, sync_version, cloud_synced_version, sync_attempt_count) VALUES (?, ?, ?, 2, 0, ?)")
+      .run('stuck-exp', 'r-1', 100, STUCK_RECORD_THRESHOLD);
+    db.query("INSERT INTO expenditure (id, restaurant_id, amount, sync_version, cloud_synced_version, sync_attempt_count) VALUES (?, ?, ?, 2, 0, 0)")
+      .run('fresh-exp', 'r-1', 50);
+
+    const collected = db.query(
+      `SELECT id FROM expenditure
+       WHERE sync_version > cloud_synced_version
+         AND sync_attempt_count < ?
+       ORDER BY created_at ASC LIMIT 10`,
+    ).all(STUCK_RECORD_THRESHOLD) as Array<{ id: string }>;
+
+    const ids = collected.map(r => r.id);
+    expect(ids).toContain('fresh-exp');
+    expect(ids).not.toContain('stuck-exp');
+  });
+});

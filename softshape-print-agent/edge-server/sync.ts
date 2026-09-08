@@ -32,6 +32,7 @@ const SYNC_INTERVAL_MS = parseInt(process.env.EDGE_SYNC_INTERVAL_MS || "5000", 1
 const CONFIG_PULL_INTERVAL_MS = parseInt(process.env.EDGE_CONFIG_PULL_INTERVAL_MS || "60000", 10);
 const BUSINESS_PULL_INTERVAL_MS = parseInt(process.env.EDGE_BUSINESS_PULL_INTERVAL_MS || "30000", 10);
 const RECONCILE_INTERVAL_MS = 5 * 60_000; // every 5 minutes
+const WAL_CHECKPOINT_INTERVAL_MS = 5 * 60_000; // every 5 minutes
 const MAX_ORDERS_PER_CYCLE = 10;
 const BACKOFF_BASE_MS = 5_000;
 const BACKOFF_MAX_MS = 60_000;
@@ -43,6 +44,7 @@ let lastSyncAt = 0;
 let lastConfigPullAt = 0;
 let lastBusinessPullAt = 0;
 let lastReconcileAt = 0;
+let lastWalCheckpointAt = 0;
 let consecutiveFailures = 0;
 let lastSyncResult: { ok: boolean; pushed: number; accepted: number; rejected: number; error?: string } | null = null;
 let _cloudRegistrationAttempted = false;
@@ -72,9 +74,10 @@ function collectUnsyncedOrders(): PendingOrder[] {
     `SELECT id, revision, cloud_synced_version, created_at
      FROM order_record
      WHERE revision > cloud_synced_version AND is_deleted = 0
+       AND sync_attempt_count < ?  -- dead-letter: stop retrying stuck records
      ORDER BY created_at ASC
      LIMIT ?`,
-  ).all(MAX_ORDERS_PER_CYCLE) as PendingOrder[];
+  ).all(STUCK_RECORD_THRESHOLD, MAX_ORDERS_PER_CYCLE) as PendingOrder[];
 }
 
 // Build a complete order payload inside a SQLite read transaction for a
@@ -264,9 +267,10 @@ function collectUnsyncedExpenditures(): PendingExpenditure[] {
     `SELECT id, sync_version, cloud_synced_version
      FROM expenditure
      WHERE sync_version > cloud_synced_version
+       AND sync_attempt_count < ?  -- dead-letter: stop retrying stuck records
      ORDER BY created_at ASC
      LIMIT ?`,
-  ).all(MAX_ORDERS_PER_CYCLE) as PendingExpenditure[];
+  ).all(STUCK_RECORD_THRESHOLD, MAX_ORDERS_PER_CYCLE) as PendingExpenditure[];
 }
 
 function markExpenditureSynced(id: string, snapshotRevision: number): boolean {
@@ -364,9 +368,10 @@ function collectUnsyncedWalkins(): PendingWalkin[] {
     `SELECT id, sync_version, cloud_synced_version
      FROM transaction_record
      WHERE kind = 'walkin' AND sync_version > cloud_synced_version
+       AND sync_attempt_count < ?  -- dead-letter: stop retrying stuck records
      ORDER BY created_at ASC
      LIMIT ?`,
-  ).all(MAX_ORDERS_PER_CYCLE) as PendingWalkin[];
+  ).all(STUCK_RECORD_THRESHOLD, MAX_ORDERS_PER_CYCLE) as PendingWalkin[];
 }
 
 function markWalkinSynced(id: string, snapshotRevision: number): boolean {
@@ -711,7 +716,10 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
   }
 
   lastSyncAt = Date.now();
-  const ok = rejected === 0;
+  // Partial success is OK — only count as failure if ALL records failed.
+  // This prevents a few stuck records from triggering backoff and blocking
+  // new records from syncing at normal interval.
+  const ok = rejected === 0 || accepted > 0;
   lastSyncResult = {
     ok,
     pushed: totalPending,
@@ -733,7 +741,6 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
 
 let syncTimer: ReturnType<typeof setTimeout> | null = null;
 let _sessionInvalidLoggedAt = 0;
-let _reconcileOnStartupDone = false;
 
 async function runSyncCycle(): Promise<void> {
   if (!isSessionValid()) {
@@ -758,22 +765,24 @@ async function runSyncCycle(): Promise<void> {
   let skipBackoff = false;
   const cycleStart = Date.now();
   try {
-    // One-shot cloud reconciliation on startup
-    if (!_reconcileOnStartupDone) {
-      _reconcileOnStartupDone = true;
-      try {
-        await reconcileWithCloud();
-      } catch (err: any) {
-        console.warn("[Sync] Startup reconciliation failed:", err.message || err);
-      }
-    }
+    // Startup reconciliation removed — it fetches ALL cloud records and compares
+    // with ALL local records, blocking SQLite for extended periods on large
+    // existing databases. The periodic reconciliation (every 5 minutes) below
+    // handles this after the Edge is already READY and serving requests.
 
     const result = await pushSyncBatch();
 
-    // Checkpoint WAL to keep the -wal file small and reads fast
-    try {
-      getDb().query("PRAGMA wal_checkpoint(TRUNCATE)").run();
-    } catch { /* non-fatal */ }
+    // WAL checkpoint: use PASSIVE mode (non-blocking) instead of TRUNCATE
+    // (which requires an exclusive lock and freezes all reads). PASSIVE
+    // checkpoints as much as possible without waiting for readers. Only
+    // run every 5 minutes to avoid repeated overhead.
+    const now = Date.now();
+    if (now - lastWalCheckpointAt >= WAL_CHECKPOINT_INTERVAL_MS) {
+      lastWalCheckpointAt = now;
+      try {
+        getDb().query("PRAGMA wal_checkpoint(PASSIVE)").run();
+      } catch { /* non-fatal */ }
+    }
 
     if (result.ok) {
       consecutiveFailures = 0;
@@ -786,7 +795,6 @@ async function runSyncCycle(): Promise<void> {
     }
 
     // Periodically pull config changes from cloud (printer config, menu, etc.)
-    const now = Date.now();
     if (now - lastConfigPullAt >= CONFIG_PULL_INTERVAL_MS) {
       lastConfigPullAt = now;
       try {
