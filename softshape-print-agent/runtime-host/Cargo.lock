@@ -77,7 +77,7 @@ dependencies = [
 
 [[package]]
 name = "softshape-host"
-version = "24.0.8"
+version = "24.0.9"
 dependencies = [
  "serde",
  "serde_json",
