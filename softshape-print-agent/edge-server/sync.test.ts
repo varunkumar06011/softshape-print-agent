@@ -733,6 +733,7 @@ describe('v2 sync migration (sync_queue → revision-based)', () => {
         order_id TEXT,
         restaurant_id TEXT,
         kind TEXT,
+        cloud_synced INTEGER DEFAULT 0,
         sync_version INTEGER DEFAULT 1,
         cloud_synced_version INTEGER DEFAULT 0
       )
@@ -742,6 +743,7 @@ describe('v2 sync migration (sync_queue → revision-based)', () => {
         id TEXT PRIMARY KEY,
         restaurant_id TEXT,
         amount REAL,
+        cloud_synced INTEGER DEFAULT 0,
         sync_version INTEGER DEFAULT 1,
         cloud_synced_version INTEGER DEFAULT 0
       )

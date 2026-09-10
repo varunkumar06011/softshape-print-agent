@@ -31,7 +31,8 @@ import { startSocketSync } from "./socketSync.ts";
 const SYNC_INTERVAL_MS = parseInt(process.env.EDGE_SYNC_INTERVAL_MS || "5000", 10);
 const CONFIG_PULL_INTERVAL_MS = parseInt(process.env.EDGE_CONFIG_PULL_INTERVAL_MS || "60000", 10);
 const BUSINESS_PULL_INTERVAL_MS = parseInt(process.env.EDGE_BUSINESS_PULL_INTERVAL_MS || "30000", 10);
-const RECONCILE_INTERVAL_MS = 5 * 60_000; // every 5 minutes
+const RECONCILE_INTERVAL_MS = 30 * 60_000; // every 30 minutes
+const MAX_CONCURRENT_PUSHES = 10; // cap in-flight cloud requests per cycle
 const WAL_CHECKPOINT_INTERVAL_MS = 5 * 60_000; // every 5 minutes
 const MAX_ORDERS_PER_CYCLE = 50;
 const BACKOFF_BASE_MS = 5_000;
@@ -184,9 +185,16 @@ function buildOrderPayload(orderId: string): { payload: any; snapshotRevision: n
 function markOrderSynced(orderId: string, snapshotRevision: number): boolean {
   const db = getDb();
   const result = db.query(
-    "UPDATE order_record SET cloud_synced_version = ?, sync_attempt_count = 0, last_sync_error = NULL WHERE id = ? AND revision = ?",
+    "UPDATE order_record SET cloud_synced_version = ?, cloud_synced = 1, sync_attempt_count = 0, last_sync_error = NULL WHERE id = ? AND revision = ?",
   ).run(snapshotRevision, orderId, snapshotRevision);
-  return (result.changes || 0) > 0;
+  if ((result.changes || 0) === 0) return false;
+  // The order snapshot carried its kind='settle' transaction_records — they are
+  // in the cloud now too. Mark them synced so getOrderSyncStatus / backup purge
+  // see the true state (revision guard passed → the txns match this snapshot).
+  db.query(
+    "UPDATE transaction_record SET cloud_synced_version = sync_version, cloud_synced = 1, sync_attempt_count = 0, last_sync_error = NULL WHERE order_id = ?",
+  ).run(orderId);
+  return true;
 }
 
 function recordOrderSyncFailure(orderId: string, errorMsg: string): void {
@@ -276,7 +284,7 @@ function collectUnsyncedExpenditures(): PendingExpenditure[] {
 function markExpenditureSynced(id: string, snapshotRevision: number): boolean {
   const db = getDb();
   const result = db.query(
-    "UPDATE expenditure SET cloud_synced_version = ?, sync_attempt_count = 0, last_sync_error = NULL WHERE id = ? AND sync_version = ?",
+    "UPDATE expenditure SET cloud_synced_version = ?, cloud_synced = 1, sync_attempt_count = 0, last_sync_error = NULL WHERE id = ? AND sync_version = ?",
   ).run(snapshotRevision, id, snapshotRevision);
   return (result.changes || 0) > 0;
 }
@@ -377,7 +385,7 @@ function collectUnsyncedWalkins(): PendingWalkin[] {
 function markWalkinSynced(id: string, snapshotRevision: number): boolean {
   const db = getDb();
   const result = db.query(
-    "UPDATE transaction_record SET cloud_synced_version = ?, sync_attempt_count = 0, last_sync_error = NULL WHERE id = ? AND sync_version = ?",
+    "UPDATE transaction_record SET cloud_synced_version = ?, cloud_synced = 1, sync_attempt_count = 0, last_sync_error = NULL WHERE id = ? AND sync_version = ?",
   ).run(snapshotRevision, id, snapshotRevision);
   return (result.changes || 0) > 0;
 }
@@ -397,9 +405,19 @@ async function pushWalkin(walkin: PendingWalkin): Promise<{ ok: boolean; error?:
 
   const payload = getTransactionRecord(walkin.id);
   if (!payload) {
-    // Data missing — mark synced to stop retrying (legacy data loss scenario)
-    markWalkinSynced(walkin.id, walkin.sync_version);
-    return { ok: true };
+    // Row genuinely gone (hard-deleted between collect and push) → nothing to
+    // sync. But if the row exists and only the payload is unreadable, that's
+    // data corruption — record a failure so it stays pending and visible as a
+    // stuck record instead of being silently marked synced.
+    const rowExists = getDb()
+      .query("SELECT 1 FROM transaction_record WHERE id = ?")
+      .get(walkin.id);
+    if (!rowExists) {
+      markWalkinSynced(walkin.id, walkin.sync_version);
+      return { ok: true };
+    }
+    recordWalkinSyncFailure(walkin.id, "Transaction payload missing or corrupt");
+    return { ok: false, error: "Payload corrupt" };
   }
 
   try {
@@ -518,43 +536,50 @@ async function reconcileWithCloud(): Promise<{ ordersReset: number; expenditures
 
   // Compare local synced records against cloud. If local says synced but cloud
   // doesn't have the ID, reset cloud_synced_version = 0 so the worker re-pushes.
+  // All resets run inside ONE transaction — thousands of individual UPDATEs
+  // each fsyncing is what blocked the event loop when this was enabled before.
   let ordersReset = 0;
   let expendituresReset = 0;
   let walkinsReset = 0;
 
-  // Orders: local cloud_synced_version > 0 means "synced". If cloud doesn't have
-  // the ID, reset to 0.
-  const syncedOrders = db.query(
-    "SELECT id FROM order_record WHERE cloud_synced_version > 0 AND is_deleted = 0",
-  ).all() as Array<{ id: string }>;
-  for (const o of syncedOrders) {
-    if (!cloudOrderIds.has(o.id)) {
-      db.query("UPDATE order_record SET cloud_synced_version = 0 WHERE id = ?").run(o.id);
-      ordersReset++;
+  db.transaction(() => {
+    // Orders: local cloud_synced_version > 0 means "synced". If cloud doesn't
+    // have the ID, reset to 0.
+    const syncedOrders = db.query(
+      "SELECT id FROM order_record WHERE cloud_synced_version > 0 AND is_deleted = 0",
+    ).all() as Array<{ id: string }>;
+    const resetOrder = db.query("UPDATE order_record SET cloud_synced_version = 0, cloud_synced = 0 WHERE id = ?");
+    for (const o of syncedOrders) {
+      if (!cloudOrderIds.has(o.id)) {
+        resetOrder.run(o.id);
+        ordersReset++;
+      }
     }
-  }
 
-  // Expenditures
-  const syncedExps = db.query(
-    "SELECT id FROM expenditure WHERE cloud_synced_version > 0",
-  ).all() as Array<{ id: string }>;
-  for (const e of syncedExps) {
-    if (!cloudExpenditureIds.has(e.id)) {
-      db.query("UPDATE expenditure SET cloud_synced_version = 0 WHERE id = ?").run(e.id);
-      expendituresReset++;
+    // Expenditures
+    const syncedExps = db.query(
+      "SELECT id FROM expenditure WHERE cloud_synced_version > 0",
+    ).all() as Array<{ id: string }>;
+    const resetExp = db.query("UPDATE expenditure SET cloud_synced_version = 0, cloud_synced = 0 WHERE id = ?");
+    for (const e of syncedExps) {
+      if (!cloudExpenditureIds.has(e.id)) {
+        resetExp.run(e.id);
+        expendituresReset++;
+      }
     }
-  }
 
-  // Walk-in transactions
-  const syncedWalkins = db.query(
-    "SELECT id FROM transaction_record WHERE kind = 'walkin' AND cloud_synced_version > 0",
-  ).all() as Array<{ id: string }>;
-  for (const w of syncedWalkins) {
-    if (!cloudWalkinIds.has(w.id)) {
-      db.query("UPDATE transaction_record SET cloud_synced_version = 0 WHERE id = ?").run(w.id);
-      walkinsReset++;
+    // Walk-in transactions
+    const syncedWalkins = db.query(
+      "SELECT id FROM transaction_record WHERE kind = 'walkin' AND cloud_synced_version > 0",
+    ).all() as Array<{ id: string }>;
+    const resetWalkin = db.query("UPDATE transaction_record SET cloud_synced_version = 0, cloud_synced = 0 WHERE id = ?");
+    for (const w of syncedWalkins) {
+      if (!cloudWalkinIds.has(w.id)) {
+        resetWalkin.run(w.id);
+        walkinsReset++;
+      }
     }
-  }
+  })();
 
   // Settled-order transactions (kind='settle'): these are part of the order
   // payload, so if the order is missing from cloud, the transaction is too.
@@ -657,6 +682,220 @@ async function ensureCloudSession(): Promise<boolean> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Config push — edge → cloud sync for menu/category/users/etc.
+// ═══════════════════════════════════════════════════════════════════════════════
+// The revision-based sync above only pushes orders/expenditures/walkins.
+// Config changes (menu_item, category, users, etc.) are enqueued via
+// enqueueSync() into sync_queue but were never pushed. This section reads
+// pending config entries, builds the payload from local SQLite, and sends
+// a single batch to /api/edge/sync per cycle.
+//
+// Bounded to MAX_CONFIG_PER_CYCLE to avoid overwhelming the cloud or
+// blocking the sync worker. Config changes are infrequent (cashier menu
+// edits), so this is more than enough throughput.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const MAX_CONFIG_PER_CYCLE = 10;
+
+// Tables whose sync_queue entries should be pushed to the cloud via
+// /api/edge/sync. Business data (orders, transactions, expenditures,
+// walkins) is handled by the revision-based sync above.
+const CONFIG_TABLES = new Set([
+  "menu_item",
+  "menu_item_variant",
+  "category",
+  "venue",
+  "floor",
+  "section",
+  "table",
+  "outlet",
+  "users",
+  "employee",
+  "ledger_category",
+]);
+
+interface PendingConfig {
+  queueId: number;
+  tableName: string;
+  recordId: string;
+  operation: string;
+}
+
+function collectUnsyncedConfig(): PendingConfig[] {
+  const db = getDb();
+  const tableNames = Array.from(CONFIG_TABLES);
+  const placeholders = tableNames.map(() => "?").join(",");
+  return db.query(
+    `SELECT id as queueId, table_name as tableName, record_id as recordId, operation
+     FROM sync_queue
+     WHERE synced = 0 AND table_name IN (${placeholders})
+     ORDER BY created_at ASC
+     LIMIT ?`,
+  ).all(...tableNames, MAX_CONFIG_PER_CYCLE) as PendingConfig[];
+}
+
+// Convert snake_case key to camelCase
+function snakeToCamel(s: string): string {
+  return s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+}
+
+// Convert a SQLite row (snake_case keys) to a camelCase object
+function rowToCamel(row: Record<string, any>): Record<string, any> {
+  const result: Record<string, any> = {};
+  for (const [key, value] of Object.entries(row)) {
+    result[snakeToCamel(key)] = value;
+  }
+  return result;
+}
+
+// Build the data payload for a config item by reading its SQLite row.
+// For menu_item, also includes nested venue_prices, venue_availabilities,
+// and section_availabilities so the cloud can upsert them in one request.
+function buildConfigPayload(tableName: string, recordId: string): any | null {
+  const db = getDb();
+
+  // Quote table name for SQLite reserved words (e.g., "table")
+  const quotedTable = `"${tableName}"`;
+
+  const row = db.query(`SELECT * FROM ${quotedTable} WHERE id = ?`).get(recordId) as any;
+  if (!row) return null; // Row may have been hard-deleted
+
+  const data = rowToCamel(row);
+
+  // For menu_item, include nested venue prices + availabilities so the
+  // cloud's upsertMenuItem can apply them in the same request.
+  if (tableName === "menu_item") {
+    const venuePrices = db.query(
+      "SELECT venue_id, price, is_active FROM venue_price WHERE menu_item_id = ?",
+    ).all(recordId) as any[];
+    if (venuePrices.length > 0) {
+      data.venuePrices = venuePrices.map((vp) => ({
+        venueId: vp.venue_id,
+        price: Number(vp.price),
+        isActive: vp.is_active !== 0,
+      }));
+    }
+
+    const venueAvail = db.query(
+      "SELECT venue_id, is_available FROM venue_menu_item_availability WHERE menu_item_id = ?",
+    ).all(recordId) as any[];
+    if (venueAvail.length > 0) {
+      data.venueAvailabilities = venueAvail.map((va) => ({
+        venueId: va.venue_id,
+        isAvailable: va.is_available !== 0,
+      }));
+    }
+
+    const sectionAvail = db.query(
+      "SELECT section_id, is_available FROM section_menu_item_availability WHERE menu_item_id = ?",
+    ).all(recordId) as any[];
+    if (sectionAvail.length > 0) {
+      data.sectionAvailabilities = sectionAvail.map((sa) => ({
+        sectionId: sa.section_id,
+        isAvailable: sa.is_available !== 0,
+      }));
+    }
+  }
+
+  return data;
+}
+
+function markConfigSynced(queueId: number): void {
+  const db = getDb();
+  db.query("UPDATE sync_queue SET synced = 1 WHERE id = ?").run(queueId);
+}
+
+function markConfigAttempt(queueId: number, error: string): void {
+  const db = getDb();
+  db.query("UPDATE sync_queue SET attempts = attempts + 1, last_error = ? WHERE id = ?").run(error, queueId);
+}
+
+async function pushConfigBatch(): Promise<{ ok: boolean; pushed: number; accepted: number; rejected: number }> {
+  const pending = collectUnsyncedConfig();
+  if (pending.length === 0) {
+    return { ok: true, pushed: 0, accepted: 0, rejected: 0 };
+  }
+
+  const backendUrl = getBackendUrl();
+  const token = getSessionToken();
+  const restaurantId = getRestaurantId();
+
+  if (!backendUrl || !token || !restaurantId) {
+    return { ok: false, pushed: 0, accepted: 0, rejected: 0 };
+  }
+
+  // Build the batch payload, skipping rows that no longer exist
+  const batch: Array<{ queueId: number; tableName: string; recordId: string; operation: string; data: any }> = [];
+  for (const item of pending) {
+    const data = buildConfigPayload(item.tableName, item.recordId);
+    if (data) {
+      batch.push({
+        queueId: item.queueId,
+        tableName: item.tableName,
+        recordId: item.recordId,
+        operation: item.operation,
+        data,
+      });
+    } else {
+      // Row doesn't exist (hard-deleted) — mark as synced to dequeue
+      markConfigSynced(item.queueId);
+    }
+  }
+
+  if (batch.length === 0) {
+    return { ok: true, pushed: 0, accepted: 0, rejected: 0 };
+  }
+
+  try {
+    const res = await cloudFetch(`${backendUrl}/api/edge/sync`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ restaurantId, deviceId: getDeviceId(), batch }),
+      timeout: 15_000,
+    });
+
+    if (!res.ok) {
+      console.warn(`[Sync] Config push failed: HTTP ${res.status}`);
+      return { ok: false, pushed: batch.length, accepted: 0, rejected: batch.length };
+    }
+
+    const result = (await res.json()) as { accepted: number[]; rejected: Array<{ queueId: number; error: string; outcome: string }> };
+    const acceptedSet = new Set(result.accepted);
+
+    for (const item of batch) {
+      if (acceptedSet.has(item.queueId)) {
+        markConfigSynced(item.queueId);
+      } else {
+        const rejectedItem = result.rejected.find((r) => r.queueId === item.queueId);
+        if (rejectedItem && rejectedItem.outcome !== "error" && rejectedItem.outcome !== "waiting_dependency") {
+          // Permanent rejection (duplicate, rejected, conflict) — safe to dequeue
+          markConfigSynced(item.queueId);
+        } else if (rejectedItem && rejectedItem.outcome === "waiting_dependency") {
+          // Parent not yet synced — leave for retry next cycle without penalty
+        } else {
+          // Error — increment attempts for tracking
+          markConfigAttempt(item.queueId, rejectedItem?.error || "Unknown error");
+        }
+      }
+    }
+
+    const acceptedCount = result.accepted.length;
+    const rejectedCount = batch.length - acceptedCount;
+    if (acceptedCount > 0) {
+      console.log(`[Sync] Config push: ${acceptedCount}/${batch.length} accepted`);
+    }
+
+    return { ok: rejectedCount === 0 || acceptedCount > 0, pushed: batch.length, accepted: acceptedCount, rejected: rejectedCount };
+  } catch (err) {
+    console.warn("[Sync] Config push error:", (err as Error)?.message || err);
+    return { ok: false, pushed: batch.length, accepted: 0, rejected: batch.length };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Sync cycle — collect, push concurrently, mark synced
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -672,48 +911,55 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
     return { ok: false, pushed: 0, accepted: 0, rejected: 0, error: "No valid cloud session" };
   }
 
-  // Collect all pending records
+  // Collect all pending business records
   const pendingOrders = collectUnsyncedOrders();
   const pendingExpenditures = collectUnsyncedExpenditures();
   const pendingWalkins = collectUnsyncedWalkins();
 
-  const totalPending = pendingOrders.length + pendingExpenditures.length + pendingWalkins.length;
-  if (totalPending === 0) {
-    lastSyncAt = Date.now();
-    lastSyncResult = { ok: true, pushed: 0, accepted: 0, rejected: 0 };
-    return lastSyncResult;
-  }
+  const totalBusinessPending = pendingOrders.length + pendingExpenditures.length + pendingWalkins.length;
 
-  // Push orders concurrently (each is independent — no dependency ordering)
-  const orderPromises = pendingOrders.map((o) => pushOrder(o));
-  const expPromises = pendingExpenditures.map((e) => pushExpenditure(e));
-  const walkinPromises = pendingWalkins.map((w) => pushWalkin(w));
-
-  const allPromises = [...orderPromises, ...expPromises, ...walkinPromises];
-  const results = await Promise.allSettled(allPromises);
-
-  let accepted = 0;
-  let rejected = 0;
+  // Push business data (orders/expenses/walkins) if any are pending
+  let businessAccepted = 0;
+  let businessRejected = 0;
   let had401 = false;
 
-  for (let i = 0; i < results.length; i++) {
-    const r = results[i];
-    if (r.status === "fulfilled") {
-      if (r.value.ok) {
-        accepted++;
-      } else {
-        rejected++;
-        if (r.value.error === "401") had401 = true;
+  if (totalBusinessPending > 0) {
+    // Push concurrently but bounded — launching up to 150 requests at once
+    // exhausts sockets and starves the local API on the same event loop.
+    const pushFns: Array<() => Promise<{ ok: boolean; error?: string }>> = [
+      ...pendingOrders.map((o) => () => pushOrder(o)),
+      ...pendingExpenditures.map((e) => () => pushExpenditure(e)),
+      ...pendingWalkins.map((w) => () => pushWalkin(w)),
+    ];
+
+    for (let i = 0; i < pushFns.length; i += MAX_CONCURRENT_PUSHES) {
+      const results = await Promise.allSettled(pushFns.slice(i, i + MAX_CONCURRENT_PUSHES).map((fn) => fn()));
+      for (const r of results) {
+        if (r.status === "fulfilled") {
+          if (r.value.ok) {
+            businessAccepted++;
+          } else {
+            businessRejected++;
+            if (r.value.error === "401") had401 = true;
+          }
+        } else {
+          businessRejected++;
+        }
       }
-    } else {
-      rejected++;
     }
   }
+
+  // Push config changes (menu_item, category, users, etc.) — single batch
+  const configResult = await pushConfigBatch();
 
   // If any got 401, attempt session refresh for next cycle
   if (had401) {
     await refreshCloudSession();
   }
+
+  const totalPending = totalBusinessPending + configResult.pushed;
+  const accepted = businessAccepted + configResult.accepted;
+  const rejected = businessRejected + configResult.rejected;
 
   lastSyncAt = Date.now();
   // Partial success is OK — only count as failure if ALL records failed.
@@ -821,22 +1067,25 @@ async function runSyncCycle(): Promise<void> {
       }
     }
 
-    // Reconciliation disabled — reconcileWithCloud() fetches up to 100k cloud
-    // records and iterates every local record, blocking the edge server's
-    // single-threaded event loop for 30+ seconds. This causes /health to hang,
-    // which triggers the frontend's 19s LAN discovery cascade, freezing the UI.
-    // The revision-based sync system (revision > cloud_synced_version) already
-    // guarantees that unsynced records are retried every cycle — reconciliation
-    // is only needed to detect cloud-side data loss, which is rare at this scale.
-    // Re-enable manually via POST /api/edge/sync/reconcile if needed.
-    // if (now - lastReconcileAt >= RECONCILE_INTERVAL_MS) {
-    //   lastReconcileAt = now;
-    //   try {
-    //     await reconcileWithCloud();
-    //   } catch (reconErr) {
-    //     console.warn("[Sync] Reconciliation failed:", (reconErr as Error)?.message || reconErr);
-    //   }
-    // }
+    // Self-healing: records that hit the dead-letter threshold are excluded
+    // from collection. Reset any that have been quiet for 30+ minutes so they
+    // retry automatically — no manual intervention needed.
+    resetStaleStuckRecords(now);
+
+    // Periodic cloud reconciliation — catches records wrongly marked synced
+    // (migrated rows, dead-lettered pushes, cloud-side loss). Paginated and
+    // transaction-batched so it never blocks the event loop for long.
+    if (now - lastReconcileAt >= RECONCILE_INTERVAL_MS) {
+      lastReconcileAt = now;
+      try {
+        const recon = await reconcileWithCloud();
+        if (recon.ordersReset + recon.expendituresReset + recon.walkinsReset > 0) {
+          console.warn(`[Sync] Reconcile requeued ${recon.ordersReset} orders, ${recon.expendituresReset} expenditures, ${recon.walkinsReset} walkins missing in cloud`);
+        }
+      } catch (reconErr) {
+        console.warn("[Sync] Reconciliation failed:", (reconErr as Error)?.message || reconErr);
+      }
+    }
   } catch (err) {
     consecutiveFailures++;
     console.error("[Sync] Worker cycle error:", err);
@@ -847,7 +1096,34 @@ async function runSyncCycle(): Promise<void> {
   scheduleNextCycle(skipBackoff ? SYNC_INTERVAL_MS : getBackoffDelay());
 }
 
+// Reset stuck (dead-lettered) records whose last attempt is older than
+// STUCK_RECORD_AGE_MS — they re-enter the pending pool and retry automatically.
+function resetStaleStuckRecords(now: number): void {
+  const db = getDb();
+  const cutoff = now - STUCK_RECORD_AGE_MS;
+  try {
+    const tx = db.transaction(() => {
+      db.query(
+        "UPDATE order_record SET sync_attempt_count = 0, last_sync_error = NULL WHERE revision > cloud_synced_version AND sync_attempt_count >= ? AND (last_sync_attempt_at IS NULL OR last_sync_attempt_at < ?)",
+      ).run(STUCK_RECORD_THRESHOLD, cutoff);
+      db.query(
+        "UPDATE expenditure SET sync_attempt_count = 0, last_sync_error = NULL WHERE sync_version > cloud_synced_version AND sync_attempt_count >= ? AND (last_sync_attempt_at IS NULL OR last_sync_attempt_at < ?)",
+      ).run(STUCK_RECORD_THRESHOLD, cutoff);
+      db.query(
+        "UPDATE transaction_record SET sync_attempt_count = 0, last_sync_error = NULL WHERE sync_version > cloud_synced_version AND sync_attempt_count >= ? AND (last_sync_attempt_at IS NULL OR last_sync_attempt_at < ?)",
+      ).run(STUCK_RECORD_THRESHOLD, cutoff);
+    });
+    tx();
+  } catch (err) {
+    console.warn("[Sync] Stuck-record auto-reset failed:", (err as Error)?.message || err);
+  }
+}
+
 function scheduleNextCycle(delay: number): void {
+  if (syncTimer) {
+    clearTimeout(syncTimer);
+    syncTimer = null;
+  }
   syncTimer = setTimeout(async () => {
     await runSyncCycle();
   }, delay);
@@ -875,6 +1151,24 @@ export function startSyncWorker(): void {
     if (totalReset > 0) {
       console.log(`[Sync] Startup reset: cleared dead-letter status on ${totalReset} stuck record(s) — they will retry syncing`);
     }
+
+    // Repair legacy flag: records synced by the revision worker never got
+    // cloud_synced = 1 (older v2 builds only set cloud_synced_version). Backup
+    // purge and getOrderSyncStatus still read cloud_synced — backfill it for
+    // records already fully synced.
+    const orderFlagFix = db.query(
+      "UPDATE order_record SET cloud_synced = 1 WHERE cloud_synced = 0 AND cloud_synced_version >= revision",
+    ).run();
+    const txnFlagFix = db.query(
+      "UPDATE transaction_record SET cloud_synced = 1 WHERE cloud_synced = 0 AND cloud_synced_version >= sync_version",
+    ).run();
+    const expFlagFix = db.query(
+      "UPDATE expenditure SET cloud_synced = 1 WHERE cloud_synced = 0 AND cloud_synced_version >= sync_version",
+    ).run();
+    const flagFixed = (orderFlagFix.changes || 0) + (txnFlagFix.changes || 0) + (expFlagFix.changes || 0);
+    if (flagFixed > 0) {
+      console.log(`[Sync] Startup repair: set cloud_synced=1 on ${flagFixed} already-synced record(s)`);
+    }
   } catch (err) {
     console.warn("[Sync] Startup reset failed:", err);
   }
@@ -900,9 +1194,11 @@ export function getSyncStatus(): {
   workerRunning: boolean;
   lastSyncAt: number | null;
   lastSyncResult: typeof lastSyncResult;
+  pendingCount: number;
   pendingOrders: number;
   pendingExpenditures: number;
   pendingWalkins: number;
+  deadLetterCount: number;
   consecutiveFailures: number;
   nextSyncInMs: number;
   stuckRecords: Array<{ type: string; id: string; attempts: number; lastError: string | null; pendingSince: number }>;
@@ -947,9 +1243,11 @@ export function getSyncStatus(): {
     workerRunning: syncTimer !== null,
     lastSyncAt: lastSyncAt || null,
     lastSyncResult,
+    pendingCount: pendingOrders + pendingExpenditures + pendingWalkins,
     pendingOrders,
     pendingExpenditures,
     pendingWalkins,
+    deadLetterCount: stuckRecords.length,
     consecutiveFailures,
     nextSyncInMs: getBackoffDelay(),
     stuckRecords,

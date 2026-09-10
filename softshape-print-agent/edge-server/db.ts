@@ -2906,133 +2906,71 @@ export function getSyncAlerts(): Array<{
 
 
 
+// Threshold must match STUCK_RECORD_THRESHOLD in sync.ts — a record pending
+// with this many failed attempts is excluded from sync collection (dead-letter).
+const STUCK_SYNC_ATTEMPT_LIMIT = 100;
+
 export function getOrderSyncStatus(orderId: string): { synced: boolean; pending: number; deadLettered: number } {
 
   const db = getDb();
 
 
 
-  // ── Order-related sync rows (order, order_item, kot, kot_item) ──────────────
+  // Revision-based sync state (v11+): an order is synced when its revision has
 
-  // NOTE: only the 'order' row actually matches record_id = orderId; order_item,
+  // been confirmed by the cloud (revision <= cloud_synced_version), and every
 
-  // kot, and kot_item rows store their own IDs in record_id, so they won't match
+  // transaction_record bundled with it is synced too. The legacy sync_queue is
 
-  // here. This is a known limitation — the order row is the one that matters for
+  // no longer written for business records — checking it always reported
 
-  // confirming the order itself reached the cloud.
+  // "pending", which stranded the frontend's edgeSynced actions forever.
 
-  const orderRows = db.query(
+  const order = db.query(
 
-    `SELECT synced, attempts FROM sync_queue WHERE table_name IN ('order', 'order_item', 'kot', 'kot_item') AND record_id = ?`,
+    "SELECT revision, cloud_synced_version, sync_attempt_count FROM order_record WHERE id = ?",
 
-  ).all(orderId) as any[];
-
-
-
-  // ── Transaction sync rows linked to this order ──────────────────────────────
-
-  // Transactions are enqueued under their localTxnId (not the orderId), so we
-
-  // look them up via the transaction_record table which has an order_id column.
-
-  // Without this check, the frontend considers the settlement synced as soon as
-
-  // the order row is confirmed — even if the payment/transaction is still
-
-  // pending, failing, or dead-lettered in the sync queue. That causes the
-
-  // frontend to drop its tracking record prematurely, and if the transaction
-
-  // subsequently fails permanently, the payment never reaches the cloud admin
-
-  // panel.
-
-  const txnRows = db.query(
-
-    `SELECT sq.synced, sq.attempts
-
-     FROM sync_queue sq
-
-     JOIN transaction_record tr ON sq.record_id = tr.id
-
-     WHERE sq.table_name IN ('transaction', 'walkin_transaction')
-
-       AND tr.order_id = ?`,
-
-  ).all(orderId) as any[];
+  ).get(orderId) as any;
 
 
 
-  const allRows = [...orderRows, ...txnRows];
+  if (!order) {
 
-
-
-  if (allRows.length === 0) {
-
-    // No sync_queue rows — check if the order exists at all.
-
-    // If it doesn't exist, the order was never created (wrong ID or not yet processed).
-
-    // If it exists with no pending sync entries, it was either already synced and
-
-    // cleaned up, or sync hasn't been queued yet. Check cloud_synced to distinguish.
-
-    const order = db.query("SELECT cloud_synced FROM order_record WHERE id = ?").get(orderId) as any;
-
-    if (!order) {
-
-      return { synced: false, pending: 0, deadLettered: 0 };
-
-    }
-
-    // Order exists — if cloud_synced is 1, the order was confirmed synced.
-
-    // But also verify any transaction_record for this order is synced, otherwise
-
-    // the settlement payment hasn't reached the cloud yet.
-
-    if (order.cloud_synced === 1) {
-
-      const txnSynced = db.query(
-
-        `SELECT 1 FROM transaction_record WHERE order_id = ? AND cloud_synced = 0 LIMIT 1`,
-
-      ).get(orderId) as any;
-
-      if (txnSynced) {
-
-        // Order is synced but a transaction is still pending — don't report synced.
-
-        return { synced: false, pending: 1, deadLettered: 0 };
-
-      }
-
-      return { synced: true, pending: 0, deadLettered: 0 };
-
-    }
-
-    return { synced: false, pending: 1, deadLettered: 0 };
+    return { synced: false, pending: 0, deadLettered: 0 };
 
   }
 
 
 
-  let pending = 0;
+  const orderPending = (order.revision ?? 0) > (order.cloud_synced_version ?? 0);
 
-  let deadLettered = 0;
+  const orderStuck = orderPending && (order.sync_attempt_count ?? 0) >= STUCK_SYNC_ATTEMPT_LIMIT;
 
-  for (const row of allRows) {
 
-    if (row.synced === 1) continue;
 
-    if (row.attempts >= 5) deadLettered++;
+  // Settle transactions ride inside the order payload — the order is only fully
 
-    else pending++;
+  // synced when its transaction_records are synced as well.
 
-  }
+  const txnStats = db.query(
 
-  return { synced: pending === 0 && deadLettered === 0, pending, deadLettered };
+    `SELECT COUNT(*) as pending,
+
+            SUM(CASE WHEN sync_attempt_count >= ? THEN 1 ELSE 0 END) as stuck
+
+     FROM transaction_record
+
+     WHERE order_id = ? AND sync_version > cloud_synced_version`,
+
+  ).get(STUCK_SYNC_ATTEMPT_LIMIT, orderId) as any;
+
+
+
+  const pending = (orderPending ? 1 : 0) + (txnStats?.pending || 0);
+
+  const deadLettered = (orderStuck ? 1 : 0) + (txnStats?.stuck || 0);
+
+  return { synced: pending === 0, pending, deadLettered };
 
 }
 
@@ -3611,16 +3549,23 @@ export function migrateSyncQueueToRevisions(): { migrated: boolean; pendingConve
   //    Important: exclude IDs that have pending (synced=0) rows in sync_queue,
   //    otherwise a pending record with revision === 1 or sync_version === 1 would
   //    incorrectly be marked as already synced (cloud_synced_version === revision).
+  //
+  //    Also exclude IDs with a sync_audit 'rejected'/'conflict' row — v1
+  //    dequeued those on failure, so they look synced but never reached the
+  //    cloud. Leaving them pending lets the new worker retry them.
+  //    Anything else wrongly marked synced here is caught later by the
+  //    periodic reconcileWithCloud() (cloud sync-state comparison).
 
   //    Orders: cloud_synced_version = revision
 
   const syncedOrdersResult = db.query(
 
     `UPDATE order_record
-     SET cloud_synced_version = revision
+     SET cloud_synced_version = revision, cloud_synced = 1
      WHERE cloud_synced_version = 0
        AND revision > 0
-       AND id NOT IN (SELECT record_id FROM sync_queue WHERE table_name = 'order' AND synced = 0)`,
+       AND id NOT IN (SELECT record_id FROM sync_queue WHERE table_name = 'order' AND synced = 0)
+       AND id NOT IN (SELECT record_id FROM sync_audit WHERE table_name = 'order' AND outcome IN ('rejected', 'conflict'))`,
 
   ).run();
 
@@ -3633,10 +3578,11 @@ export function migrateSyncQueueToRevisions(): { migrated: boolean; pendingConve
   const syncedTxnsResult = db.query(
 
     `UPDATE transaction_record
-     SET cloud_synced_version = sync_version
+     SET cloud_synced_version = sync_version, cloud_synced = 1
      WHERE cloud_synced_version = 0
        AND sync_version > 0
-       AND id NOT IN (SELECT record_id FROM sync_queue WHERE table_name IN ('transaction', 'walkin_transaction') AND synced = 0)`,
+       AND id NOT IN (SELECT record_id FROM sync_queue WHERE table_name IN ('transaction', 'walkin_transaction') AND synced = 0)
+       AND id NOT IN (SELECT record_id FROM sync_audit WHERE table_name IN ('transaction', 'walkin_transaction') AND outcome IN ('rejected', 'conflict'))`,
 
   ).run();
 
@@ -3649,10 +3595,11 @@ export function migrateSyncQueueToRevisions(): { migrated: boolean; pendingConve
   const syncedExpsResult = db.query(
 
     `UPDATE expenditure
-     SET cloud_synced_version = sync_version
+     SET cloud_synced_version = sync_version, cloud_synced = 1
      WHERE cloud_synced_version = 0
        AND sync_version > 0
-       AND id NOT IN (SELECT record_id FROM sync_queue WHERE table_name = 'expenditure' AND synced = 0)`,
+       AND id NOT IN (SELECT record_id FROM sync_queue WHERE table_name = 'expenditure' AND synced = 0)
+       AND id NOT IN (SELECT record_id FROM sync_audit WHERE table_name = 'expenditure' AND outcome IN ('rejected', 'conflict'))`,
 
   ).run();
 
