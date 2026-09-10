@@ -127,7 +127,7 @@ export function startSocketSync(): void {
     socket!.emit("edge:register", {
       restaurantId,
       sessionToken: token,
-      edgeVersion: "24.0.9",
+      edgeVersion: "24.0.10",
       capabilities: ["print"],
     });
 
@@ -172,7 +172,7 @@ export function startSocketSync(): void {
     socket!.emit("edge:register", {
       restaurantId,
       sessionToken: freshToken || token,
-      edgeVersion: "24.0.9",
+      edgeVersion: "24.0.10",
       capabilities: ["print"],
     });
 
