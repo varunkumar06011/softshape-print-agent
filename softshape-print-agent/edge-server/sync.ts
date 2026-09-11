@@ -33,6 +33,10 @@ const CONFIG_PULL_INTERVAL_MS = parseInt(process.env.EDGE_CONFIG_PULL_INTERVAL_M
 const BUSINESS_PULL_INTERVAL_MS = parseInt(process.env.EDGE_BUSINESS_PULL_INTERVAL_MS || "30000", 10);
 const RECONCILE_INTERVAL_MS = 30 * 60_000; // every 30 minutes
 const MAX_CONCURRENT_PUSHES = 10; // cap in-flight cloud requests per cycle
+// Config-queue rows that keep erroring past this many attempts are left
+// synced=0 but no longer pushed — they still surface via the sync alerts
+// (dead-letter detector flags attempts >= 5) for manual review.
+const CONFIG_DEAD_LETTER_THRESHOLD = 50;
 const WAL_CHECKPOINT_INTERVAL_MS = 5 * 60_000; // every 5 minutes
 const MAX_ORDERS_PER_CYCLE = 50;
 const BACKOFF_BASE_MS = 5_000;
@@ -76,7 +80,9 @@ function collectUnsyncedOrders(): PendingOrder[] {
      FROM order_record
      WHERE revision > cloud_synced_version AND is_deleted = 0
        AND sync_attempt_count < ?  -- dead-letter: stop retrying stuck records
-     ORDER BY created_at ASC
+     -- Least-recently-attempted first: never-tried records (NULL → 0) go
+     -- before old failures, so a few poison records can't head-block the queue.
+     ORDER BY COALESCE(last_sync_attempt_at, 0) ASC, created_at ASC
      LIMIT ?`,
   ).all(STUCK_RECORD_THRESHOLD, MAX_ORDERS_PER_CYCLE) as PendingOrder[];
 }
@@ -197,11 +203,23 @@ function markOrderSynced(orderId: string, snapshotRevision: number): boolean {
   return true;
 }
 
-function recordOrderSyncFailure(orderId: string, errorMsg: string): void {
+// Error classes that can never self-heal: FK violations, Prisma validation
+// failures, or the backend explicitly flagging permanence. They get a large
+// attempt bump so the record exits the retry set in ~5 cycles instead of
+// head-blocking the queue until the 100-attempt stuck threshold.
+function isPermanentSyncError(msg: string): boolean {
+  return /permanent":\s*true|Foreign key constraint violated|Argument `\w+` is missing|Unknown argument/i.test(msg);
+}
+
+function failureStep(errorMsg: string, permanent = false): number {
+  return (permanent || isPermanentSyncError(errorMsg)) ? 20 : 1;
+}
+
+function recordOrderSyncFailure(orderId: string, errorMsg: string, permanent = false): void {
   const db = getDb();
   db.query(
-    "UPDATE order_record SET sync_attempt_count = sync_attempt_count + 1, last_sync_attempt_at = ?, last_sync_error = ? WHERE id = ?",
-  ).run(Date.now(), errorMsg.slice(0, 500), orderId);
+    "UPDATE order_record SET sync_attempt_count = sync_attempt_count + ?, last_sync_attempt_at = ?, last_sync_error = ? WHERE id = ?",
+  ).run(failureStep(errorMsg, permanent), Date.now(), errorMsg.slice(0, 500), orderId);
 }
 
 async function pushOrder(order: PendingOrder): Promise<{ ok: boolean; duplicate?: boolean; error?: string }> {
@@ -235,7 +253,10 @@ async function pushOrder(order: PendingOrder): Promise<{ ok: boolean; duplicate?
         snapshotRevision: built.snapshotRevision,
         ...built.payload,
       }),
-      connectTimeout: 15_000,
+      // Whole-order payloads are one transaction cloud-side — under load the
+      // server can take >15s before sending headers. 30s matches the reconcile
+      // budget and keeps legitimate slow commits from being read as failures.
+      connectTimeout: 30_000,
       bodyTimeout: 30_000,
     });
 
@@ -245,7 +266,11 @@ async function pushOrder(order: PendingOrder): Promise<{ ok: boolean; duplicate?
     if (!res.ok) {
       const errBody = await res.json().catch(() => ({}));
       const errorMsg = errBody.error || `HTTP ${res.status}`;
-      recordOrderSyncFailure(order.id, errorMsg);
+      // Other 4xx (except retryable 408/429) can't self-heal — the payload or
+      // resource state won't change on retry, so count them permanent-class.
+      const permanent = errBody.permanent === true
+        || (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429);
+      recordOrderSyncFailure(order.id, errorMsg, permanent);
       return { ok: false, error: errorMsg };
     }
 
@@ -276,7 +301,7 @@ function collectUnsyncedExpenditures(): PendingExpenditure[] {
      FROM expenditure
      WHERE sync_version > cloud_synced_version
        AND sync_attempt_count < ?  -- dead-letter: stop retrying stuck records
-     ORDER BY created_at ASC
+     ORDER BY COALESCE(last_sync_attempt_at, 0) ASC, created_at ASC
      LIMIT ?`,
   ).all(STUCK_RECORD_THRESHOLD, MAX_ORDERS_PER_CYCLE) as PendingExpenditure[];
 }
@@ -289,11 +314,11 @@ function markExpenditureSynced(id: string, snapshotRevision: number): boolean {
   return (result.changes || 0) > 0;
 }
 
-function recordExpenditureSyncFailure(id: string, errorMsg: string): void {
+function recordExpenditureSyncFailure(id: string, errorMsg: string, permanent = false): void {
   const db = getDb();
   db.query(
-    "UPDATE expenditure SET sync_attempt_count = sync_attempt_count + 1, last_sync_attempt_at = ?, last_sync_error = ? WHERE id = ?",
-  ).run(Date.now(), errorMsg.slice(0, 500), id);
+    "UPDATE expenditure SET sync_attempt_count = sync_attempt_count + ?, last_sync_attempt_at = ?, last_sync_error = ? WHERE id = ?",
+  ).run(failureStep(errorMsg, permanent), Date.now(), errorMsg.slice(0, 500), id);
 }
 
 async function pushExpenditure(exp: PendingExpenditure): Promise<{ ok: boolean; error?: string }> {
@@ -347,7 +372,9 @@ async function pushExpenditure(exp: PendingExpenditure): Promise<{ ok: boolean; 
     if (!res.ok) {
       const errBody = await res.json().catch(() => ({}));
       const errorMsg = errBody.error || `HTTP ${res.status}`;
-      recordExpenditureSyncFailure(exp.id, errorMsg);
+      const permanent = errBody.permanent === true
+        || (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429);
+      recordExpenditureSyncFailure(exp.id, errorMsg, permanent);
       return { ok: false, error: errorMsg };
     }
 
@@ -377,7 +404,7 @@ function collectUnsyncedWalkins(): PendingWalkin[] {
      FROM transaction_record
      WHERE kind = 'walkin' AND sync_version > cloud_synced_version
        AND sync_attempt_count < ?  -- dead-letter: stop retrying stuck records
-     ORDER BY created_at ASC
+     ORDER BY COALESCE(last_sync_attempt_at, 0) ASC, created_at ASC
      LIMIT ?`,
   ).all(STUCK_RECORD_THRESHOLD, MAX_ORDERS_PER_CYCLE) as PendingWalkin[];
 }
@@ -390,11 +417,11 @@ function markWalkinSynced(id: string, snapshotRevision: number): boolean {
   return (result.changes || 0) > 0;
 }
 
-function recordWalkinSyncFailure(id: string, errorMsg: string): void {
+function recordWalkinSyncFailure(id: string, errorMsg: string, permanent = false): void {
   const db = getDb();
   db.query(
-    "UPDATE transaction_record SET sync_attempt_count = sync_attempt_count + 1, last_sync_attempt_at = ?, last_sync_error = ? WHERE id = ?",
-  ).run(Date.now(), errorMsg.slice(0, 500), id);
+    "UPDATE transaction_record SET sync_attempt_count = sync_attempt_count + ?, last_sync_attempt_at = ?, last_sync_error = ? WHERE id = ?",
+  ).run(failureStep(errorMsg, permanent), Date.now(), errorMsg.slice(0, 500), id);
 }
 
 async function pushWalkin(walkin: PendingWalkin): Promise<{ ok: boolean; error?: string }> {
@@ -441,7 +468,9 @@ async function pushWalkin(walkin: PendingWalkin): Promise<{ ok: boolean; error?:
     if (!res.ok) {
       const errBody = await res.json().catch(() => ({}));
       const errorMsg = errBody.error || `HTTP ${res.status}`;
-      recordWalkinSyncFailure(walkin.id, errorMsg);
+      const permanent = errBody.permanent === true
+        || (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429);
+      recordWalkinSyncFailure(walkin.id, errorMsg, permanent);
       return { ok: false, error: errorMsg };
     }
 
@@ -728,10 +757,10 @@ function collectUnsyncedConfig(): PendingConfig[] {
   return db.query(
     `SELECT id as queueId, table_name as tableName, record_id as recordId, operation
      FROM sync_queue
-     WHERE synced = 0 AND table_name IN (${placeholders})
+     WHERE synced = 0 AND attempts < ? AND table_name IN (${placeholders})
      ORDER BY created_at ASC
      LIMIT ?`,
-  ).all(...tableNames, MAX_CONFIG_PER_CYCLE) as PendingConfig[];
+  ).all(CONFIG_DEAD_LETTER_THRESHOLD, ...tableNames, MAX_CONFIG_PER_CYCLE) as PendingConfig[];
 }
 
 // Convert snake_case key to camelCase

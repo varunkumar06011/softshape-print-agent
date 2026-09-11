@@ -982,7 +982,12 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const tableCount = (db.query("SELECT COUNT(*) as c FROM \"table\" WHERE restaurant_id = ?").get(rid) as any)?.c || 0;
     const menuItemCount = (db.query("SELECT COUNT(*) as c FROM menu_item WHERE is_deleted = 0 AND restaurant_id = ?").get(rid) as any)?.c || 0;
     const orderCount = (db.query("SELECT COUNT(*) as c FROM order_record WHERE is_deleted = 0 AND restaurant_id = ?").get(rid) as any)?.c || 0;
-    const pendingSyncCount = (db.query("SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0").get() as any)?.c || 0;
+    // Only config-table rows are actually pushed — business rows (order, kot,
+    // transaction...) are legacy residue from the pre-revision sync system and
+    // nothing processes them, so they must not inflate the pending count.
+    const pendingSyncCount = (db.query(
+      "SELECT COUNT(*) as c FROM sync_queue WHERE synced = 0 AND table_name IN ('menu_item','menu_item_variant','category','venue','floor','section','table','outlet','users','employee','ledger_category')",
+    ).get() as any)?.c || 0;
 
     return jsonResponse({
       registered: true,
