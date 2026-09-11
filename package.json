@@ -1,6 +1,6 @@
 {
   "name": "softshape-print-agent",
-  "version": "24.0.11",
+  "version": "24.0.13",
   "description": "Windows Print Agent for SoftShape — silent ESC/POS printing via Socket.IO",
   "type": "module",
   "scripts": {
