@@ -71,15 +71,6 @@ import { cloudFetch } from "./cloudFetch.ts";
 import { initLanBroadcast, registerClient, unregisterClient, getLanClientCount, setClientRegistered, lanBroadcast } from "./lanBroadcast.ts";
 import { printToPrinter, resolvePrinterName } from "./printer.ts";
 import { buildXReport, buildExpenditure } from "./escpos.ts";
-import {
-  buildEdgePaymentSummary,
-  buildEdgeSourceFingerprint,
-  legalTransition,
-  initialState,
-  type EdgeTransaction,
-  type EdgeExpenditure,
-  type XReportStatus,
-} from "./edgePaymentSummary.ts";
 import { isPrintServiceReady, getPrintServiceStatus, getPrintServiceExeDiagnostics, sendToPrintService, listPrintersViaService, startPrintService, stopPrintService } from "./printServiceManager.ts";
 import { deviceManager } from "./drivers/manager.ts";
 import { PrinterDriver } from "./drivers/printer/index.ts";
@@ -1871,8 +1862,6 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
 
   // ── GET /api/edge/x-report?date=YYYY-MM-DD ──────────────────────────────────
   // X Report data from local SQLite — aggregates settled orders + expenditures.
-  // Uses the canonical edge PaymentSummary (parity with cloud) and persists
-  // report state (status, version, fingerprint, payout confirmation) locally.
   if (url.pathname === "/api/edge/x-report" && req.method === "GET") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const restaurantId = getRestaurantId();
@@ -1890,123 +1879,66 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       "SELECT id FROM order_record WHERE restaurant_id = ? AND status = 'SETTLED' AND paid_at >= ? AND paid_at <= ?"
     ).all(restaurantId, startTs, endTs) as any[];
 
-    // Build EdgeTransaction[] from settle records
-    const edgeTxns: EdgeTransaction[] = [];
+    let totalSales = 0, cashAmount = 0, cardAmount = 0, upiAmount = 0, otherAmount = 0, tipsAmount = 0;
+
     for (const order of orders) {
       const settleRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
       if (!settleRow?.value) continue;
       try {
         const pd = JSON.parse(settleRow.value);
-        edgeTxns.push({
-          id: pd.localTxnId || `edge-txn-${order.id}`,
-          method: (pd.paymentMethod || "CASH").toUpperCase(),
-          grandTotal: Number(pd.grandTotal || 0),
-          tipAmount: Number(pd.tipAmount || 0),
-          cashAmount: Number(pd.cashAmount || 0),
-          cardAmount: Number(pd.cardAmount || 0),
-          upiAmount: Number(pd.upiAmount || 0),
-          otherAmount: Number(pd.otherAmount || 0),
-          cashTipAmount: Number(pd.cashTipAmount || 0),
-          cardTipAmount: Number(pd.cardTipAmount || 0),
-          upiTipAmount: Number(pd.upiTipAmount || 0),
-          otherTipAmount: Number(pd.otherTipAmount || 0),
-          paidAt: pd.settledAt || null,
-        });
+        const grand = Number(pd.grandTotal || 0);
+        totalSales += grand;
+        tipsAmount += Number(pd.tipAmount || 0);
+        const method = (pd.paymentMethod || "CASH").toUpperCase();
+        if (method === "CASH") cashAmount += Number(pd.cashAmount || grand);
+        else if (method === "CARD") cardAmount += Number(pd.cardAmount || grand);
+        else if (method === "UPI") upiAmount += Number(pd.cashAmount || grand);
+        else if (method === "MIXED") {
+          cashAmount += Number(pd.cashAmount || 0);
+          cardAmount += Number(pd.cardAmount || 0);
+          otherAmount += Math.max(0, grand - Number(pd.cashAmount || 0) - Number(pd.cardAmount || 0));
+        } else otherAmount += grand;
       } catch {}
     }
 
     // Expenditures for the date
-    const expRows = db.query(
+    const expenditures = db.query(
       "SELECT * FROM expenditure WHERE restaurant_id = ? AND date = ? AND voided = 0 ORDER BY created_at DESC"
     ).all(restaurantId, date) as any[];
+    const expenditureAmount = expenditures.reduce((sum, e) => sum + Number(e.amount || 0), 0);
 
-    const edgeExps: EdgeExpenditure[] = expRows.map(e => ({
-      id: e.id,
-      amount: Number(e.amount || 0),
-      status: e.voided ? "VOIDED" : "APPROVED",
-      entryType: e.entry_type || "EXPENSE",
-      paymentMethod: e.payment_method || null,
-    }));
-
-    // Compute canonical PaymentSummary
-    const summary = buildEdgePaymentSummary(edgeTxns, edgeExps);
-
-    // Load persisted report state
-    let reportState: any = null;
-    try {
-      const stateRaw = getConfig(`x_report_state:${date}`);
-      if (stateRaw) reportState = JSON.parse(stateRaw);
-    } catch {}
-
-    const reportStatus: XReportStatus = reportState?.reportStatus || "DRAFT";
-    const reportVersion: number = reportState?.reportVersion || 1;
-    const tipsPaidConfirmedAt = reportState?.tipsPaidConfirmedAt || null;
-    const tipsPaidConfirmedBy = reportState?.tipsPaidConfirmedBy || null;
-    const storedFingerprint = reportState?.sourceFingerprint || null;
-
-    // For DRAFT: always return live computed values.
-    // For PAYOUT_CONFIRMED / FINALIZED: return frozen snapshot if fingerprint
-    // matches, otherwise flag stale-source conflict.
-    let responseSummary = summary;
-    let staleSource = false;
-    if (reportStatus !== "DRAFT" && storedFingerprint) {
-      if (storedFingerprint !== summary.sourceFingerprint) {
-        // Source data changed after confirmation — flag conflict.
-        staleSource = true;
-      } else if (reportState?.snapshot) {
-        responseSummary = reportState.snapshot;
-      }
-    }
-
-    // Merge saved denomination counts
-    let savedDenoms: any = null;
+    // Merge saved overrides (card amount, denominations) from edge_config
+    let savedOverrides: any = null;
     try {
       const savedRaw = getConfig(`x_report:${date}`);
-      if (savedRaw) savedDenoms = JSON.parse(savedRaw);
+      if (savedRaw) savedOverrides = JSON.parse(savedRaw);
     } catch {}
 
     return jsonResponse({
       reportDate: date,
-      totalSales: responseSummary.totalSales,
-      cashAmount: responseSummary.collections.cash,
-      cardAmount: responseSummary.collections.card,
-      upiAmount: responseSummary.collections.upi,
-      otherAmount: responseSummary.collections.other,
-      tipsAmount: responseSummary.totalTips,
-      cashTipsAmount: responseSummary.tipByMethod.cash,
-      cardTipsAmount: responseSummary.tipByMethod.card,
-      upiTipsAmount: responseSummary.tipByMethod.upi,
-      otherTipsAmount: responseSummary.tipByMethod.other,
-      tipsPaidAmount: responseSummary.tipsPaid,
-      cashExpenditures: responseSummary.cashExpenditures,
-      expectedCash: responseSummary.expectedCash,
-      totalAmount: responseSummary.expectedCash,
-      reportStatus,
-      reportVersion,
-      sourceFingerprint: summary.sourceFingerprint,
-      staleSource,
-      tipsPaidConfirmedAt,
-      tipsPaidConfirmedBy,
-      expenditureAmount: responseSummary.totalExpenditures,
-      expenditures: expRows.map(e => ({
+      totalSales: round2(totalSales),
+      cashAmount: round2(cashAmount),
+      cardAmount: savedOverrides?.cardAmount != null ? round2(Number(savedOverrides.cardAmount)) : round2(cardAmount),
+      upiAmount: round2(upiAmount),
+      otherAmount: round2(otherAmount),
+      tipsAmount: round2(tipsAmount),
+      expenditureAmount: round2(expenditureAmount),
+      expenditures: expenditures.map(e => ({
         id: e.id, amount: Number(e.amount), paidToType: e.paid_to_type,
         paidToName: e.paid_to_name, category: e.category, narration: e.narration,
         approver: e.approver, expenditureNo: e.expenditure_no,
       })),
-      invariants: responseSummary.invariants,
-      unallocatedLegacyTips: responseSummary.unallocatedLegacyTips,
-      notes500: savedDenoms?.notes500 ?? 0,
-      notes200: savedDenoms?.notes200 ?? 0,
-      notes100: savedDenoms?.notes100 ?? 0,
-      notes50: savedDenoms?.notes50 ?? 0,
-      notes20: savedDenoms?.notes20 ?? 0,
-      notes10: savedDenoms?.notes10 ?? 0,
+      notes500: savedOverrides?.notes500 ?? 0,
+      notes200: savedOverrides?.notes200 ?? 0,
+      notes100: savedOverrides?.notes100 ?? 0,
+      notes50: savedOverrides?.notes50 ?? 0,
+      notes20: savedOverrides?.notes20 ?? 0,
+      notes10: savedOverrides?.notes10 ?? 0,
     }, 200, { "Cache-Control": "no-store" });
   }
 
-  // ── POST /api/edge/x-report — save denomination counts to local SQLite ──────
-  // Only denomination counts are persisted. Derived totals (sales, payment
-  // breakdown, tips, expected cash) are always recomputed from settle records.
+  // ── POST /api/edge/x-report — save cashier overrides to local SQLite ────────
+  // Persists card amount override + denomination counts so they survive reload.
   if (url.pathname === "/api/edge/x-report" && req.method === "POST") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const restaurantId = getRestaurantId();
@@ -2014,6 +1946,8 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     let body: any; try { body = JSON.parse(await req.text()); } catch { return errorResponse("Invalid JSON", 400); }
 
     const date = body.reportDate || getKolkataDateString();
+    // Only persist cardAmount when explicitly provided as a number — otherwise
+    // the GET endpoint falls back to the live-computed card amount from orders.
     const payload: any = {
       notes500: Math.max(0, Math.floor(Number(body.notes500) || 0)),
       notes200: Math.max(0, Math.floor(Number(body.notes200) || 0)),
@@ -2023,192 +1957,11 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       notes10: Math.max(0, Math.floor(Number(body.notes10) || 0)),
       savedAt: Date.now(),
     };
+    if (typeof body.cardAmount === 'number') {
+      payload.cardAmount = Number(body.cardAmount) || 0;
+    }
     setConfig(`x_report:${date}`, JSON.stringify(payload));
     return jsonResponse({ ok: true, reportDate: date, ...payload }, 200, { "Cache-Control": "no-store" });
-  }
-
-  // ── POST /api/edge/x-report/confirm-payout ──────────────────────────────────
-  // DRAFT → PAYOUT_CONFIRMED. Requires tips > 0. Freezes snapshot + fingerprint.
-  if (url.pathname === "/api/edge/x-report/confirm-payout" && req.method === "POST") {
-    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
-    const restaurantId = getRestaurantId();
-    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
-    let body: any; try { body = JSON.parse(await req.text()); } catch { return errorResponse("Invalid JSON", 400); }
-
-    const date = body.reportDate || getKolkataDateString();
-
-    // Load current state
-    let reportState: any = null;
-    try {
-      const stateRaw = getConfig(`x_report_state:${date}`);
-      if (stateRaw) reportState = JSON.parse(stateRaw);
-    } catch {}
-    const currentStatus: XReportStatus = reportState?.reportStatus || "DRAFT";
-
-    // Recompute live summary to get tips + fingerprint
-    const db = getDb();
-    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
-    const [dy, dm, dd] = date.split("-").map(Number);
-    const startTs = Date.UTC(dy, dm - 1, dd, 0, 0, 0, 0) - IST_OFFSET_MS;
-    const endTs = Date.UTC(dy, dm - 1, dd, 23, 59, 59, 999) - IST_OFFSET_MS;
-    const orders = db.query("SELECT id FROM order_record WHERE restaurant_id = ? AND status = 'SETTLED' AND paid_at >= ? AND paid_at <= ?").all(restaurantId, startTs, endTs) as any[];
-    const edgeTxns: EdgeTransaction[] = [];
-    for (const order of orders) {
-      const settleRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
-      if (!settleRow?.value) continue;
-      try {
-        const pd = JSON.parse(settleRow.value);
-        edgeTxns.push({
-          id: pd.localTxnId || `edge-txn-${order.id}`,
-          method: (pd.paymentMethod || "CASH").toUpperCase(),
-          grandTotal: Number(pd.grandTotal || 0), tipAmount: Number(pd.tipAmount || 0),
-          cashAmount: Number(pd.cashAmount || 0), cardAmount: Number(pd.cardAmount || 0),
-          upiAmount: Number(pd.upiAmount || 0), otherAmount: Number(pd.otherAmount || 0),
-          cashTipAmount: Number(pd.cashTipAmount || 0), cardTipAmount: Number(pd.cardTipAmount || 0),
-          upiTipAmount: Number(pd.upiTipAmount || 0), otherTipAmount: Number(pd.otherTipAmount || 0),
-          paidAt: pd.settledAt || null,
-        });
-      } catch {}
-    }
-    const expRows = db.query("SELECT * FROM expenditure WHERE restaurant_id = ? AND date = ? AND voided = 0").all(restaurantId, date) as any[];
-    const edgeExps: EdgeExpenditure[] = expRows.map(e => ({
-      id: e.id, amount: Number(e.amount || 0), status: e.voided ? "VOIDED" : "APPROVED",
-      entryType: e.entry_type || "EXPENSE", paymentMethod: e.payment_method || null,
-    }));
-    const summary = buildEdgePaymentSummary(edgeTxns, edgeExps);
-
-    if (!legalTransition(currentStatus, "PAYOUT_CONFIRMED", summary.totalTips)) {
-      return errorResponse(
-        summary.totalTips === 0
-          ? "Cannot confirm payout when tips are 0 — use finalize instead"
-          : `Illegal transition from ${currentStatus} to PAYOUT_CONFIRMED`,
-        409,
-      );
-    }
-
-    const newState = {
-      reportStatus: "PAYOUT_CONFIRMED",
-      reportVersion: (reportState?.reportVersion || 1) + 1,
-      sourceFingerprint: summary.sourceFingerprint,
-      tipsPaidConfirmedAt: Date.now(),
-      tipsPaidConfirmedBy: body.cashierName || "Edge Cashier",
-      snapshot: summary,
-    };
-    setConfig(`x_report_state:${date}`, JSON.stringify(newState));
-    return jsonResponse({ ok: true, reportDate: date, ...newState }, 200, { "Cache-Control": "no-store" });
-  }
-
-  // ── POST /api/edge/x-report/finalize ────────────────────────────────────────
-  // PAYOUT_CONFIRMED → FINALIZED (tips > 0) or DRAFT → FINALIZED (tips = 0).
-  // Verifies fingerprint unchanged since payout confirmation.
-  if (url.pathname === "/api/edge/x-report/finalize" && req.method === "POST") {
-    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
-    const restaurantId = getRestaurantId();
-    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
-    let body: any; try { body = JSON.parse(await req.text()); } catch { return errorResponse("Invalid JSON", 400); }
-
-    const date = body.reportDate || getKolkataDateString();
-
-    let reportState: any = null;
-    try {
-      const stateRaw = getConfig(`x_report_state:${date}`);
-      if (stateRaw) reportState = JSON.parse(stateRaw);
-    } catch {}
-    const currentStatus: XReportStatus = reportState?.reportStatus || "DRAFT";
-
-    // Recompute live summary for tips + fingerprint check
-    const db = getDb();
-    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
-    const [dy, dm, dd] = date.split("-").map(Number);
-    const startTs = Date.UTC(dy, dm - 1, dd, 0, 0, 0, 0) - IST_OFFSET_MS;
-    const endTs = Date.UTC(dy, dm - 1, dd, 23, 59, 59, 999) - IST_OFFSET_MS;
-    const orders = db.query("SELECT id FROM order_record WHERE restaurant_id = ? AND status = 'SETTLED' AND paid_at >= ? AND paid_at <= ?").all(restaurantId, startTs, endTs) as any[];
-    const edgeTxns: EdgeTransaction[] = [];
-    for (const order of orders) {
-      const settleRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
-      if (!settleRow?.value) continue;
-      try {
-        const pd = JSON.parse(settleRow.value);
-        edgeTxns.push({
-          id: pd.localTxnId || `edge-txn-${order.id}`,
-          method: (pd.paymentMethod || "CASH").toUpperCase(),
-          grandTotal: Number(pd.grandTotal || 0), tipAmount: Number(pd.tipAmount || 0),
-          cashAmount: Number(pd.cashAmount || 0), cardAmount: Number(pd.cardAmount || 0),
-          upiAmount: Number(pd.upiAmount || 0), otherAmount: Number(pd.otherAmount || 0),
-          cashTipAmount: Number(pd.cashTipAmount || 0), cardTipAmount: Number(pd.cardTipAmount || 0),
-          upiTipAmount: Number(pd.upiTipAmount || 0), otherTipAmount: Number(pd.otherTipAmount || 0),
-          paidAt: pd.settledAt || null,
-        });
-      } catch {}
-    }
-    const expRows = db.query("SELECT * FROM expenditure WHERE restaurant_id = ? AND date = ? AND voided = 0").all(restaurantId, date) as any[];
-    const edgeExps: EdgeExpenditure[] = expRows.map(e => ({
-      id: e.id, amount: Number(e.amount || 0), status: e.voided ? "VOIDED" : "APPROVED",
-      entryType: e.entry_type || "EXPENSE", paymentMethod: e.payment_method || null,
-    }));
-    const summary = buildEdgePaymentSummary(edgeTxns, edgeExps);
-
-    if (!legalTransition(currentStatus, "FINALIZED", summary.totalTips)) {
-      return errorResponse(
-        currentStatus === "FINALIZED"
-          ? "Report is already finalized"
-          : `Illegal transition from ${currentStatus} to FINALIZED`,
-        409,
-      );
-    }
-
-    // Fingerprint check: if was PAYOUT_CONFIRMED, fingerprint must match.
-    if (currentStatus === "PAYOUT_CONFIRMED" && reportState?.sourceFingerprint &&
-        reportState.sourceFingerprint !== summary.sourceFingerprint) {
-      return errorResponse(
-        "Source data changed after payout confirmation. Please reopen and re-confirm.",
-        409,
-      );
-    }
-
-    const newState = {
-      reportStatus: "FINALIZED",
-      reportVersion: (reportState?.reportVersion || 1) + 1,
-      sourceFingerprint: summary.sourceFingerprint,
-      tipsPaidConfirmedAt: reportState?.tipsPaidConfirmedAt || null,
-      tipsPaidConfirmedBy: reportState?.tipsPaidConfirmedBy || null,
-      snapshot: summary,
-    };
-    setConfig(`x_report_state:${date}`, JSON.stringify(newState));
-    return jsonResponse({ ok: true, reportDate: date, ...newState }, 200, { "Cache-Control": "no-store" });
-  }
-
-  // ── POST /api/edge/x-report/reopen ──────────────────────────────────────────
-  // FINALIZED → DRAFT. Clears payout confirmation + snapshot.
-  if (url.pathname === "/api/edge/x-report/reopen" && req.method === "POST") {
-    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
-    const restaurantId = getRestaurantId();
-    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
-    let body: any; try { body = JSON.parse(await req.text()); } catch { return errorResponse("Invalid JSON", 400); }
-
-    const date = body.reportDate || getKolkataDateString();
-
-    let reportState: any = null;
-    try {
-      const stateRaw = getConfig(`x_report_state:${date}`);
-      if (stateRaw) reportState = JSON.parse(stateRaw);
-    } catch {}
-    const currentStatus: XReportStatus = reportState?.reportStatus || "DRAFT";
-
-    if (!legalTransition(currentStatus, "DRAFT", 0)) {
-      return errorResponse(`Only FINALIZED reports can be reopened`, 409);
-    }
-
-    const newState = {
-      reportStatus: "DRAFT",
-      reportVersion: (reportState?.reportVersion || 1) + 1,
-      sourceFingerprint: null,
-      tipsPaidConfirmedAt: null,
-      tipsPaidConfirmedBy: null,
-      snapshot: null,
-    };
-    setConfig(`x_report_state:${date}`, JSON.stringify(newState));
-    return jsonResponse({ ok: true, reportDate: date, ...newState }, 200, { "Cache-Control": "no-store" });
   }
 
   // ── POST /api/edge/x-report/print ───────────────────────────────────────────
@@ -2219,24 +1972,8 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
     let body: any; try { body = JSON.parse(await req.text()); } catch { return errorResponse("Invalid JSON", 400); }
 
-    // Enforce FINALIZED state before printing
-    const date = body.reportDate || getKolkataDateString();
-    let reportState: any = null;
-    try {
-      const stateRaw = getConfig(`x_report_state:${date}`);
-      if (stateRaw) reportState = JSON.parse(stateRaw);
-    } catch {}
-    const currentStatus: XReportStatus = reportState?.reportStatus || "DRAFT";
-    if (currentStatus !== "FINALIZED") {
-      return errorResponse(
-        `Cannot print X-report in ${currentStatus} state — finalize first`,
-        409,
-      );
-    }
-
     const outlet = getOutletSettings();
     const printerName = getBillPrinterName();
-    const tipsPaidAmount = Number(body.tipsPaidAmount || body.tipsAmount || 0);
     const escposData = buildXReport({
       restaurantName: outlet?.name || "",
       reportDate: body.reportDate || getKolkataDateString(),
@@ -2247,13 +1984,8 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       upiAmount: Number(body.upiAmount) || 0,
       otherAmount: Number(body.otherAmount) || 0,
       tipsAmount: Number(body.tipsAmount) || 0,
-      cashTipsAmount: Number(body.cashTipsAmount) || 0,
-      cardTipsAmount: Number(body.cardTipsAmount) || 0,
-      upiTipsAmount: Number(body.upiTipsAmount) || 0,
-      otherTipsAmount: Number(body.otherTipsAmount) || 0,
-      tipsPaidAmount,
       expenditureAmount: Number(body.expenditureAmount) || 0,
-      finalAmount: Number(body.finalAmount || body.expectedCash || 0),
+      finalAmount: round2((Number(body.totalSales) || 0) - (Number(body.cardAmount) || 0) - (Number(body.expenditureAmount) || 0)),
       expenditures: body.expenditures || [],
       denominations: body.denominations || [],
       cashFromNotes: Number(body.cashFromNotes) || 0,
