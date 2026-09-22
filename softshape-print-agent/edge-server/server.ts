@@ -610,7 +610,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       const healthResp = {
         status: rmHealth.status,
         service: "softshape-edge-server",
-        version: "24.0.13",
+        version: "24.0.14",
         uptime: process.uptime(),
         runtimeState: rmHealth.runtimeState,
         configSyncState: rmHealth.configSyncState,
@@ -671,7 +671,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const healthResp = {
       status: "ok",
       service: "softshape-edge-server",
-      version: "24.0.13",
+      version: "24.0.14",
       sessionValid: isSessionValid(),
       restaurantId: session?.restaurantId || null,
       restaurantName: session?.restaurantName || null,
@@ -3096,7 +3096,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   // returns the download URL if an update exists. The Host handles the
   // download, binary swap, and restart.
   if (url.pathname === "/api/edge/update-check" && req.method === "GET") {
-    const currentVersion = "24.0.13";
+    const currentVersion = "24.0.14";
     const backendUrl = getBackendUrl();
     const sessionToken = getSessionToken();
 
