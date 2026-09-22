@@ -1679,7 +1679,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     } catch { /* ignore */ }
 
     // Aggregate items
-    const itemMap = new Map<string, { name: string; quantity: number; revenue: number; type: string; orderCount: number }>();
+    const itemMap = new Map<string, { name: string; quantity: number; revenue: number; netRevenue: number; type: string; orderCount: number }>();
 
     // Process settled orders
     for (const order of settledOrders) {
@@ -1697,7 +1697,8 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         const key = name.toLowerCase().replace(/\s+/g, " ").trim();
         const quantity = Number(item.quantity || 0);
         const price = Number(item.price || 0);
-        const revenue = Math.round(price * quantity * discountFactor * 100) / 100;
+        const revenue = Math.round(price * quantity * 100) / 100;
+        const netRevenue = Math.round(revenue * discountFactor * 100) / 100;
         const meta = item.menu_item_id ? menuItemMeta.get(item.menu_item_id) : null;
         const reportCat = getReportCategory(item.menu_type, name, meta?.reportCategory ?? null, meta?.categoryName ?? null, meta?.categoryReportCategory ?? null);
         const type = reportCat.toLowerCase();
@@ -1706,9 +1707,10 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
           const existing = itemMap.get(key)!;
           existing.quantity += quantity;
           existing.revenue += revenue;
+          existing.netRevenue += netRevenue;
           existing.orderCount += 1;
         } else {
-          itemMap.set(key, { name, quantity, revenue, type, orderCount: 1 });
+          itemMap.set(key, { name, quantity, revenue, netRevenue, type, orderCount: 1 });
         }
       }
     }
@@ -1724,7 +1726,8 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         const key = name.toLowerCase().replace(/\s+/g, " ").trim();
         const quantity = Number(item.quantity || item.q || 0);
         const price = Number(item.price || item.p || 0);
-        const revenue = Math.round(price * quantity * discountFactor * 100) / 100;
+        const revenue = Math.round(price * quantity * 100) / 100;
+        const netRevenue = Math.round(revenue * discountFactor * 100) / 100;
         const mid = item.menuItemId || item.id || null;
         const meta = mid ? menuItemMeta.get(mid) : null;
         const reportCat = getReportCategory(item.menuType, name, meta?.reportCategory ?? null, meta?.categoryName ?? null, meta?.categoryReportCategory ?? null);
@@ -1734,9 +1737,10 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
           const existing = itemMap.get(key)!;
           existing.quantity += quantity;
           existing.revenue += revenue;
+          existing.netRevenue += netRevenue;
           existing.orderCount += 1;
         } else {
-          itemMap.set(key, { name, quantity, revenue, type, orderCount: 1 });
+          itemMap.set(key, { name, quantity, revenue, netRevenue, type, orderCount: 1 });
         }
       }
     }
@@ -1746,6 +1750,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         name: data.name,
         quantity: data.quantity,
         revenue: Math.round(data.revenue * 100) / 100,
+        netRevenue: Math.round(data.netRevenue * 100) / 100,
         type: data.type,
         orderCount: data.orderCount,
       }))
@@ -1753,6 +1758,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
 
     const totalQuantity = itemsData.reduce((sum, item) => sum + item.quantity, 0);
     const totalRevenue = itemsData.reduce((sum, item) => sum + item.revenue, 0);
+    const totalNetRevenue = itemsData.reduce((sum, item) => sum + item.netRevenue, 0);
 
     return jsonResponse({
       items: itemsData,
@@ -1760,6 +1766,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
         totalItems: itemsData.length,
         totalQuantity,
         totalRevenue: Math.round(totalRevenue * 100) / 100,
+        totalNetRevenue: Math.round(totalNetRevenue * 100) / 100,
       },
       dateRange: { startDate, endDate },
     }, 200, { "Cache-Control": "no-store" });

@@ -3606,7 +3606,7 @@ export async function reprintKot(input: ReprintKotInput): Promise<{ success: boo
 
 
 
-  // Get all KOT items for this order
+  // Get all KOTs for this order
 
   const kots = db.query("SELECT * FROM kot WHERE order_id = ? ORDER BY kot_number").all(orderId) as any[];
 
@@ -3616,11 +3616,26 @@ export async function reprintKot(input: ReprintKotInput): Promise<{ success: boo
 
   }
 
+  // Determine which KOT to reprint: specific KOT (by kotNumber) or the last
+  // KOT (the one that most likely failed to print). Only the items from this
+  // KOT are reprinted — NOT all order items — so previously-printed KOTs are
+  // not duplicated in the kitchen.
+  let targetKot: any;
+  if (input.kotNumber != null) {
+    targetKot = kots.find((k: any) => k.kot_number === input.kotNumber);
+    if (!targetKot) {
+      return { success: false, error: `KOT #${input.kotNumber} not found for this order` };
+    }
+  } else {
+    targetKot = kots[kots.length - 1];
+  }
 
-
-  // Get all order items
-
-  const orderItems = db.query("SELECT * FROM order_item WHERE order_id = ? AND removed_from_bill = 0 AND quantity > 0").all(orderId) as any[];
+  // Get only the items from the target KOT, joining with order_item for
+  // menu_type (kot_item doesn't store it). Filter out items whose order_item
+  // was removed from the bill after the KOT was sent.
+  const kotItems = db.query(
+    "SELECT ki.*, oi.menu_type FROM kot_item ki JOIN order_item oi ON ki.order_item_id = oi.id WHERE ki.kot_id = ? AND oi.removed_from_bill = 0"
+  ).all(targetKot.id) as any[];
 
 
 
@@ -3636,11 +3651,11 @@ export async function reprintKot(input: ReprintKotInput): Promise<{ success: boo
 
 
 
-  // Build print items from order items
+  // Build print items from the target KOT's items only
 
-  const printItems = orderItems.map((oi) => {
+  const printItems = kotItems.map((ki) => {
 
-    const menuItem = db.query("SELECT * FROM menu_item WHERE id = ?").get(oi.menu_item_id) as any;
+    const menuItem = db.query("SELECT * FROM menu_item WHERE id = ?").get(ki.menu_item_id) as any;
 
     const category = menuItem ? db.query("SELECT * FROM category WHERE id = ?").get(menuItem.category_id) as any : null;
 
@@ -3658,17 +3673,17 @@ export async function reprintKot(input: ReprintKotInput): Promise<{ success: boo
 
     return {
 
-      name: oi.name,
+      name: ki.name,
 
-      quantity: oi.quantity,
+      quantity: ki.quantity,
 
-      price: Number(oi.price),
+      price: Number(ki.price),
 
-      notes: oi.notes,
+      notes: ki.notes,
 
-      menuType: oi.menu_type,
+      menuType: ki.menu_type,
 
-      menuItemId: oi.menu_item_id,
+      menuItemId: ki.menu_item_id,
 
       isCombo: !!menuItem?.is_combo,
 
@@ -3720,7 +3735,7 @@ export async function reprintKot(input: ReprintKotInput): Promise<{ success: boo
 
     restaurantName,
 
-    kotId: String(kots[kots.length - 1].kot_number),
+    kotId: String(targetKot.kot_number),
 
     sectionName,
 
