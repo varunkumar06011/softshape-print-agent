@@ -106,7 +106,7 @@ function createTestDb(): Database {
 
     CREATE TABLE IF NOT EXISTS transaction_record (
       id TEXT PRIMARY KEY, order_id TEXT, restaurant_id TEXT,
-      kind TEXT, payload TEXT, created_at INTEGER,
+      kind TEXT, payload TEXT, created_at INTEGER, cloud_synced INTEGER DEFAULT 0,
       sync_version INTEGER DEFAULT 1, cloud_synced_version INTEGER DEFAULT 0,
       sync_attempt_count INTEGER DEFAULT 0, last_sync_attempt_at INTEGER,
       last_sync_error TEXT

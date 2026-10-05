@@ -24,6 +24,7 @@
 
 
 
+import { getBillPrefix, resolveWalkinVenue } from "./deviceScope.ts";
 import { getDb, getNextKotNumber, enqueueSync, markUnsynced, getKolkataDateString, createPrintJob, updatePrintJobStatus, getPendingPrintJobs, claimPrintJob, reclaimStalePrintingJobs, getPrintJobByEventId, cancelPrintJob, lookupCommand, recordCommand, nextTableRevision, nextOrderRevision, upsertTransactionRecord } from "./db.ts";
 
 import { buildFoodKOT, buildLiquorKOT, buildCancelKOT, buildFinalBill, type PrintItem, type OrderData, type BillData } from "./escpos.ts";
@@ -3933,7 +3934,9 @@ function getNextBillNumber(restaurantId: string): string {
 
 
 
-  return String(row.bill_count);
+  // Multi-PC restaurants set a per-PC prefix ("D-", "C-") so two billing PCs
+  // never issue the same bill number. Empty prefix = legacy numbering.
+  return getBillPrefix() + String(row.bill_count);
 
 }
 
@@ -5023,11 +5026,15 @@ export async function printWalkinBillEdge(input: PrintWalkinBillInput): Promise<
 
 
 
-  // Resolve bill printer — same pattern as printBillEdge
+  // Resolve bill printer — same order as printBillEdge: the venue's own bill
+  // printer first (so a curry-point bill goes to the curry-point printer), then
+  // the restaurant-wide mapping. No venue resolved = legacy behaviour.
 
   const printerConfig = outlet.printerConfig || {};
 
-  const billPrinterName = resolvePrinterName(null, "BILL_PRINTER", null, printerConfig);
+  const walkinVenue = resolveWalkinVenue(restaurantId, input.sectionTag);
+
+  const billPrinterName = walkinVenue?.bill_printer_name || resolvePrinterName(null, "BILL_PRINTER", null, printerConfig);
 
 
 

@@ -17,6 +17,7 @@
 
 import { getDb } from "./db.ts";
 import { getRestaurantId } from "./auth.ts";
+import { getBoundVenueId } from "./deviceScope.ts";
 import { runtimeLog } from "./contract/logger.ts";
 
 const ACTIVE_ORDER_STATUSES = ["PENDING", "CONFIRMED", "PREPARING", "READY", "BILLING_REQUESTED"];
@@ -173,6 +174,9 @@ export function getTablesForRestaurant(): any[] {
 
   const db = getDb();
 
+  // A PC bound to one venue only exposes that venue's sections (multi-PC restaurants).
+  const boundVenueId = getBoundVenueId();
+
   // Get sections
   const sections = db.query(`
     SELECT s.*, v.name as venue_name, v.venue_type, v.kot_enabled,
@@ -180,9 +184,9 @@ export function getTablesForRestaurant(): any[] {
     FROM section s
     LEFT JOIN venue v ON s.venue_id = v.id
     LEFT JOIN floor f ON s.floor_id = f.id
-    WHERE s.restaurant_id = ?
+    WHERE s.restaurant_id = ?${boundVenueId ? " AND s.venue_id = ?" : ""}
     ORDER BY s.sort_order ASC, s.name ASC
-  `).all(restaurantId) as any[];
+  `).all(...(boundVenueId ? [restaurantId, boundVenueId] : [restaurantId])) as any[];
 
   return sections.map((section) => {
     // Get tables for this section
@@ -248,6 +252,7 @@ export function getTablesFlat(): any[] {
   if (!restaurantId) return [];
 
   const db = getDb();
+  const boundVenueId = getBoundVenueId();
 
   const tables = db.query(`
     SELECT t.*, s.name as section_name, s.venue_id,
@@ -255,9 +260,9 @@ export function getTablesFlat(): any[] {
     FROM "table" t
     LEFT JOIN section s ON t.section_id = s.id
     LEFT JOIN venue v ON s.venue_id = v.id
-    WHERE t.restaurant_id = ?
+    WHERE t.restaurant_id = ?${boundVenueId ? " AND s.venue_id = ?" : ""}
     ORDER BY s.name ASC, t.number ASC
-  `).all(restaurantId) as any[];
+  `).all(...(boundVenueId ? [restaurantId, boundVenueId] : [restaurantId])) as any[];
 
   return tables.map((t) => {
     const mapped = mapTableRow(t);
@@ -402,7 +407,8 @@ export function getSections(): any[] {
   const restaurantId = getRestaurantId();
   if (!restaurantId) return [];
 
-  const cacheKey = `sections:${restaurantId}`;
+  const boundVenueId = getBoundVenueId();
+  const cacheKey = `sections:${restaurantId}:${boundVenueId || "all"}`;
   const cached = getCached<any[]>(cacheKey);
   if (cached) return cached;
 
@@ -414,9 +420,9 @@ export function getSections(): any[] {
     FROM section s
     LEFT JOIN venue v ON s.venue_id = v.id
     LEFT JOIN floor f ON s.floor_id = f.id
-    WHERE s.restaurant_id = ?
+    WHERE s.restaurant_id = ?${boundVenueId ? " AND s.venue_id = ?" : ""}
     ORDER BY s.sort_order ASC, s.name ASC
-  `).all(restaurantId) as any[];
+  `).all(...(boundVenueId ? [restaurantId, boundVenueId] : [restaurantId])) as any[];
 
   const result = sections.map((s) => {
     const tables = db.query(`
@@ -749,7 +755,8 @@ export function getVenues(): any[] {
   const restaurantId = getRestaurantId();
   if (!restaurantId) return [];
 
-  const cacheKey = `venues:${restaurantId}`;
+  const boundVenueId = getBoundVenueId();
+  const cacheKey = `venues:${restaurantId}:${boundVenueId || "all"}`;
   const cached = getCached<any[]>(cacheKey);
   if (cached) return cached;
 
@@ -757,9 +764,9 @@ export function getVenues(): any[] {
 
   const venues = db.query(`
     SELECT * FROM venue
-    WHERE restaurant_id = ? AND is_deleted = 0
+    WHERE restaurant_id = ? AND is_deleted = 0${boundVenueId ? " AND id = ?" : ""}
     ORDER BY sort_order ASC, name ASC
-  `).all(restaurantId) as any[];
+  `).all(...(boundVenueId ? [restaurantId, boundVenueId] : [restaurantId])) as any[];
 
   const result = venues.map((v) => {
     const floors = db.query(`

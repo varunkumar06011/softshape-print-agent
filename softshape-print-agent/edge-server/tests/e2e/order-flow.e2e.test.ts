@@ -281,14 +281,10 @@ test("E2E: POST /api/edge/order creates order + KOT + print job", async () => {
   expect(table.revision).toBeGreaterThan(1);
   expect(table.last_command_id).toBe(requestId);
 
-  // Sync queue entries (order, kot, table)
-  const syncEntries = db.query("SELECT * FROM sync_queue WHERE synced = 0").all() as any[];
-  const tableSync = syncEntries.filter((e) => e.record_id === TABLE_ID);
-  const orderSync = syncEntries.filter((e) => e.record_id === body.orderId);
-  const kotSync = syncEntries.filter((e) => e.record_id === kot.id);
-  expect(orderSync.length).toBeGreaterThanOrEqual(1);
-  expect(kotSync.length).toBeGreaterThanOrEqual(1);
-  expect(tableSync.length).toBeGreaterThanOrEqual(1);
+  // Cloud sync is revision-based (no sync_queue rows for orders/KOTs): the
+  // order is pending until cloud_synced_version catches up with its revision,
+  // and the KOT travels inside the order's complete payload.
+  expect(order.revision).toBeGreaterThan(order.cloud_synced_version);
 
   // Command log (idempotency)
   const cmdLog = db.query("SELECT * FROM command_log WHERE request_id = ?").get(requestId) as any;

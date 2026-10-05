@@ -63,7 +63,8 @@ import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, g
 import { pullIncrementalChanges } from "./config.ts";
 import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, printWalkinBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
 import { createMenuItemEdge, updateMenuItemEdge, deleteMenuItemEdge, toggleAvailabilityEdge, toggleVenueAvailabilityEdge, toggleSectionAvailabilityEdge, toggleMenuTypeEdge } from "./menuService.ts";
-import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders } from "./reads.ts";
+import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders, invalidateReadCache } from "./reads.ts";
+import { getDeviceScope, updateDeviceScope, listAllVenues, getBoundVenueId, isCaptainHub, type DeviceScopeUpdate } from "./deviceScope.ts";
 import { getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
 import { getSocketStatus } from "./socketSync.ts";
 import { forceReleaseLock, getLockStatus } from "./instanceLock.ts";
@@ -686,6 +687,9 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       recoveryMessage: recovery.message || null,
       lanIp,
       edgePort: PORT,
+      // Multi-PC restaurants: captain LAN discovery skips PCs with captainHub=false
+      captainHub: isCaptainHub(),
+      boundVenueId: getBoundVenueId(),
       maintenanceError: rmHealth.startupError,
       sync: syncMetrics ? {
         workerRunning: syncMetrics.workerRunning,
@@ -2659,6 +2663,33 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
     const data = getVenues();
     return jsonResponse(data);
+  }
+
+  // ── GET/POST /api/edge/device-scope — per-PC venue binding, bill prefix, captain hub ──
+  // Local to this PC only (never synced). Used when one restaurant runs several
+  // billing PCs. Body: { boundVenueId?: string|null, billPrefix?: string|null, captainHub?: boolean }
+  if (url.pathname === "/api/edge/device-scope" && (req.method === "GET" || req.method === "POST")) {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("Restaurant is not linked locally", 401);
+    if (req.method === "GET") return jsonResponse({ ...getDeviceScope(), availableVenues: listAllVenues(restaurantId) });
+    const body = await req.json().catch(() => ({}));
+    const update: DeviceScopeUpdate = {};
+    if ("boundVenueId" in body) update.boundVenueId = body.boundVenueId == null ? null : String(body.boundVenueId);
+    if ("billPrefix" in body) update.billPrefix = body.billPrefix == null ? null : String(body.billPrefix);
+    if ("captainHub" in body) update.captainHub = body.captainHub === true;
+    const result = updateDeviceScope(restaurantId, update);
+    if (!result.ok) return errorResponse(result.error, 400);
+    // Venue binding changes what sections/tables/venues reads return, and
+    // /health reports captainHub + boundVenueId — drop its 5s snapshot so
+    // captain discovery sees the new values immediately.
+    invalidateReadCache();
+    _healthCache = null;
+    _healthRateLimit.clear();
+    try {
+      emitEvent({ event: EVENT_NAMES.CONFIG_CHANGED, data: { tables: ["section", "table", "venue"], source: "poll" } });
+    } catch { /* clients will pick the change up on their next refresh */ }
+    return jsonResponse({ ...result.scope, availableVenues: listAllVenues(restaurantId) });
   }
 
   // ── GET /api/edge/outlet — outlet settings ─────────────────────────────────
