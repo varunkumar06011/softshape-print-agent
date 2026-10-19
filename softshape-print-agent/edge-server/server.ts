@@ -58,7 +58,6 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enqueueSync, markUnsynced, getRecoveryStatus, updatePrintJobStatus, getPendingPrintJobs, getOrderSyncStatus, getPrintJobByEventId, cancelPrintJob, reprintPrintJob, getPrintJobsByOrder, insertSyncAudit, getSyncAuditRecords, createPrintJob, claimPrintJob, getKolkataDateString, getSyncMetrics, getSyncAlerts } from "./db.ts";
-import os from "os";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getSessionToken, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { pullIncrementalChanges } from "./config.ts";
 import { createOrder, updateOrderItems, cancelKotItem, cancelKotItems, reprintKot, requestBillingEdge, printBillEdge, printWalkinBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
@@ -86,6 +85,7 @@ import { EVENT_NAMES } from "./contract/events.ts";
 import { runtimeLog } from "./contract/logger.ts";
 import { hashSync, compareSync } from "bcryptjs";
 import { runtimeManager } from "./runtimeManager.ts";
+import { getLanIpv4, getLanIpv4Addresses } from "./lanAddress.ts";
 
 const PORT = parseInt(process.env.EDGE_PORT || "3101", 10);
 
@@ -625,18 +625,11 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const session = loadSession();
     const recovery = getRecoveryStatus();
     // Include LAN IP so captain devices can verify they found the right edge server
-    let lanIp = null;
+    let lanIp: string | null = null;
+    let lanIps: string[] = [];
     try {
-      const nets = os.networkInterfaces();
-      for (const iface of Object.values(nets)) {
-        for (const addr of iface || []) {
-          if (addr.family === "IPv4" && !addr.internal) {
-            lanIp = addr.address;
-            break;
-          }
-        }
-        if (lanIp) break;
-      }
+      lanIps = getLanIpv4Addresses();
+      lanIp = lanIps[0] ?? null;
     } catch (e) { console.warn('[health] network interface enumeration failed:', (e as Error).message); }
 
     // Operational metrics for monitoring
@@ -686,6 +679,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       databaseRecovered: recovery.recovered,
       recoveryMessage: recovery.message || null,
       lanIp,
+      lanIps,
       edgePort: PORT,
       // Multi-PC restaurants: captain LAN discovery skips PCs with captainHub=false
       captainHub: isCaptainHub(),
@@ -1019,16 +1013,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     // backend's /api/print/agent-endpoint response instead of a 15s LAN scan.
     let lanIp: string | null = null;
     try {
-      const nets = os.networkInterfaces();
-      for (const iface of Object.values(nets)) {
-        for (const addr of iface || []) {
-          if (addr.family === "IPv4" && !addr.internal) {
-            lanIp = addr.address;
-            break;
-          }
-        }
-        if (lanIp) break;
-      }
+      lanIp = getLanIpv4();
     } catch (e) { console.warn('[register] network interface enumeration failed:', (e as Error).message); }
 
     // Call cloud backend to register the agent
@@ -1195,6 +1180,9 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       expectedRevision: body.expectedRevision,
       isExtraTable: body.isExtraTable,
       tableNumber: body.tableNumber,
+      firstAttemptAt: body.firstAttemptAt ?? null,
+      sentAt: body.sentAt ?? null,
+      allowDuplicate: body.allowDuplicate === true,
     });
 
     if (!result.success) {
@@ -1237,6 +1225,9 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       expectedRevision: body.expectedRevision,
       isExtraTable: body.isExtraTable,
       tableNumber: body.tableNumber,
+      firstAttemptAt: body.firstAttemptAt ?? null,
+      sentAt: body.sentAt ?? null,
+      allowDuplicate: body.allowDuplicate === true,
     });
 
     if (!result.success) {

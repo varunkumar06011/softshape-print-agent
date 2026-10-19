@@ -1387,7 +1387,7 @@ function resolveItemPrice(
 
 
 
-export interface CreateOrderInput {
+export interface CreateOrderInput extends RetryGuardInput {
 
   tableId: string;
 
@@ -1442,6 +1442,10 @@ export interface CreateOrderInput {
 export interface CreateOrderResult {
 
   success: boolean;
+
+  code?: string;
+
+  conflicts?: DuplicateConflict[];
 
   orderId?: string;
 
@@ -1739,6 +1743,104 @@ function buildKotHistoryEntry(kotNumber: number, items: any[]): any {
 
 
 
+// ─── Retry duplicate guard ───────────────────────────────────────────────────
+// A captain KOT that failed on weak WiFi is retried with the same requestId
+// plus the time it was first tried. Meanwhile the captain may have walked to
+// the cashier, who punched the same food. Before a retry writes anything, look
+// for KOT items on that table with the same menu items added since the first
+// attempt. If there are any, the retry is rejected (nothing written, nothing
+// printed) and the captain decides: discard, or send anyway.
+
+export interface RetryGuardInput {
+  firstAttemptAt?: number | null; // phone clock (ms) when this KOT was first sent
+  sentAt?: number | null; // phone clock (ms) when this retry was sent — corrects clock skew
+  allowDuplicate?: boolean; // captain chose "Send anyway"
+}
+
+export interface DuplicateConflict {
+  menuItemId: string;
+  name: string;
+  quantity: number;
+  addedBy: string;
+  at: number;
+  kotNumber: number;
+}
+
+const RETRY_GUARD_SLACK_MS = 2000;
+
+/** The applied result of this KOT if it already went through as a create or an update. */
+function findAppliedKot(restaurantId: string, requestId: string | undefined): any | null {
+  if (!requestId) return null;
+  for (const type of ["createOrder", "updateOrderItems"]) {
+    const entry = lookupCommand(restaurantId, requestId, type);
+    if (entry?.status === "applied" && entry.response_json) {
+      try { return JSON.parse(entry.response_json); } catch { /* ignore */ }
+    }
+  }
+  return null;
+}
+
+export function findRetryConflicts(
+  restaurantId: string,
+  tableId: string,
+  items: Array<{ menuItemId: string }>,
+  guard: RetryGuardInput,
+): DuplicateConflict[] {
+  if (!guard.firstAttemptAt || guard.allowDuplicate || !tableId) return [];
+  const skew = guard.sentAt ? Date.now() - Number(guard.sentAt) : 0;
+  const since = Number(guard.firstAttemptAt) + skew - RETRY_GUARD_SLACK_MS;
+  const menuItemIds = new Set(items.map((i) => String(i.menuItemId)));
+  const rows = getDb().query(
+    `SELECT ki.menu_item_id, ki.name, ki.quantity, k.created_at, k.kot_number, k.captain_id, u.name AS by_name
+     FROM kot k
+     JOIN kot_item ki ON ki.kot_id = k.id
+     LEFT JOIN users u ON u.id = k.captain_id
+     WHERE k.restaurant_id = ? AND k.table_id = ? AND k.created_at >= ?
+       AND (ki.status IS NULL OR ki.status != 'CANCELLED')
+     ORDER BY k.created_at`,
+  ).all(restaurantId, tableId, since) as any[];
+  return rows
+    .filter((r) => menuItemIds.has(String(r.menu_item_id)))
+    .map((r) => ({
+      menuItemId: String(r.menu_item_id),
+      name: r.name,
+      quantity: Number(r.quantity) || 0,
+      addedBy: r.by_name || (r.captain_id ? "Another captain" : "Cashier"),
+      at: Number(r.created_at),
+      kotNumber: Number(r.kot_number),
+    }));
+}
+
+function duplicateRetryResult(conflicts: DuplicateConflict[]) {
+  return {
+    success: false,
+    statusCode: 409,
+    code: "POSSIBLE_DUPLICATE",
+    error: "These items were already added to this table after your KOT failed",
+    conflicts,
+  };
+}
+
+/**
+ * Runs before a retried KOT is written. Returns the earlier result when this
+ * KOT already went through (as a create or an update), a POSSIBLE_DUPLICATE
+ * rejection when someone else added the same items since the first attempt,
+ * or null to go ahead.
+ */
+function checkRetriedKot(
+  restaurantId: string,
+  tableId: string,
+  input: { requestId?: string; items: Array<{ menuItemId: string }> } & RetryGuardInput,
+): any | null {
+  if (!input.firstAttemptAt) return null;
+  const applied = findAppliedKot(restaurantId, input.requestId);
+  if (applied) return applied;
+  const conflicts = findRetryConflicts(restaurantId, tableId, input.items, input);
+  return conflicts.length > 0 ? duplicateRetryResult(conflicts) : null;
+}
+
+
+
 // ─── Create Order (the hot path) ─────────────────────────────────────────────
 
 
@@ -1838,6 +1940,18 @@ export async function createOrder(
     }
 
   }
+
+
+
+  // ── Retried captain KOT: never print food someone else already punched ────
+
+  // Runs before the active-order check so a retry on a table the cashier
+
+  // opened meanwhile is caught here instead of being turned into an add-on.
+
+  const retryVerdict = checkRetriedKot(restaurantId, tableId, input);
+
+  if (retryVerdict) return retryVerdict;
 
 
 
@@ -2405,7 +2519,7 @@ function safeParseKotHistory(raw: any): any[] {
 
 
 
-export interface UpdateOrderItemsInput {
+export interface UpdateOrderItemsInput extends RetryGuardInput {
 
   orderId: string;
 
@@ -2462,6 +2576,10 @@ export interface UpdateOrderItemsInput {
 export interface UpdateOrderItemsResult {
 
   success: boolean;
+
+  code?: string;
+
+  conflicts?: DuplicateConflict[];
 
   orderId?: string;
 
@@ -2634,6 +2752,14 @@ export async function updateOrderItems(
     return rejectResult;
 
   }
+
+
+
+  // ── Retried captain KOT: never print food someone else already punched ────
+
+  const retryVerdict = checkRetriedKot(restaurantId, effectiveTableId, input);
+
+  if (retryVerdict) return retryVerdict;
 
 
 
