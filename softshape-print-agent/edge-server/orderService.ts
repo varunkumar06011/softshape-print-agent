@@ -3217,7 +3217,23 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
 
 
 
-  const qtyToCancel = cancelQuantity || orderItem.quantity;
+  // order_item.quantity is what is still on the bill (each cancel decrements it),
+  // so a cancel is full when it takes everything that is left — same rule as the
+  // cloud backend. Comparing the running cancelled_quantity against it instead
+  // removed the whole line on a second partial cancel (3 → cancel 1 → cancel 1 → 0).
+  const remainingQty = Number(orderItem.quantity) || 0;
+
+  if (remainingQty <= 0 || orderItem.removed_from_bill) {
+
+    const rejectResult = { success: false, error: "Item is already cancelled" };
+
+    recordCommandResult(restaurantId, input, "cancelKotItem", "order_item", orderItemId, "rejected", rejectResult, null, rejectResult.error);
+
+    return rejectResult;
+
+  }
+
+  const qtyToCancel = Math.min(remainingQty, Math.max(1, Math.round(Number(cancelQuantity) || remainingQty)));
 
   const newCancelledQty = (orderItem.cancelled_quantity || 0) + qtyToCancel;
 
@@ -3227,7 +3243,7 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
 
 
 
-  const isFullCancel = newCancelledQty >= orderItem.quantity;
+  const isFullCancel = qtyToCancel >= remainingQty;
 
 
 
@@ -3556,6 +3572,106 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
   recordCommandResult(restaurantId, input, "cancelKotItem", "order", orderId, "applied", result, newOrderRev);
 
   return result;
+
+}
+
+
+
+// ─── Cancel several KOT items (cashier cancel dialog) ────────────────────────
+
+export interface CancelItemsInput extends Omit<CancelItemInput, "orderItemId" | "cancelQuantity"> {
+
+  items: { orderItemId: string; cancelQuantity?: number }[];
+
+}
+
+
+
+// Each item is its own command. The command log replays by request id, so if
+// every item shared the batch id, the first item's result was replayed for the
+// rest and they were never cancelled (and their cancel slips never printed).
+// A retry of the same batch gets the same per-item ids, so it stays idempotent.
+export function batchItemRequestId(requestId: string | undefined, orderItemId: string): string | undefined {
+
+  return requestId ? `${requestId}-${orderItemId}` : undefined;
+
+}
+
+
+
+export async function cancelKotItems(input: CancelItemsInput): Promise<{ success: boolean; status?: number; error?: string; results?: { orderItemId: string; success: boolean; error?: string; printResult?: any }[] }> {
+
+  const db = getDb();
+
+  const { orderId, restaurantId, items, requestId, ...rest } = input;
+
+  if (!items?.length) return { success: false, status: 400, error: "No items to cancel" };
+
+
+
+  // Pre-validate all items before cancelling any to prevent partial state.
+  // If any item is invalid (order/item not found), reject the entire batch
+  // so the caller can correct and retry without inconsistent DB state.
+  const order = db.query("SELECT id FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
+
+  if (!order) return { success: false, status: 404, error: "Order not found" };
+
+
+
+  for (const item of items) {
+
+    const orderItem = db.query("SELECT id, quantity FROM order_item WHERE id = ? AND order_id = ?").get(item.orderItemId, orderId) as any;
+
+    if (!orderItem) {
+
+      return { success: false, status: 404, error: `Order item ${item.orderItemId} not found — no items were cancelled` };
+
+    }
+
+    // Already applied by an earlier attempt of this batch — replayed below.
+    const itemRequestId = batchItemRequestId(requestId, item.orderItemId);
+
+    if (itemRequestId && lookupCommand(restaurantId, itemRequestId, "cancelKotItem")?.status === "applied") continue;
+
+    const qtyToCancel = item.cancelQuantity || 1;
+
+    if (qtyToCancel > (Number(orderItem.quantity) || 0)) {
+
+      return { success: false, status: 400, error: `Cannot cancel ${qtyToCancel} of item ${item.orderItemId} — exceeds remaining quantity. No items were cancelled.` };
+
+    }
+
+  }
+
+
+
+  const results = [];
+
+  for (const item of items) {
+
+    const result = await cancelKotItem({
+
+      ...rest,
+
+      orderId,
+
+      restaurantId,
+
+      orderItemId: item.orderItemId,
+
+      cancelQuantity: item.cancelQuantity || 1,
+
+      requestId: batchItemRequestId(requestId, item.orderItemId),
+
+    });
+
+    results.push({ orderItemId: item.orderItemId, success: result.success, error: result.error, printResult: result.printResult });
+
+  }
+
+
+
+  return { success: results.every(r => r.success), results };
 
 }
 

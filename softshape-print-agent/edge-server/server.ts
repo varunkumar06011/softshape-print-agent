@@ -61,7 +61,7 @@ import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enque
 import os from "os";
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getSessionToken, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { pullIncrementalChanges } from "./config.ts";
-import { createOrder, updateOrderItems, cancelKotItem, reprintKot, requestBillingEdge, printBillEdge, printWalkinBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
+import { createOrder, updateOrderItems, cancelKotItem, cancelKotItems, reprintKot, requestBillingEdge, printBillEdge, printWalkinBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
 import { createMenuItemEdge, updateMenuItemEdge, deleteMenuItemEdge, toggleAvailabilityEdge, toggleVenueAvailabilityEdge, toggleSectionAvailabilityEdge, toggleMenuTypeEdge } from "./menuService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders, invalidateReadCache } from "./reads.ts";
 import { getDeviceScope, updateDeviceScope, listAllVenues, getBoundVenueId, isCaptainHub, type DeviceScopeUpdate } from "./deviceScope.ts";
@@ -1286,48 +1286,20 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const restaurantId = getRestaurantId();
     if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
 
-    const items = body.items || [];
-    if (!items.length) return errorResponse("No items to cancel", 400);
-
-    // Pre-validate all items before cancelling any to prevent partial state.
-    // If any item is invalid (order/item not found), reject the entire batch
-    // so the caller can correct and retry without inconsistent DB state.
-    const db = getDb();
-    const order = db.query("SELECT id FROM order_record WHERE id = ? AND restaurant_id = ?").get(body.orderId, restaurantId) as any;
-    if (!order) return errorResponse("Order not found", 404);
-
-    for (const item of items) {
-      const orderItem = db.query("SELECT id, quantity, cancelled_quantity FROM order_item WHERE id = ? AND order_id = ?").get(item.orderItemId, body.orderId) as any;
-      if (!orderItem) {
-        return errorResponse(`Order item ${item.orderItemId} not found — no items were cancelled`, 404);
-      }
-      const qtyToCancel = item.cancelQuantity || 1;
-      const newCancelledQty = (orderItem.cancelled_quantity || 0) + qtyToCancel;
-      if (newCancelledQty > orderItem.quantity) {
-        return errorResponse(`Cannot cancel ${qtyToCancel} of item ${item.orderItemId} — exceeds remaining quantity. No items were cancelled.`, 400);
-      }
-    }
-
-    const results = [];
-    for (const item of items) {
-      const result = await cancelKotItem({
-        orderId: body.orderId,
-        restaurantId,
-        orderItemId: item.orderItemId,
-        cancelQuantity: item.cancelQuantity || 1,
-        cancelledBy: body.cancelledBy || "Staff",
-        tableNumber: body.tableNumber,
-        requestId: body.requestId,
-        localPrinted: body.localPrinted || false,
-        deviceId: body.deviceId,
-        expectedRevision: body.expectedRevision,
-        isExtraTable: body.isExtraTable,
-      });
-      results.push({ orderItemId: item.orderItemId, success: result.success, error: result.error, printResult: result.printResult });
-    }
-
-    const allSuccess = results.every(r => r.success);
-    return jsonResponse({ success: allSuccess, results });
+    const result = await cancelKotItems({
+      orderId: body.orderId,
+      restaurantId,
+      items: body.items || [],
+      cancelledBy: body.cancelledBy || "Staff",
+      tableNumber: body.tableNumber,
+      requestId: body.requestId,
+      localPrinted: body.localPrinted || false,
+      deviceId: body.deviceId,
+      expectedRevision: body.expectedRevision,
+      isExtraTable: body.isExtraTable,
+    });
+    if (result.status) return errorResponse(result.error || "Cancel failed", result.status);
+    return jsonResponse({ success: result.success, results: result.results });
   }
 
   // ── POST /api/edge/kot/reprint — reprint KOT for an order ──────────────────
