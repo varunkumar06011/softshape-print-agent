@@ -3281,6 +3281,8 @@ export interface CancelItemInput {
 
   requestId?: string;
 
+  skipPrint?: boolean; // batch cancel: return the slip data instead of printing one slip per line
+
   localPrinted?: boolean;
 
   deviceId?: string;
@@ -3293,7 +3295,14 @@ export interface CancelItemInput {
 
 
 
-export async function cancelKotItem(input: CancelItemInput): Promise<{ success: boolean; error?: string; printResult?: any; revision?: number; tableRevision?: number }> {
+export interface CancelSlipItem {
+  name: string;
+  quantity: number;
+  menuType: string;
+  printerName: string | null;
+}
+
+export async function cancelKotItem(input: CancelItemInput): Promise<{ success: boolean; error?: string; printResult?: any; revision?: number; tableRevision?: number; slip?: CancelSlipItem }> {
 
   const db = getDb();
 
@@ -3303,7 +3312,7 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
 
   // ── Phase 1: Durable idempotency check via command_log ────────────────────
 
-  const idem = checkCommandIdempotency<{ success: boolean; error?: string; printResult?: any; revision?: number; tableRevision?: number }>(restaurantId, input, "cancelKotItem", orderItemId);
+  const idem = checkCommandIdempotency<{ success: boolean; error?: string; printResult?: any; revision?: number; tableRevision?: number; slip?: CancelSlipItem }>(restaurantId, input, "cancelKotItem", orderItemId);
 
   if (idem.replay && idem.result) {
 
@@ -3583,8 +3592,26 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
 
 
 
-  const escposData = buildCancelKOT({
+  if (input.skipPrint) {
+    // Batch cancel: the caller prints ONE combined slip. Keep the slip data in
+    // the stored result so a retried batch can rebuild the same slip.
+    const slipMenuItem = db.query("SELECT * FROM menu_item WHERE id = ?").get(orderItem.menu_item_id) as any;
+    const slipCategory = slipMenuItem ? db.query("SELECT * FROM category WHERE id = ?").get(slipMenuItem.category_id) as any : null;
+    const slip: CancelSlipItem = {
+      ...cancelItem,
+      printerName: resolvePrinterName(
+        slipMenuItem?.printer_name || null,
+        slipMenuItem?.printer_target || null,
+        slipCategory?.printer_target || null,
+        outlet.printerConfig || {},
+      ) || null,
+    };
+    const slipResult = { success: true, revision: newOrderRev, tableRevision: newTableRev, slip };
+    recordCommandResult(restaurantId, input, "cancelKotItem", "order", orderId, "applied", slipResult, newOrderRev);
+    return slipResult;
+  }
 
+  const escposData = buildCancelKOT({
     tableNumber: formattedTableNumber,
 
     cancelledBy,
@@ -3725,6 +3752,81 @@ export function batchItemRequestId(requestId: string | undefined, orderItemId: s
 
 
 
+/**
+ * ONE cancel slip per printer for the whole cancel action. "Biryani x6" that is
+ * stored as several order lines (one per KOT) is merged into a single
+ * "6 BIRYANI CANCELLED" line; food and bar items go to their own printers.
+ */
+async function printCancelSlips(
+  input: CancelItemsInput,
+  slips: CancelSlipItem[],
+): Promise<Map<string | null, any>> {
+  const printed = new Map<string | null, any>();
+  const { orderId, restaurantId, cancelledBy } = input;
+  if (slips.length === 0 || input.localPrinted) return printed;
+  const db = getDb();
+  const order = db.query("SELECT table_id FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
+  const table = order ? getTableWithSection(order.table_id) : null;
+  const outlet = getOutlet(restaurantId);
+  if (!order || !table || !outlet) return printed;
+
+  const byPrinter = new Map<string | null, Map<string, { name: string; quantity: number; menuType: string }>>();
+  for (const slip of slips) {
+    const lines = byPrinter.get(slip.printerName) ?? new Map();
+    const key = `${slip.menuType}::${slip.name}`;
+    const line = lines.get(key) ?? { name: slip.name, quantity: 0, menuType: slip.menuType };
+    line.quantity += slip.quantity;
+    lines.set(key, line);
+    byPrinter.set(slip.printerName, lines);
+  }
+
+  const formattedTableNumber = input.isExtraTable && input.tableNumber
+    ? String(input.tableNumber)
+    : formatTableNumber(table);
+  const baseId = `CANCEL_KOT-${input.requestId || Date.now()}`;
+  for (const [printerName, lines] of byPrinter) {
+    const items = [...lines.values()];
+    const escposData = buildCancelKOT({
+      tableNumber: formattedTableNumber,
+      cancelledBy,
+      timestamp: new Date().toISOString(),
+      items,
+      sectionName: table.section_name || "Main Hall",
+      sectionTag: table.section_tag,
+      restaurant: {
+        name: outlet.name,
+        receiptHeader: outlet.receipt_header,
+        receiptSubHeader: outlet.receipt_sub_header,
+        address: outlet.address,
+        phone: outlet.phone,
+        gstin: outlet.gstin,
+      },
+    });
+    // Same batch + same printer → same event id, so a retried batch never prints twice.
+    const eventId = `${baseId}-${printerName || "default"}`;
+    if (getPrintJobByEventId(eventId)) {
+      printed.set(printerName, { ok: true, printerName, bytes: 0, method: "already_queued", eventId });
+      continue;
+    }
+    const group: PrintGroup = { printerName, escposData, type: "CANCEL_KOT" };
+    createPrintJob({
+      eventId,
+      restaurantId,
+      orderId,
+      kotId: null,
+      kotNumber: null,
+      tableId: order.table_id,
+      printerName,
+      jobType: "CANCEL_KOT",
+      escposData,
+      itemSummary: items.map((i) => ({ name: i.name, quantity: i.quantity })),
+      captainName: cancelledBy || null,
+    });
+    printed.set(printerName, await awaitDispatchBounded(eventId, group, input.requestId, 5000));
+  }
+  return printed;
+}
+
 export async function cancelKotItems(input: CancelItemsInput): Promise<{ success: boolean; status?: number; error?: string; results?: { orderItemId: string; success: boolean; error?: string; printResult?: any }[] }> {
 
   const db = getDb();
@@ -3771,7 +3873,8 @@ export async function cancelKotItems(input: CancelItemsInput): Promise<{ success
 
 
 
-  const results = [];
+  const results: any[] = [];
+  const slips: CancelSlipItem[] = [];
 
   for (const item of items) {
 
@@ -3786,16 +3889,18 @@ export async function cancelKotItems(input: CancelItemsInput): Promise<{ success
       orderItemId: item.orderItemId,
 
       cancelQuantity: item.cancelQuantity || 1,
-
       requestId: batchItemRequestId(requestId, item.orderItemId),
-
+      skipPrint: true,
     });
-
-    results.push({ orderItemId: item.orderItemId, success: result.success, error: result.error, printResult: result.printResult });
-
+    if (result.slip) slips.push(result.slip);
+    results.push({ orderItemId: item.orderItemId, success: result.success, error: result.error, printResult: result.printResult, printerName: result.slip?.printerName ?? null });
   }
 
-
+  const printed = await printCancelSlips({ ...rest, orderId, restaurantId, items, requestId }, slips);
+  for (const r of results as any[]) {
+    if (r.success && printed.has(r.printerName)) r.printResult = printed.get(r.printerName);
+    delete r.printerName;
+  }
 
   return { success: results.every(r => r.success), results };
 
