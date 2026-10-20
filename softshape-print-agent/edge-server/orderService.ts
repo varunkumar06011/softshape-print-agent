@@ -1279,6 +1279,30 @@ function buildKotPrintGroups(
 
 const ACTIVE_ORDER_STATUSES = ["PENDING", "CONFIRMED", "PREPARING", "READY", "BILLING_REQUESTED"];
 
+// ─── Closed orders ───────────────────────────────────────────────────────────
+// A paid or cancelled order is final. A captain whose screen went stale (WiFi
+// dropped while the cashier settled the table) must not add food to it — the
+// kitchen would print it but it could never be billed — and a stale cashier
+// screen must not change the amount of a bill that is already paid.
+const CLOSED_ORDER_STATUSES = ["SETTLED", "PAID", "CANCELLED", "VOIDED"];
+
+export function isOrderClosed(order: { status?: string | null; is_deleted?: number | null } | null | undefined): boolean {
+  if (!order) return false;
+  return !!order.is_deleted || CLOSED_ORDER_STATUSES.includes(String(order.status || "").toUpperCase());
+}
+
+export function closedOrderResult(order: { status?: string | null }) {
+  const paid = ["SETTLED", "PAID"].includes(String(order.status || "").toUpperCase());
+  return {
+    success: false,
+    statusCode: 409,
+    code: "ORDER_CLOSED",
+    error: paid
+      ? "This table was already billed and paid"
+      : "This order was already cancelled",
+  };
+}
+
 
 
 // ─── Server-side price resolution (Bug 1 fix) ───────────────────────────────
@@ -2711,8 +2735,11 @@ export async function updateOrderItems(
 
   }
 
-
-
+  if (isOrderClosed(order)) {
+    const rejectResult = closedOrderResult(order);
+    recordCommandResult(restaurantId, input, "updateOrderItems", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
+  }
   // ── Resolve tableId: fall back to order.table_id if not provided ──────────
 
   // The frontend may omit tableId or pass the table number instead of the UUID
@@ -3336,8 +3363,11 @@ export async function cancelKotItem(input: CancelItemInput): Promise<{ success: 
 
   }
 
-
-
+  if (isOrderClosed(order)) {
+    const rejectResult = closedOrderResult(order);
+    recordCommandResult(restaurantId, input, "cancelKotItem", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
+    return rejectResult;
+  }
   const orderItem = db.query("SELECT * FROM order_item WHERE id = ? AND order_id = ?").get(orderItemId, orderId) as any;
 
   if (!orderItem) {
@@ -3840,12 +3870,11 @@ export async function cancelKotItems(input: CancelItemsInput): Promise<{ success
   // Pre-validate all items before cancelling any to prevent partial state.
   // If any item is invalid (order/item not found), reject the entire batch
   // so the caller can correct and retry without inconsistent DB state.
-  const order = db.query("SELECT id FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
+  const order = db.query("SELECT id, status, is_deleted FROM order_record WHERE id = ? AND restaurant_id = ?").get(orderId, restaurantId) as any;
 
   if (!order) return { success: false, status: 404, error: "Order not found" };
 
-
-
+  if (isOrderClosed(order)) return { success: false, status: 409, error: closedOrderResult(order).error };
   for (const item of items) {
 
     const orderItem = db.query("SELECT id, quantity FROM order_item WHERE id = ? AND order_id = ?").get(item.orderItemId, orderId) as any;
