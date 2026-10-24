@@ -1295,6 +1295,17 @@ export function applyChangesBatch(changes: any[]): number {
       if (change?.table) touchedTables.push(change.table);
     }
   }
+  if (applied > 0) {
+    // Drop cached reads (e.g. /api/edge/outlet) so socket-pushed settings such
+    // as expenditure approvers are served fresh instead of after the 5-min TTL.
+    try {
+      invalidateReadCache();
+    } catch (cacheErr) {
+      runtimeLog.warn("[config] Cache invalidation after socket batch failed (non-fatal)", {
+        error: String(cacheErr),
+      });
+    }
+  }
   if (touchedTables.length > 0) notifyConfigChanged(touchedTables, "socket");
   return applied;
 }
