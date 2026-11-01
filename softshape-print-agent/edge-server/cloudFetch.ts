@@ -120,7 +120,7 @@ async function fetchWithTimeouts(
   if (res.status >= 500 && res.status < 600) {
     let bodyText = "";
     try { bodyText = await res.text(); } catch { /* ignore */ }
-    throw new Error(`Server error: ${res.status} ${res.statusText} — ${url} — ${bodyText.slice(0, 200)}`);
+    throw new Error(`Server error: ${res.status} ${res.statusText} — ${url} — ${bodyText.slice(0, 1000)}`);
   }
 
   // Stage 2: Body timeout — wraps the response so that consumers calling

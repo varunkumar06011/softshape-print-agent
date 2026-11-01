@@ -32,7 +32,7 @@ import { EVENT_NAMES } from "./contract/events.ts";
 import { getDeviceId, getRestaurantId, isSessionValid, isLocalReady, loadSession } from "./auth.ts";
 import { getDb, getSyncState, setSyncState, migrateSyncQueueToRevisions } from "./db.ts";
 import { downloadFullConfig, type ConfigSyncResult } from "./config.ts";
-import { startSyncWorker, stopSyncWorker, getSyncStatus } from "./sync.ts";
+import { startSyncWorker, stopSyncWorker, flushPendingSync, getSyncStatus } from "./sync.ts";
 import { startSocketSync, stopSocketSync, getSocketStatus, isInFallbackMode } from "./socketSync.ts";
 import { startHeartbeat, stopHeartbeat } from "./socketSync.ts";
 import { startHeartbeatLoop, stopHeartbeatLoop, releaseInstanceLock, acquireInstanceLock } from "./instanceLock.ts";
@@ -619,6 +619,14 @@ class RuntimeManager {
     if (this._backupTimer) clearInterval(this._backupTimer);
     if (this._pollIntervalId) clearInterval(this._pollIntervalId);
     if (this._backgroundRetryTimer) clearInterval(this._backgroundRetryTimer);
+
+    // Push whatever is still pending before anything is torn down — the last
+    // bills of the day must not depend on the next boot to reach the cloud.
+    try {
+      await flushPendingSync(8_000);
+    } catch (err) {
+      runtimeLog.warn("Final sync flush failed", { error: err });
+    }
 
     // Stop services in dependency order with a 5-second overall timeout.
     // If any service hangs (e.g., a socket that won't close), we don't

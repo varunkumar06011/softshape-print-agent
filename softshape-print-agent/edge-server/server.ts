@@ -64,7 +64,7 @@ import { createOrder, updateOrderItems, cancelKotItem, cancelKotItems, reprintKo
 import { createMenuItemEdge, updateMenuItemEdge, deleteMenuItemEdge, toggleAvailabilityEdge, toggleVenueAvailabilityEdge, toggleSectionAvailabilityEdge, toggleMenuTypeEdge } from "./menuService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders, invalidateReadCache } from "./reads.ts";
 import { getDeviceScope, updateDeviceScope, listAllVenues, getBoundVenueId, isCaptainHub, type DeviceScopeUpdate } from "./deviceScope.ts";
-import { getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
+import { kickSync, getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
 import { getSocketStatus } from "./socketSync.ts";
 import { forceReleaseLock, getLockStatus } from "./instanceLock.ts";
 import { cloudFetch } from "./cloudFetch.ts";
@@ -4408,6 +4408,12 @@ const server = Bun.serve<{ eventBus?: boolean }>({
   },
   async fetch(req, server) {
     const url = new URL(req.url);
+
+    // Any write may have produced unsynced business data — get it to the cloud
+    // within ~1 s instead of waiting for the next periodic tick.
+    if (req.method === "POST" || req.method === "PUT" || req.method === "PATCH" || req.method === "DELETE") {
+      kickSync();
+    }
 
     // ── WebSocket upgrade for LAN real-time events (Bug 2 fix) ────────────────
     if (url.pathname === "/ws" && req.method === "GET") {

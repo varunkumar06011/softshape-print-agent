@@ -43,6 +43,13 @@ const BACKOFF_BASE_MS = 5_000;
 const BACKOFF_MAX_MS = 60_000;
 const STUCK_RECORD_THRESHOLD = 100; // sync_attempt_count > 100 → stuck (was 10, too aggressive)
 const STUCK_RECORD_AGE_MS = 30 * 60_000; // pending > 30 min → stuck
+// A local write kicks the worker so a bill settled seconds before the machine
+// goes down is not left waiting for the next 5 s tick (or a 60 s backoff).
+const KICK_DELAY_MS = 1_000;
+// While a backlog remains and pushes are succeeding (e.g. catching up after the
+// machine was off overnight), don't idle for the full interval between batches.
+const DRAIN_INTERVAL_MS = 250;
+const MAX_DRAIN_STREAK = 400; // safety valve: fall back to the normal interval
 
 let syncRunning = false;
 let lastSyncAt = 0;
@@ -55,6 +62,12 @@ let lastSyncResult: { ok: boolean; pushed: number; accepted: number; rejected: n
 let _cloudRegistrationAttempted = false;
 let _lastRefreshAttemptAt = 0;
 const REFRESH_COOLDOWN_MS = 60_000;
+let workerStopped = true;
+let nextCycleAt = 0;
+let kickRequested = false;
+let drainStreak = 0;
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 function getBackoffDelay(): number {
   if (consecutiveFailures === 0) return SYNC_INTERVAL_MS;
@@ -275,8 +288,11 @@ async function pushOrder(order: PendingOrder): Promise<{ ok: boolean; duplicate?
     }
 
     const result = await res.json() as { outcome: "applied" | "duplicate"; appliedRevision: number };
-    // Conditional update — only marks synced if revision hasn't advanced
-    markOrderSynced(order.id, result.appliedRevision);
+    // Conditional update — only marks synced if revision hasn't advanced.
+    // Use the snapshot we actually sent, not the cloud's echo: if the echo ever
+    // differs from the local revision the WHERE clause never matches and the
+    // order is re-pushed forever.
+    markOrderSynced(order.id, built.snapshotRevision);
     return { ok: true, duplicate: result.outcome === "duplicate" };
   } catch (err: any) {
     recordOrderSyncFailure(order.id, err.message || "Network error");
@@ -378,8 +394,8 @@ async function pushExpenditure(exp: PendingExpenditure): Promise<{ ok: boolean; 
       return { ok: false, error: errorMsg };
     }
 
-    const result = await res.json() as { appliedRevision: number };
-    markExpenditureSynced(exp.id, result.appliedRevision);
+    await res.json().catch(() => ({}));
+    markExpenditureSynced(exp.id, exp.sync_version);
     return { ok: true };
   } catch (err: any) {
     recordExpenditureSyncFailure(exp.id, err.message || "Network error");
@@ -474,8 +490,8 @@ async function pushWalkin(walkin: PendingWalkin): Promise<{ ok: boolean; error?:
       return { ok: false, error: errorMsg };
     }
 
-    const result = await res.json() as { appliedRevision: number };
-    markWalkinSynced(walkin.id, result.appliedRevision);
+    await res.json().catch(() => ({}));
+    markWalkinSynced(walkin.id, walkin.sync_version);
     return { ok: true };
   } catch (err: any) {
     recordWalkinSyncFailure(walkin.id, err.message || "Network error");
@@ -1010,6 +1026,12 @@ export async function pushSyncBatch(): Promise<{ ok: boolean; pushed: number; ac
   return lastSyncResult;
 }
 
+function hasPendingBusiness(): boolean {
+  return collectUnsyncedOrders().length > 0
+    || collectUnsyncedExpenditures().length > 0
+    || collectUnsyncedWalkins().length > 0;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Sync worker loop
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1038,6 +1060,7 @@ async function runSyncCycle(): Promise<void> {
 
   syncRunning = true;
   let skipBackoff = false;
+  let drainMore = false;
   const cycleStart = Date.now();
   try {
     // Startup reconciliation removed — it fetches ALL cloud records and compares
@@ -1046,6 +1069,7 @@ async function runSyncCycle(): Promise<void> {
     // handles this after the Edge is already READY and serving requests.
 
     const result = await pushSyncBatch();
+    drainMore = result.ok && result.accepted > 0 && hasPendingBusiness();
 
     // WAL checkpoint: use PASSIVE mode (non-blocking) instead of TRUNCATE
     // (which requires an exclusive lock and freezes all reads). PASSIVE
@@ -1122,7 +1146,17 @@ async function runSyncCycle(): Promise<void> {
     syncRunning = false;
   }
 
-  scheduleNextCycle(skipBackoff ? SYNC_INTERVAL_MS : getBackoffDelay());
+  let nextDelay = skipBackoff ? SYNC_INTERVAL_MS : getBackoffDelay();
+  if (drainMore && ++drainStreak <= MAX_DRAIN_STREAK) {
+    nextDelay = Math.min(nextDelay, DRAIN_INTERVAL_MS);
+  } else {
+    drainStreak = 0;
+  }
+  if (kickRequested) {
+    kickRequested = false;
+    if (consecutiveFailures === 0) nextDelay = Math.min(nextDelay, KICK_DELAY_MS);
+  }
+  scheduleNextCycle(nextDelay);
 }
 
 // Reset stuck (dead-lettered) records whose last attempt is older than
@@ -1153,6 +1187,9 @@ function scheduleNextCycle(delay: number): void {
     clearTimeout(syncTimer);
     syncTimer = null;
   }
+  // An in-flight cycle finishing after stopSyncWorker() must not re-arm the timer.
+  if (workerStopped) return;
+  nextCycleAt = Date.now() + delay;
   syncTimer = setTimeout(async () => {
     await runSyncCycle();
   }, delay);
@@ -1160,6 +1197,7 @@ function scheduleNextCycle(delay: number): void {
 
 export function startSyncWorker(): void {
   if (syncTimer) return;
+  workerStopped = false;
 
   // Reset dead-lettered records on startup. After prolonged connectivity
   // issues, records accumulate sync_attempt_count > STUCK_RECORD_THRESHOLD
@@ -1208,11 +1246,53 @@ export function startSyncWorker(): void {
 }
 
 export function stopSyncWorker(): void {
+  workerStopped = true;
   if (syncTimer) {
     clearTimeout(syncTimer);
     syncTimer = null;
     console.log("[Sync] Worker stopped");
   }
+}
+
+// Ask the worker to run soon because local business data just changed.
+// Cheap and safe to call on every write: it only ever pulls the next cycle
+// earlier, never adds a cycle, and stays out of the way while the cloud is
+// failing (normal backoff applies).
+export function kickSync(delayMs: number = KICK_DELAY_MS): void {
+  if (workerStopped || consecutiveFailures > 0) return;
+  if (syncRunning) {
+    kickRequested = true;
+    return;
+  }
+  if (nextCycleAt - Date.now() > delayMs) scheduleNextCycle(delayMs);
+}
+
+// Final drain for a graceful shutdown: stop scheduling, let the in-flight
+// cycle finish, then keep pushing until nothing is pending or the budget runs
+// out. Returns true if everything pending was pushed.
+export async function flushPendingSync(maxMs: number = 8_000): Promise<boolean> {
+  const deadline = Date.now() + maxMs;
+  stopSyncWorker();
+  while (syncRunning && Date.now() < deadline) await sleep(100);
+  if (syncRunning) return false;
+
+  while (Date.now() < deadline) {
+    if (!hasPendingBusiness()) return true;
+    syncRunning = true;
+    let progressed = false;
+    try {
+      const r = await Promise.race([pushSyncBatch(), sleep(deadline - Date.now()).then(() => null)]);
+      progressed = !!r && r.accepted > 0;
+    } catch (err) {
+      console.warn("[Sync] Shutdown flush error:", (err as Error)?.message || err);
+    } finally {
+      syncRunning = false;
+    }
+    if (!progressed) break;
+  }
+  const drained = !hasPendingBusiness();
+  console.log(`[Sync] Shutdown flush ${drained ? "complete" : "incomplete — remaining records will sync on next start"}`);
+  return drained;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
