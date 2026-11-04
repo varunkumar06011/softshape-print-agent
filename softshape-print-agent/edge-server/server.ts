@@ -61,7 +61,7 @@ import { getDb, closeDb, getConfig, setConfig, getSyncState, setSyncState, enque
 import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, getBackendUrl, getSessionToken, getRestaurantId, getDeviceId, getEdgeApiKey, saveEdgeApiKey } from "./auth.ts";
 import { pullIncrementalChanges } from "./config.ts";
 import { createOrder, updateOrderItems, cancelKotItem, cancelKotItems, reprintKot, requestBillingEdge, printBillEdge, printWalkinBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
-import { createMenuItemEdge, updateMenuItemEdge, deleteMenuItemEdge, toggleAvailabilityEdge, toggleVenueAvailabilityEdge, toggleSectionAvailabilityEdge, toggleMenuTypeEdge } from "./menuService.ts";
+import { createMenuItemEdge, updateMenuItemEdge, deleteMenuItemEdge, toggleAvailabilityEdge, toggleVenueAvailabilityEdge, toggleSectionAvailabilityEdge, toggleMenuTypeEdge, listCategoriesWithPrinters, setCategoryPrinterEdge } from "./menuService.ts";
 import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders, invalidateReadCache } from "./reads.ts";
 import { getDeviceScope, updateDeviceScope, listAllVenues, getBoundVenueId, isCaptainHub, type DeviceScopeUpdate } from "./deviceScope.ts";
 import { getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
@@ -2501,6 +2501,27 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     return jsonResponse(data);
   }
 
+  // ── GET /api/edge/menu/categories — categories with their KOT printer ─────
+  if (url.pathname === "/api/edge/menu/categories" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    return jsonResponse({ success: true, categories: listCategoriesWithPrinters() });
+  }
+
+  // ── PATCH /api/edge/menu/categories/:id — set category KOT printer ─────────
+  // Overrides all per-item printers in the category (see setCategoryPrinterEdge).
+  if (url.pathname.startsWith("/api/edge/menu/categories/") && req.method === "PATCH") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const categoryId = url.pathname.split("/").pop()!;
+    const body = await req.json().catch(() => ({}));
+    try {
+      const r = setCategoryPrinterEdge(categoryId, body.printerTarget ?? null);
+      return r.success ? jsonResponse(r) : jsonResponse(r, r.statusCode || 400);
+    } catch (err: any) {
+      console.error("[server] category printer PATCH failed:", err);
+      return errorResponse("Failed to update category printer", 500);
+    }
+  }
+
   // ── GET /api/edge/menu/debug — diagnostic: raw SQLite menu state ───────────
   if (url.pathname === "/api/edge/menu/debug" && req.method === "GET") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
@@ -3738,10 +3759,17 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
 
     if (body.name !== undefined) { updates.push("name = ?"); values.push(body.name); }
     if (body.sortOrder !== undefined) { updates.push("sort_order = ?"); values.push(Number(body.sortOrder)); }
-    if (body.printerTarget !== undefined) { updates.push("printer_target = ?"); values.push(body.printerTarget); }
     if (body.reportCategory !== undefined) { updates.push("report_category = ?"); values.push(body.reportCategory || null); }
+    // printerTarget goes through setCategoryPrinterEdge so it also clears per-item overrides.
+    const hasPrinterTarget = body.printerTarget !== undefined;
 
-    if (updates.length === 0) return errorResponse("No fields to update", 400);
+    if (updates.length === 0 && !hasPrinterTarget) return errorResponse("No fields to update", 400);
+
+    if (hasPrinterTarget) {
+      const r = setCategoryPrinterEdge(categoryId, body.printerTarget);
+      if (!r.success) return jsonResponse(r, r.statusCode || 400);
+      if (updates.length === 0) return jsonResponse({ success: true, id: categoryId });
+    }
 
     values.push(categoryId);
     db.query(`UPDATE category SET ${updates.join(", ")} WHERE id = ? AND restaurant_id = ?`).run(...values, restaurantId);
