@@ -406,7 +406,7 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
     db.query(`DELETE FROM menu_item_variant WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM menu_item WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM category WHERE restaurant_id = ?`).run(rid);
-    db.query(`DELETE FROM "table" WHERE restaurant_id = ? AND id NOT IN (SELECT table_id FROM order_record WHERE restaurant_id = ? AND status IN ('PREPARING','READY','BILLING_REQUESTED','SETTLED') AND is_deleted = 0)`).run(rid, rid);
+    db.query(`DELETE FROM "table" WHERE restaurant_id = ? AND id NOT IN (SELECT table_id FROM order_record WHERE restaurant_id = ? AND status IN ('PENDING','CONFIRMED','PREPARING','READY','BILLING_REQUESTED','SETTLED') AND is_deleted = 0)`).run(rid, rid);
     db.query(`DELETE FROM section WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM floor WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM venue WHERE restaurant_id = ?`).run(rid);

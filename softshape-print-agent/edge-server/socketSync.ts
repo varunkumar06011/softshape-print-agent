@@ -534,6 +534,15 @@ function upsertOrderFromSync(db: any, row: any): boolean {
   const existing = db.query("SELECT updated_at, cloud_synced, table_id FROM order_record WHERE id = ?").get(orderId) as any;
   const incomingUpdatedAt = Number(row.updated_at || row.updatedAt || Date.now());
   const incomingRevision = Number(row.revision || 1);
+  // paid_at drives every sales/X report. Orders settled on another device or in
+  // the cloud arrive here as SETTLED; without paid_at they never appear in reports.
+  const toMs = (v: any): number | null => {
+    if (v == null || v === "") return null;
+    const n = typeof v === "number" ? v : (/^\d+$/.test(String(v)) ? Number(v) : new Date(v).getTime());
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+  const incomingStatus = String(row.status || "").toUpperCase();
+  const incomingPaidAt = toMs(row.paid_at ?? row.paidAt) ?? (incomingStatus === "SETTLED" ? incomingUpdatedAt : null);
 
   if (existing) {
     // Skip if local is same or newer
@@ -546,7 +555,8 @@ function upsertOrderFromSync(db: any, row: any): boolean {
     // re-push an order that came from cloud (via pull or socket sync).
     db.query(`UPDATE order_record SET
       table_id = ?, status = ?, total_amount = ?, captain_id = ?, bill_number = ?,
-      billing_requested = ?, revision = ?, cloud_synced_version = ?, updated_at = ?, cloud_synced = 1
+      billing_requested = ?, revision = ?, cloud_synced_version = ?, updated_at = ?, cloud_synced = 1,
+      paid_at = CASE WHEN ? IS NOT NULL THEN ? ELSE paid_at END
       WHERE id = ?`).run(
       row.table_id || row.tableId || existing.table_id,
       row.status || "PREPARING",
@@ -557,6 +567,8 @@ function upsertOrderFromSync(db: any, row: any): boolean {
       incomingRevision,
       incomingRevision,
       incomingUpdatedAt,
+      incomingPaidAt,
+      incomingPaidAt,
       orderId,
     );
   } else {
@@ -566,8 +578,8 @@ function upsertOrderFromSync(db: any, row: any): boolean {
     db.query(`INSERT INTO order_record
       (id, table_id, restaurant_id, status, total_amount, captain_id, platform,
        created_by_user_id, last_request_id, created_at, updated_at, cloud_synced,
-       is_extra_table, bill_number, billing_requested, revision, cloud_synced_version)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`).run(
+       is_extra_table, bill_number, billing_requested, revision, cloud_synced_version, paid_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`).run(
       orderId,
       row.table_id || row.tableId,
       row.restaurant_id || row.restaurantId,
@@ -584,6 +596,7 @@ function upsertOrderFromSync(db: any, row: any): boolean {
       row.billing_requested || 0,
       incomingRevision,
       incomingRevision,
+      incomingPaidAt,
     );
   }
 

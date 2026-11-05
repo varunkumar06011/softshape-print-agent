@@ -1848,30 +1848,64 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     const startTs = Date.UTC(dy, dm - 1, dd, 0, 0, 0, 0) - IST_OFFSET_MS;
     const endTs = Date.UTC(dy, dm - 1, dd, 23, 59, 59, 999) - IST_OFFSET_MS;
 
-    // Settled orders for the date
+    // Settled orders for the date (excluding transactions deleted from Past Transactions,
+    // same rule the sales/item reports use).
     const orders = db.query(
-      "SELECT id FROM order_record WHERE restaurant_id = ? AND status = 'SETTLED' AND paid_at >= ? AND paid_at <= ?"
+      "SELECT id, total_amount FROM order_record WHERE restaurant_id = ? AND status = 'SETTLED' AND paid_at >= ? AND paid_at <= ?"
+        + " AND NOT EXISTS (SELECT 1 FROM edge_config WHERE key = 'txn_deleted:' || order_record.id)"
     ).all(restaurantId, startTs, endTs) as any[];
 
     let totalSales = 0, cashAmount = 0, cardAmount = 0, upiAmount = 0, otherAmount = 0, tipsAmount = 0;
 
+    // Attribute one settlement to payment buckets. Single-method bills put the whole
+    // grand total on that method; MIXED bills use the recorded split and any
+    // remainder goes to "other" so the buckets always add up to totalSales.
+    const addPayment = (pd: any, grand: number) => {
+      totalSales += grand;
+      tipsAmount += Number(pd.tipAmount || 0);
+      const method = String(pd.paymentMethod || pd.method || "CASH").toUpperCase();
+      if (method === "CASH") cashAmount += grand;
+      else if (method === "CARD") cardAmount += grand;
+      else if (method === "UPI") upiAmount += grand;
+      else if (method === "MIXED" || method === "SPLIT") {
+        const c = Number(pd.cashAmount || 0), k = Number(pd.cardAmount || 0), u = Number(pd.upiAmount || 0), o = Number(pd.otherAmount || 0);
+        cashAmount += c; cardAmount += k; upiAmount += u;
+        otherAmount += o + Math.max(0, grand - c - k - u - o);
+      } else otherAmount += grand;
+    };
+
+    const countedOrderIds = new Set<string>();
     for (const order of orders) {
-      const settleRow = db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any;
-      if (!settleRow?.value) continue;
+      countedOrderIds.add(order.id);
+      // Primary source: edge_config settle:*. Fallback: durable transaction_record
+      // (edge_config rows can be missing; orders pulled from another device or the
+      // cloud never had one). Last resort: the order's own total, counted as "other"
+      // so the day's total is never silently short.
+      let raw: string | undefined = (db.query("SELECT value FROM edge_config WHERE key LIKE 'settle:%' AND json_extract(value, '$.orderId') = ?").get(order.id) as any)?.value;
+      if (!raw) {
+        raw = (db.query("SELECT payload FROM transaction_record WHERE order_id = ? AND kind = 'settle' ORDER BY created_at DESC LIMIT 1").get(order.id) as any)?.payload;
+      }
+      let pd: any = null;
+      if (raw) { try { pd = JSON.parse(raw); } catch {} }
+      if (pd && Number(pd.grandTotal) > 0) {
+        addPayment(pd, Number(pd.grandTotal));
+      } else {
+        const fallback = Number(order.total_amount || 0);
+        if (fallback > 0) addPayment({ paymentMethod: "OTHER", tipAmount: pd?.tipAmount }, fallback);
+      }
+    }
+
+    // Walk-in transactions (stored separately from order_record) — previously missing from the X report.
+    const walkinRows = db.query("SELECT value FROM edge_config WHERE key LIKE 'walkin_txn:%'").all() as any[];
+    for (const row of walkinRows) {
       try {
-        const pd = JSON.parse(settleRow.value);
-        const grand = Number(pd.grandTotal || 0);
-        totalSales += grand;
-        tipsAmount += Number(pd.tipAmount || 0);
-        const method = (pd.paymentMethod || "CASH").toUpperCase();
-        if (method === "CASH") cashAmount += Number(pd.cashAmount || grand);
-        else if (method === "CARD") cardAmount += Number(pd.cardAmount || grand);
-        else if (method === "UPI") upiAmount += Number(pd.cashAmount || grand);
-        else if (method === "MIXED") {
-          cashAmount += Number(pd.cashAmount || 0);
-          cardAmount += Number(pd.cardAmount || 0);
-          otherAmount += Math.max(0, grand - Number(pd.cashAmount || 0) - Number(pd.cardAmount || 0));
-        } else otherAmount += grand;
+        const txn = JSON.parse(row.value);
+        if (txn.restaurantId !== restaurantId) continue;
+        if (txn.orderId && countedOrderIds.has(txn.orderId)) continue; // already counted via its order
+        const paidMs = txn.paidAt ? new Date(txn.paidAt).getTime() : Number(txn.createdAt || 0);
+        if (!(paidMs >= startTs && paidMs <= endTs)) continue;
+        const grand = Number(txn.grandTotal || txn.amount || 0);
+        if (grand > 0) addPayment({ ...txn, paymentMethod: txn.method }, grand);
       } catch {}
     }
 
