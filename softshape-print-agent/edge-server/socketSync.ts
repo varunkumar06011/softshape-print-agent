@@ -527,7 +527,7 @@ function applyBusinessSync(tableName: string, row: any): boolean {
   }
 }
 
-function upsertOrderFromSync(db: any, row: any): boolean {
+export function upsertOrderFromSync(db: any, row: any): boolean {
   const orderId = row.id || row.order_id;
   if (!orderId) return false;
 
@@ -542,7 +542,10 @@ function upsertOrderFromSync(db: any, row: any): boolean {
     return Number.isFinite(n) && n > 0 ? n : null;
   };
   const incomingStatus = String(row.status || "").toUpperCase();
-  const incomingPaidAt = toMs(row.paid_at ?? row.paidAt) ?? (incomingStatus === "SETTLED" ? incomingUpdatedAt : null);
+  const explicitPaidAt = toMs(row.paid_at ?? row.paidAt);
+  // Fallback only fills a missing paid_at; it never replaces a value we already have.
+  const fallbackPaidAt = incomingStatus === "SETTLED" ? incomingUpdatedAt : null;
+  const incomingPaidAt = explicitPaidAt ?? fallbackPaidAt;
 
   if (existing) {
     // Skip if local is same or newer
@@ -556,7 +559,9 @@ function upsertOrderFromSync(db: any, row: any): boolean {
     db.query(`UPDATE order_record SET
       table_id = ?, status = ?, total_amount = ?, captain_id = ?, bill_number = ?,
       billing_requested = ?, revision = ?, cloud_synced_version = ?, updated_at = ?, cloud_synced = 1,
-      paid_at = CASE WHEN ? IS NOT NULL THEN ? ELSE paid_at END
+      paid_at = CASE WHEN ? IS NOT NULL THEN ?
+                     WHEN paid_at IS NULL OR paid_at = 0 THEN ?
+                     ELSE paid_at END
       WHERE id = ?`).run(
       row.table_id || row.tableId || existing.table_id,
       row.status || "PREPARING",
@@ -567,8 +572,9 @@ function upsertOrderFromSync(db: any, row: any): boolean {
       incomingRevision,
       incomingRevision,
       incomingUpdatedAt,
-      incomingPaidAt,
-      incomingPaidAt,
+      explicitPaidAt,
+      explicitPaidAt,
+      fallbackPaidAt,
       orderId,
     );
   } else {
