@@ -1887,8 +1887,11 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       }
       let pd: any = null;
       if (raw) { try { pd = JSON.parse(raw); } catch {} }
-      if (pd && Number(pd.grandTotal) > 0) {
-        addPayment(pd, Number(pd.grandTotal));
+      // A settle record with grandTotal 0 is a real complimentary bill: count it as 0,
+      // not as the order's pre-discount total. Only fall back when the amount is absent.
+      const recordedGrand = pd && pd.grandTotal != null && pd.grandTotal !== "" ? Number(pd.grandTotal) : NaN;
+      if (Number.isFinite(recordedGrand)) {
+        addPayment(pd, recordedGrand);
       } else {
         const fallback = Number(order.total_amount || 0);
         if (fallback > 0) addPayment({ paymentMethod: "OTHER", tipAmount: pd?.tipAmount }, fallback);
