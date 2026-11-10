@@ -333,13 +333,16 @@ export function setCategoryPrinterEdge(categoryId: string, printerTarget: string
   const target = typeof printerTarget === "string" && printerTarget.trim() ? printerTarget.trim() : null;
   const now = Date.now();
 
+  // Items carrying their own printer: a logical one (printer_target) or a physical
+  // override (printer_name). The physical override outranks everything at print time,
+  // so it must be cleared too or the category printer would never take effect.
   const itemIds = (db.query(
-    "SELECT id FROM menu_item WHERE category_id = ? AND restaurant_id = ? AND printer_target IS NOT NULL AND printer_target != ''"
+    "SELECT id FROM menu_item WHERE category_id = ? AND restaurant_id = ? AND ((printer_target IS NOT NULL AND printer_target != '') OR (printer_name IS NOT NULL AND printer_name != ''))"
   ).all(categoryId, restaurantId) as any[]).map((r) => r.id);
 
   db.transaction(() => {
     db.query("UPDATE category SET printer_target = ? WHERE id = ? AND restaurant_id = ?").run(target, categoryId, restaurantId);
-    db.query("UPDATE menu_item SET printer_target = NULL, updated_at = ?, synced_at = unixepoch() WHERE category_id = ? AND restaurant_id = ?")
+    db.query("UPDATE menu_item SET printer_target = NULL, printer_name = NULL, updated_at = ?, synced_at = unixepoch() WHERE category_id = ? AND restaurant_id = ?")
       .run(now, categoryId, restaurantId);
   })();
 
