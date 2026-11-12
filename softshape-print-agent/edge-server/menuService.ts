@@ -22,6 +22,15 @@ import { invalidateReadCache } from "./reads.ts";
 import { emitEvent } from "./eventBus.ts";
 import { EVENT_NAMES } from "./contract/events.ts";
 import { runtimeLog } from "./contract/logger.ts";
+import { buildVenuePriceMap } from "./pricing.ts";
+import { getServerTimeOffsetMs } from "./cloudFetch.ts";
+
+// Edit time on the cloud's clock. The cloud decides "whose edit is newer" by
+// comparing this with its own times, so a PC clock running slow or fast must
+// not make a fresh edit look old (and be thrown away) or an old one look new.
+function editTime(): number {
+  return Date.now() + getServerTimeOffsetMs();
+}
 
 export interface MenuEditResult {
   success: boolean;
@@ -83,28 +92,59 @@ function resolveCategoryId(restaurantId: string, category: string): string | nul
 // Upsert venue_price rows for an item. Runs all upserts inside a single
 // transaction so a multi-venue edit is atomic and avoids N separate implicit
 // transactions (one per INSERT).
-function upsertVenuePrices(restaurantId: string, itemId: string, venuePrices: Record<string, any>): void {
+// `savedVenueIds`: venues whose price the user explicitly saved in Edit Menu.
+// Those are always marked for upload, even when the PC already shows that
+// price — re-saving is how a price that differs between the PC and the cloud
+// is put right (the PC's value then goes to the cloud).
+export function upsertVenuePrices(
+  restaurantId: string,
+  itemId: string,
+  venuePrices: Record<string, any>,
+  savedVenueIds: string[] = [],
+): void {
   const db = getDb();
   if (!venuePrices || typeof venuePrices !== "object") return;
   const entries = Object.entries(venuePrices).filter(([, price]) => price !== undefined && price !== null && price !== "");
   if (entries.length === 0) return;
 
+  // pending_push marks the price as edited here and not yet confirmed by the
+  // cloud — only marked prices travel up with the menu item (sync.ts).
+  const editedAt = Date.now();
   const stmt = db.query(`
-    INSERT INTO venue_price (id, venue_id, menu_item_id, price, is_active, restaurant_id)
-    VALUES (?, ?, ?, ?, 1, ?)
-    ON CONFLICT(venue_id, menu_item_id) DO UPDATE SET price = excluded.price, is_active = 1
+    INSERT INTO venue_price (id, venue_id, menu_item_id, price, is_active, restaurant_id, pending_push)
+    VALUES (?, ?, ?, ?, 1, ?, ?)
+    ON CONFLICT(venue_id, menu_item_id) DO UPDATE SET price = excluded.price, is_active = 1, pending_push = excluded.pending_push
   `);
-  db.exec("BEGIN");
-  try {
+  // Orders take their price from the venue's price profile first
+  // (buildEdgePriceMap in orderService.ts), so a price edited here must land
+  // there too or new orders keep the old price until the cloud round-trip.
+  // A list shared with another venue is left alone: writing to it would also change
+  // (or be overwritten by) the other venue. The cloud gives this venue its own list
+  // when the edit syncs up, and the new list comes back down.
+  const profileOf = db.query(
+    `SELECT price_profile_id FROM venue v WHERE id = ?
+     AND NOT EXISTS (SELECT 1 FROM venue o WHERE o.price_profile_id = v.price_profile_id AND o.id != v.id AND COALESCE(o.is_deleted, 0) = 0)`,
+  );
+  const profileStmt = db.query(`
+    INSERT INTO price_profile_item (id, price_profile_id, menu_item_id, price, restaurant_id)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(price_profile_id, menu_item_id) DO UPDATE SET price = excluded.price
+  `);
+  db.transaction(() => {
     for (const [venueId, price] of entries) {
       const id = `vp-${venueId}-${itemId}`;
-      stmt.run(id, venueId, itemId, sanitizePrice(price), restaurantId);
+      const clean = sanitizePrice(price);
+      // Unchanged price (the edit form re-sends every venue's price): leave
+      // the row alone so it is not uploaded again as a new edit.
+      const current = buildVenuePriceMap(venueId).get(itemId);
+      if (current !== undefined && Number(current) === clean && !savedVenueIds.includes(venueId)) continue;
+      stmt.run(id, venueId, itemId, clean, restaurantId, editedAt);
+      const profileId = (profileOf.get(venueId) as any)?.price_profile_id;
+      if (profileId && clean > 0) {
+        profileStmt.run(`ppi-${profileId}-${itemId}`, profileId, itemId, clean, restaurantId);
+      }
     }
-    db.exec("COMMIT");
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
+  })();
 }
 
 // Upsert venue_menu_item_availability rows for an item. Same transaction
@@ -205,7 +245,7 @@ export function createMenuItemEdge(data: any): MenuEditResult {
     data.specialActive === false ? 0 : 1,
     data.specialExpiresAt ? Number(new Date(data.specialExpiresAt).getTime()) : null,
     data.reportCategory || null,
-    Date.now(),
+    editTime(),
   );
 
   upsertVenuePrices(restaurantId, id, data.venuePrices);
@@ -289,11 +329,13 @@ export function updateMenuItemEdge(id: string, data: any): MenuEditResult {
   // conflicts. The bump is what makes the conflict check meaningful.
   sets.push("synced_at = unixepoch()");
   sets.push("updated_at = ?");
-  params.push(Date.now());
+  params.push(editTime());
   params.push(id, restaurantId);
   db.query(`UPDATE menu_item SET ${sets.join(", ")} WHERE id = ? AND restaurant_id = ?`).run(...params);
 
-  if (data.venuePrices !== undefined) upsertVenuePrices(restaurantId, id, data.venuePrices);
+  if (data.venuePrices !== undefined) {
+    upsertVenuePrices(restaurantId, id, data.venuePrices, Array.isArray(data.savedVenueIds) ? data.savedVenueIds : []);
+  }
   if (data.venueAvailabilities !== undefined) upsertVenueAvailability(restaurantId, id, data.venueAvailabilities);
   if (data.sectionAvailabilities !== undefined) upsertSectionAvailability(restaurantId, id, data.sectionAvailabilities);
 
@@ -317,7 +359,7 @@ export function deleteMenuItemEdge(id: string): MenuEditResult {
   if (!existing) return { success: false, error: "Item not found", statusCode: 404 };
 
   db.query("UPDATE menu_item SET is_deleted = 1, deleted_at = unixepoch(), is_available = 0, updated_at = ?, synced_at = unixepoch() WHERE id = ? AND restaurant_id = ?")
-    .run(Date.now(), id, restaurantId);
+    .run(editTime(), id, restaurantId);
 
   enqueueSync("menu_item", id, "delete");
   invalidateReadCache();
@@ -340,7 +382,7 @@ export function toggleAvailabilityEdge(id: string): MenuEditResult {
 
   const newValue = row.is_available ? 0 : 1;
   db.query("UPDATE menu_item SET is_available = ?, updated_at = ?, synced_at = unixepoch() WHERE id = ? AND restaurant_id = ?")
-    .run(newValue, Date.now(), id, restaurantId);
+    .run(newValue, editTime(), id, restaurantId);
 
   enqueueSync("menu_item", id, "update");
   invalidateReadCache();
@@ -373,7 +415,7 @@ export function toggleVenueAvailabilityEdge(id: string, venueId: string): MenuEd
   // carries a meaningful timestamp for the cloud conflict check. Without this,
   // the venue-only toggle would sync with a stale/NULL updated_at.
   db.query("UPDATE menu_item SET updated_at = ?, synced_at = unixepoch() WHERE id = ? AND restaurant_id = ?")
-    .run(Date.now(), id, restaurantId);
+    .run(editTime(), id, restaurantId);
 
   // Enqueue a menu_item sync so the cloud receives the updated availability map.
   enqueueSync("menu_item", id, "update");
@@ -406,7 +448,7 @@ export function toggleSectionAvailabilityEdge(id: string, sectionId: string): Me
   // Bump the parent menu_item row's updated_at + synced_at so the sync payload
   // carries a meaningful timestamp for the cloud conflict check.
   db.query("UPDATE menu_item SET updated_at = ?, synced_at = unixepoch() WHERE id = ? AND restaurant_id = ?")
-    .run(Date.now(), id, restaurantId);
+    .run(editTime(), id, restaurantId);
 
   // Enqueue a menu_item sync so the cloud receives the updated availability map.
   enqueueSync("menu_item", id, "update");
@@ -431,7 +473,7 @@ export function toggleMenuTypeEdge(id: string, newPrinterTarget?: string | null)
   const gstEnabled = newType === "LIQUOR" ? 0 : 1;
 
   db.query("UPDATE menu_item SET menu_type = ?, gst_enabled = ?, printer_target = ?, updated_at = ?, synced_at = unixepoch() WHERE id = ? AND restaurant_id = ?")
-    .run(newType, gstEnabled, newPrinterTarget || null, Date.now(), id, restaurantId);
+    .run(newType, gstEnabled, newPrinterTarget || null, editTime(), id, restaurantId);
 
   enqueueSync("menu_item", id, "update");
   invalidateReadCache();

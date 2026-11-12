@@ -62,7 +62,7 @@ import { loadSession, saveSession, clearSession, isSessionValid, isLocalReady, g
 import { pullIncrementalChanges } from "./config.ts";
 import { createOrder, updateOrderItems, cancelKotItem, cancelKotItems, reprintKot, requestBillingEdge, printBillEdge, printWalkinBillEdge, settleOrderEdge, swapTableEdge, transferItemsEdge, editBillEdge, confirmPaymentEdge, updateOrderStatusEdge, markOrderPaidEdge, saveTransactionEdge, listTransactionsEdge, dispatchPendingPrintJobs } from "./orderService.ts";
 import { createMenuItemEdge, updateMenuItemEdge, deleteMenuItemEdge, toggleAvailabilityEdge, toggleVenueAvailabilityEdge, toggleSectionAvailabilityEdge, toggleMenuTypeEdge } from "./menuService.ts";
-import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders, invalidateReadCache } from "./reads.ts";
+import { getTablesForRestaurant, getTablesFlat, getSections, getMenu, getMenuItems, getVenues, getOutletSettings, getActiveOrders, invalidateReadCache, parseExpenditureApprovers } from "./reads.ts";
 import { getDeviceScope, updateDeviceScope, listAllVenues, getBoundVenueId, isCaptainHub, type DeviceScopeUpdate } from "./deviceScope.ts";
 import { getSyncStatus, manualSyncPush, retryDeadLetters, getDeadLetterRecords, discardDeadLetter, retrySingleDeadLetter } from "./sync.ts";
 import { getSocketStatus } from "./socketSync.ts";
@@ -86,6 +86,7 @@ import { runtimeLog } from "./contract/logger.ts";
 import { hashSync, compareSync } from "bcryptjs";
 import { runtimeManager } from "./runtimeManager.ts";
 import { getLanIpv4, getLanIpv4Addresses } from "./lanAddress.ts";
+import { reportEdgeError, installErrorReporting } from "./errorReport.ts";
 
 const PORT = parseInt(process.env.EDGE_PORT || "3101", 10);
 
@@ -742,8 +743,10 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
   }
 
   // ── POST /runtime/shutdown — Shutdown all Runtime services ──────────────────
-  // Called by the Cashier tray "Shutdown Runtime" action.
+  // Called by the Cashier tray "Shutdown Runtime" action and by the update flow.
   // Stops print service, sync workers, socket sync, releases lock, then exits.
+  // The Runtime Host restarts the Runtime after this exit unless an update is in
+  // progress (see the update marker in runtime-host/src/main.rs).
   // The Runtime Host will NOT respawn (it detects graceful shutdown).
   if (url.pathname === "/runtime/shutdown" && req.method === "POST") {
     runtimeLog.info("Runtime shutdown requested via API");
@@ -1182,6 +1185,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       tableNumber: body.tableNumber,
       firstAttemptAt: body.firstAttemptAt ?? null,
       sentAt: body.sentAt ?? null,
+      tableSeenAt: body.tableSeenAt ?? null,
       allowDuplicate: body.allowDuplicate === true,
     });
 
@@ -1227,6 +1231,7 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       tableNumber: body.tableNumber,
       firstAttemptAt: body.firstAttemptAt ?? null,
       sentAt: body.sentAt ?? null,
+      tableSeenAt: body.tableSeenAt ?? null,
       allowDuplicate: body.allowDuplicate === true,
     });
 
@@ -2113,6 +2118,31 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     return jsonResponse(rows[0] || { count: 0, totalAmount: 0 }, 200, { "Cache-Control": "no-store" });
   }
 
+  // ── GET /api/edge/expenditures/approver-names ───────────────────────────────
+  // "Approved by" names: the outlet's configured list (synced from cloud), else
+  // the outlet's OWNER/ADMIN user names — same rule as the cloud endpoint.
+  if (url.pathname === "/api/edge/expenditures/approver-names" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const restaurantId = getRestaurantId();
+    if (!restaurantId) return errorResponse("No restaurant ID in session", 500);
+
+    const db = getDb();
+    const outlet = db.query("SELECT expenditure_approvers FROM outlet WHERE id = ?").get(restaurantId) as any;
+    const configured = parseExpenditureApprovers(outlet?.expenditure_approvers);
+    if (configured.length > 0) {
+      return jsonResponse({ names: configured, source: "configured" }, 200, { "Cache-Control": "no-store" });
+    }
+
+    const owners = db.query(
+      "SELECT name FROM users WHERE outlet_id = ? AND is_active = 1 AND role IN ('OWNER', 'ADMIN') ORDER BY name"
+    ).all(restaurantId) as any[];
+    const names = Array.from(new Set(owners.map((u) => String(u.name || "").trim()).filter(Boolean)));
+    // NULL column = outlet row not re-synced since this field was added; the
+    // client then prefers the cloud / its cached list over these owner names.
+    const source = outlet?.expenditure_approvers == null ? "unsynced" : "owners";
+    return jsonResponse({ names, source }, 200, { "Cache-Control": "no-store" });
+  }
+
   // ── GET /api/edge/expenditures/paid-to-options ──────────────────────────────
   if (url.pathname === "/api/edge/expenditures/paid-to-options" && req.method === "GET") {
     if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
@@ -2742,6 +2772,26 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
     return jsonResponse({
       success: true,
       runtimeToken: getOrCreateRuntimeToken(),
+    });
+  }
+
+  // ── GET /api/edge/update-readiness — is it safe to stop the Runtime for an update? ──
+  // The cashier calls this before installing an update. Anything not yet synced to
+  // the cloud or still printing must be finished first, or the update waits.
+  if (url.pathname === "/api/edge/update-readiness" && req.method === "GET") {
+    if (!isLocalReady()) return errorResponse("Restaurant is not linked locally", 401);
+    const sync = getSyncStatus();
+    const pendingPrintJobs = (getDb().query(
+      "SELECT COUNT(*) as c FROM print_job WHERE status IN ('queued', 'retrying', 'printing', 'needs_retry')",
+    ).get() as any)?.c || 0;
+    const reasons: string[] = [];
+    if (sync.pendingCount > 0) reasons.push(`${sync.pendingCount} order record(s) waiting to sync`);
+    if (pendingPrintJobs > 0) reasons.push(`${pendingPrintJobs} print job(s) not finished`);
+    return jsonResponse({
+      ready: reasons.length === 0,
+      pendingSyncRecords: sync.pendingCount,
+      pendingPrintJobs,
+      reasons,
     });
   }
 
@@ -4326,6 +4376,15 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
       searchParams.set("restaurantId", restaurantId);
     }
     const cloudUrl = `${backendUrl}${url.pathname}?${searchParams.toString()}`;
+    // Last good answer per menu item, kept on the PC so the captain's bottle
+    // picker still works when the internet is down (bottle lists rarely change).
+    const cacheKey = `bottles_for_menu:${url.pathname.split("/").pop()}`;
+    const fromCache = () => {
+      const row = getDb().query("SELECT value FROM edge_config WHERE key = ?").get(cacheKey) as any;
+      return row?.value
+        ? new Response(row.value, { status: 200, headers: { "Content-Type": "application/json", "X-From-Cache": "1", ...CORS_HEADERS } })
+        : null;
+    };
     try {
       const cloudRes = await cloudFetch(cloudUrl, {
         method: "GET",
@@ -4333,15 +4392,26 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
           "Authorization": `Bearer ${sessionToken}`,
           "Accept": "application/json",
         },
-        timeout: 20_000,
+        timeout: 8_000,
       });
       const body = await cloudRes.text();
+      if (cloudRes.ok) {
+        try {
+          getDb().query("INSERT INTO edge_config (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at")
+            .run(cacheKey, body, Date.now());
+        } catch { /* cache is best-effort */ }
+      } else if (cloudRes.status >= 500) {
+        const cached = fromCache();
+        if (cached) return cached;
+      }
       return new Response(body, {
         status: cloudRes.status,
         headers: { "Content-Type": "application/json", ...CORS_HEADERS },
       });
     } catch (err: any) {
       console.warn(`[EdgeServer] Bottles-for-menu proxy error: ${err?.message}`);
+      const cached = fromCache();
+      if (cached) return cached;
       return errorResponse("Cloud backend unreachable", 502);
     }
   }
@@ -4360,11 +4430,15 @@ async function handleRequest(req: Request, url: URL, server: any): Promise<Respo
 
 process.on("uncaughtException", (err: any) => {
   console.error("[EdgeServer] UNCAUGHT EXCEPTION (survived):", err?.stack || err);
+  reportEdgeError("crash", `Uncaught exception: ${err?.message || err}`, { stack: String(err?.stack || "").slice(0, 600) });
 });
 
 process.on("unhandledRejection", (reason: any) => {
   console.error("[EdgeServer] UNHANDLED REJECTION (survived):", reason?.stack || reason);
+  reportEdgeError("crash", `Unhandled rejection: ${reason?.message || reason}`, { stack: String(reason?.stack || "").slice(0, 600) });
 });
+
+installErrorReporting();
 
 // ── Start server ──────────────────────────────────────────────────────────────
 

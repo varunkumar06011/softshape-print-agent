@@ -26,12 +26,14 @@
 
 import { getBillPrefix, resolveWalkinVenue } from "./deviceScope.ts";
 import { getDb, getNextKotNumber, enqueueSync, markUnsynced, getKolkataDateString, createPrintJob, updatePrintJobStatus, getPendingPrintJobs, claimPrintJob, reclaimStalePrintingJobs, getPrintJobByEventId, cancelPrintJob, lookupCommand, recordCommand, nextTableRevision, nextOrderRevision, upsertTransactionRecord } from "./db.ts";
+import { buildVenuePriceMap, effectiveItemPrice, defaultVariantPrice } from "./pricing.ts";
 
 import { buildFoodKOT, buildLiquorKOT, buildCancelKOT, buildFinalBill, type PrintItem, type OrderData, type BillData } from "./escpos.ts";
 
 import { resolvePrinterName, printToPrinter } from "./printer.ts";
 
 import { lanBroadcast } from "./lanBroadcast.ts";
+import { reportEdgeError } from "./errorReport.ts";
 
 
 
@@ -1315,94 +1317,23 @@ export function closedOrderResult(order: { status?: string | null }) {
 
 
 
-function buildEdgePriceMap(venueId: string | null | undefined, restaurantId: string): Map<string, number> {
-
-  const db = getDb();
-
-  const priceMap = new Map<string, number>();
-
-
-
-  if (!venueId) return priceMap;
-
-
-
-  // 1. Look up venue → priceProfileId
-
-  const venue = db.query("SELECT price_profile_id FROM venue WHERE id = ?").get(venueId) as any;
-
-  if (!venue?.price_profile_id) return priceMap;
-
-
-
-  // 2. Load all price profile items for this profile
-
-  const profileItems = db.query("SELECT menu_item_id, price FROM price_profile_item WHERE price_profile_id = ?").all(venue.price_profile_id) as any[];
-
-  for (const pi of profileItems) {
-
-    priceMap.set(pi.menu_item_id, Number(pi.price));
-
-  }
-
-
-
-  return priceMap;
-
+// Same rule as the menu screen (pricing.ts) — the KOT, the table and the bill
+// can never show a different price from the one the captain saw.
+function buildEdgePriceMap(venueId: string | null | undefined, _restaurantId: string): Map<string, number> {
+  return buildVenuePriceMap(venueId);
 }
 
-
-
-// Resolve a single item's price: priceMap → base_price → default variant price → client fallback
-
+// priceMap → base_price → default variant price → client fallback (pricing.ts)
 function resolveItemPrice(
-
   menuItemId: string,
-
   priceMap: Map<string, number>,
-
   menuItemMap: Map<string, any>,
-
   clientPrice: number,
-
 ): number {
-
-  const resolved = priceMap.get(menuItemId);
-
-  if (resolved != null && resolved > 0) return resolved;
-
-
-
   const mi = menuItemMap.get(menuItemId);
-
-  if (mi) {
-
-    const base = Number(mi.base_price ?? 0);
-
-    if (base > 0) return base;
-
-  }
-
-
-
-  // Try default variant
-
-  if (mi) {
-
-    const db = getDb();
-
-    const variant = db.query("SELECT price FROM menu_item_variant WHERE menu_item_id = ? AND is_default = 1 LIMIT 1").get(menuItemId) as any;
-
-    if (variant && Number(variant.price) > 0) return Number(variant.price);
-
-  }
-
-
-
-  // Last resort: client-sent price (already validated as >= 0)
-
-  return Number(clientPrice);
-
+  if (!mi) return Number(clientPrice); // unknown item — rejected earlier; keep old fallback
+  const price = effectiveItemPrice(priceMap.get(menuItemId), mi.base_price, defaultVariantPrice(menuItemId));
+  return price > 0 ? price : Number(clientPrice);
 }
 
 
@@ -1779,6 +1710,7 @@ export interface RetryGuardInput {
   firstAttemptAt?: number | null; // phone clock (ms) when this KOT was first sent
   sentAt?: number | null; // phone clock (ms) when this retry was sent — corrects clock skew
   allowDuplicate?: boolean; // captain chose "Send anyway"
+  tableSeenAt?: number | null; // phone clock (ms) when the captain last saw this table's state
 }
 
 export interface DuplicateConflict {
@@ -1860,10 +1792,36 @@ function checkRetriedKot(
   const applied = findAppliedKot(restaurantId, input.requestId);
   if (applied) return applied;
   const conflicts = findRetryConflicts(restaurantId, tableId, input.items, input);
-  return conflicts.length > 0 ? duplicateRetryResult(conflicts) : null;
+  if (conflicts.length > 0) {
+    reportEdgeError("kot_refused", "KOT held: same items were already added to the table", { tableId, requestId: input.requestId, items: conflicts.length }, "info");
+    return duplicateRetryResult(conflicts);
+  }
+  return null;
 }
 
 
+
+/**
+ * A captain's phone that missed the table being billed (or moved) would open a
+ * brand-new order on the freed table and print food nobody asked for. When the
+ * phone says when it last saw the table and an order on it was closed after
+ * that, refuse and let the captain look at the table again.
+ */
+function checkTableClosedSince(
+  tableId: string,
+  input: { tableSeenAt?: number | null; sentAt?: number | null },
+): any | null {
+  if (!input.tableSeenAt || !tableId) return null;
+  const skew = input.sentAt ? Date.now() - Number(input.sentAt) : 0;
+  const seenAt = Number(input.tableSeenAt) + skew - RETRY_GUARD_SLACK_MS;
+  const row = getDb().query(
+    `SELECT status, MAX(COALESCE(paid_at, updated_at)) AS closed_at
+     FROM order_record
+     WHERE table_id = ? AND status IN (${CLOSED_ORDER_STATUSES.map(() => "?").join(",")})`,
+  ).get(tableId, ...CLOSED_ORDER_STATUSES) as any;
+  if (!row?.closed_at || Number(row.closed_at) <= seenAt) return null;
+  return closedOrderResult({ status: row.status });
+}
 
 // ─── Create Order (the hot path) ─────────────────────────────────────────────
 
@@ -2016,6 +1974,16 @@ export async function createOrder(
 
 
   // ── Get table + outlet info ────────────────────────────────────────────────
+
+  // ── Stale captain screen: the table was billed after the phone last saw it ──
+  if (!input.isExtraTable) {
+    const closedSince = checkTableClosedSince(tableId, input);
+    if (closedSince) {
+      reportEdgeError("kot_refused", "KOT refused: table was billed after the captain last saw it", { tableId, requestId, code: closedSince.code }, "info");
+      recordCommandResult(restaurantId, input, "createOrder", "table", tableId, "rejected", closedSince, null, closedSince.error);
+      return closedSince;
+    }
+  }
 
   const table = getTableWithSection(tableId);
 
@@ -2737,6 +2705,7 @@ export async function updateOrderItems(
 
   if (isOrderClosed(order)) {
     const rejectResult = closedOrderResult(order);
+    reportEdgeError("kot_refused", "KOT refused: order is already paid or cancelled", { orderId: input.orderId, requestId: input.requestId, status: order.status }, "info");
     recordCommandResult(restaurantId, input, "updateOrderItems", "order", orderId, "rejected", rejectResult, null, rejectResult.error);
     return rejectResult;
   }

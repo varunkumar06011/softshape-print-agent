@@ -14,7 +14,7 @@
 
 import { Database } from "bun:sqlite";
 import { join, dirname } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { existsSync, mkdirSync, renameSync } from "node:fs";
 import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid, getDeviceId } from "./auth.ts";
 import { cloudFetch } from "./cloudFetch.ts";
@@ -165,6 +165,13 @@ async function attemptSyncBeforeRebuild(db: Database): Promise<{ pushed: number;
   }
 }
 
+// Errors that mean the file itself is damaged. Anything else (locked, disk full,
+// permissions) is not corruption and must never trigger a rebuild.
+function isCorruptionError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /malformed|not a database|Integrity check failed|file is encrypted/i.test(message);
+}
+
 export function openDatabaseWithRecovery(): { db: Database; recovery: RecoveryResult } {
   const recovery: RecoveryResult = {
     recovered: false,
@@ -182,17 +189,12 @@ export function openDatabaseWithRecovery(): { db: Database; recovery: RecoveryRe
       console.warn("[Recovery] Using fallback DB path:", fallbackPath);
       resolvedDbPath = fallbackPath;
     } else {
-      // Last resort: temp directory
-      const tmpDir = join(tmpdir(), ".softshape");
-      try {
-        mkdirSync(tmpDir, { recursive: true });
-        if (existsSync(tmpDir)) {
-          console.warn("[Recovery] Using temp DB path:", tmpDir);
-          resolvedDbPath = join(tmpDir, "edge.db");
-        }
-      } catch (tmpErr) {
-        console.error("[Recovery] All directory creation attempts failed:", tmpErr);
-      }
+      // No temp-folder fallback: Windows cleanup can delete it, and the restaurant
+      // would lose its live data without any warning. Fail loudly instead.
+      throw new Error(
+        `Cannot create the Runtime database folder at ${DEFAULT_DB_PATH} or ${fallbackPath}. ` +
+        "Fix folder permissions, then restart the Runtime.",
+      );
     }
   }
 
@@ -213,10 +215,18 @@ export function openDatabaseWithRecovery(): { db: Database; recovery: RecoveryRe
     // DB is healthy — open normally
     const db = new Database(dbPath, { create: true });
     db.exec("PRAGMA journal_mode = WAL;");
+    db.exec("PRAGMA synchronous = FULL;");
     db.exec("PRAGMA foreign_keys = ON;");
     db.exec("PRAGMA busy_timeout = 5000;");
     return { db, recovery };
   } catch (err) {
+    // Only real corruption may trigger the rename-and-rebuild below. Any other failure
+    // (locked file, disk error, permissions) must stop here: rebuilding would replace the
+    // live database with an empty one.
+    if (!isCorruptionError(err)) {
+      console.error("[Recovery] Database could not be opened — NOT rebuilding:", err);
+      throw err;
+    }
     console.error("[Recovery] Database appears corrupt:", err);
 
     // ── Sync-before-rebuild: salvage unsynced data ────────────────────────────
@@ -248,6 +258,7 @@ export function openDatabaseWithRecovery(): { db: Database; recovery: RecoveryRe
     // Create fresh DB
     const db = new Database(dbPath, { create: true });
     db.exec("PRAGMA journal_mode = WAL;");
+    db.exec("PRAGMA synchronous = FULL;");
     db.exec("PRAGMA auto_vacuum = INCREMENTAL;");
     db.exec("PRAGMA foreign_keys = ON;");
     db.exec("PRAGMA busy_timeout = 5000;");

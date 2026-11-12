@@ -1911,6 +1911,18 @@ function runMigrations(database: Database) {
 
   }
 
+  // outlet.expenditure_approvers — JSON array of names for the expenditure/voucher
+
+  // "Approved by" dropdown (cloud-owned config). Must run after the outlet
+
+  // recreate above, which only copies its fixed column list.
+
+  if (!hasColumn("outlet", "expenditure_approvers")) {
+
+    database.exec(`ALTER TABLE outlet ADD COLUMN expenditure_approvers TEXT`);
+
+  }
+
 
 
   // ── v6: kot table — add counter_date + date-scoped uniqueness ──────────────
@@ -2081,6 +2093,18 @@ function runMigrations(database: Database) {
   if (!hasColumn("order_item", "pour_from_inventory_item_id")) {
 
     database.exec(`ALTER TABLE order_item ADD COLUMN pour_from_inventory_item_id TEXT`);
+
+  }
+
+
+
+  // ── venue_price.pending_push — this PC edited the price and the cloud has not
+  // confirmed it yet (holds the edit time). Only these rows are uploaded with a
+  // menu item, so an unrelated edit (availability, name) can never send an old
+  // price back up and undo an admin's newer price.
+  if (!hasColumn("venue_price", "pending_push")) {
+
+    database.exec(`ALTER TABLE venue_price ADD COLUMN pending_push INTEGER`);
 
   }
 

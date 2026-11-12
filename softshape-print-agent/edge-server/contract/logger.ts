@@ -126,6 +126,23 @@ function cleanupOldLogs(): void {
 cleanupOldLogs();
 setInterval(cleanupOldLogs, 60 * 60 * 1000).unref?.();
 
+// ── Error sink ───────────────────────────────────────────────────────────────
+// errorReport.ts registers a function here so error-level lines also reach the
+// cloud. Kept as a hook so this low-level file does not depend on the database.
+type ErrorSink = (file: LogFile, msg: string, context?: Record<string, unknown>) => void;
+let errorSink: ErrorSink | null = null;
+
+export function setErrorSink(sink: ErrorSink | null): void {
+  errorSink = sink;
+}
+
+// True while an error-level log line is being copied to the console, so the
+// console hook in errorReport.ts does not report the same error a second time.
+let mirroringToConsole = false;
+export function isLoggerMirroring(): boolean {
+  return mirroringToConsole;
+}
+
 // ── Core log function ────────────────────────────────────────────────────────
 
 function log(file: LogFile, level: LogLevel, msg: string, context?: Record<string, unknown>): void {
@@ -147,9 +164,14 @@ function log(file: LogFile, level: LogLevel, msg: string, context?: Record<strin
     console.error(`[${file}] ${line.trim()}`);
   }
 
+  if (level === "error" && errorSink) {
+    try { errorSink(file, msg, context); } catch { /* reporting must never break logging */ }
+  }
+
   // Also mirror to console for development visibility
   if (level === "error") {
-    console.error(`[${file}] ${msg}`, context ?? "");
+    mirroringToConsole = true;
+    try { console.error(`[${file}] ${msg}`, context ?? ""); } finally { mirroringToConsole = false; }
   } else if (level === "warn") {
     console.warn(`[${file}] ${msg}`, context ?? "");
   }

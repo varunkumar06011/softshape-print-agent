@@ -260,7 +260,8 @@ function verifyCounts(
       const row = db.query(
         `SELECT COUNT(*) as c FROM ${tableRef} WHERE ${scopeColumn} IN (${placeholders})`
       ).get(...restaurantIds) as { c: number } | undefined;
-      const localCount = row?.c ?? 0;
+      // Minus rows kept from this PC that the cloud does not have yet.
+      const localCount = (row?.c ?? 0) - (lastReloadLocalExtras[table] ?? 0);
       localCounts[cloudKey] = localCount;
 
       if (localCount !== cloudCount) {
@@ -398,6 +399,13 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
     // Guard: preserve tables that have active orders to avoid orphaning
     // in-service operational state during config refresh.
     const rid = config.outlet.id;
+
+    // Keep this PC's edits the cloud has not received yet. The purge below would
+    // otherwise wipe them and the reload would bring back the old cloud values
+    // (a menu or price edit made offline would silently disappear).
+    const unsentEdits = snapshotUnsentMenuEdits(db, rid);
+    lastReloadLocalExtras = {};
+
     db.query(`DELETE FROM venue_menu_item_availability WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM section_menu_item_availability WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM venue_price WHERE restaurant_id = ?`).run(rid);
@@ -426,8 +434,8 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
       gstin, logo_url, receipt_header, receipt_sub_header, theme_primary, theme_secondary,
       printer_config, bar_unit_ml, full_bottle_ml, half_bottle_ml, fssai,
       prices_include_gst, gst_category, gst_rate, gst_registered, service_charge_percent,
-      enabled_modules, shared_kitchen_outlet_id, organization_id, is_active, synced_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+      enabled_modules, shared_kitchen_outlet_id, organization_id, is_active, expenditure_approvers, synced_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
     ON CONFLICT(id) DO UPDATE SET
       name=excluded.name, slug=excluded.slug, restaurant_code=excluded.restaurant_code,
       restaurant_type=excluded.restaurant_type, address=excluded.address, phone=excluded.phone,
@@ -440,7 +448,7 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
       gst_category=excluded.gst_category, gst_rate=excluded.gst_rate,
       gst_registered=excluded.gst_registered, service_charge_percent=excluded.service_charge_percent,
       enabled_modules=excluded.enabled_modules, shared_kitchen_outlet_id=excluded.shared_kitchen_outlet_id,
-      organization_id=excluded.organization_id, is_active=excluded.is_active,
+      organization_id=excluded.organization_id, is_active=excluded.is_active, expenditure_approvers=excluded.expenditure_approvers,
       synced_at=unixepoch()
     `).run(
       config.outlet.id, config.outlet.name, config.outlet.slug, config.outlet.restaurantCode,
@@ -457,7 +465,8 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
       config.outlet.serviceChargePercent || 0,
       JSON.stringify(config.outlet.enabledModules || {}),
       config.outlet.sharedKitchenOutletId || null,
-      config.outlet.organizationId || null, config.outlet.isActive !== false ? 1 : 0
+      config.outlet.organizationId || null, config.outlet.isActive !== false ? 1 : 0,
+      JSON.stringify(config.outlet.expenditureApprovers || [])
     );
     totalRows++;
 
@@ -649,6 +658,9 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
       `).run(sa.id, sa.sectionId, sa.menuItemId, sa.restaurantId, sa.isAvailable !== false ? 1 : 0);
       totalRows++;
     }
+
+    // Put this PC's unsent edits back on top of the fresh cloud copy.
+    restoreUnsentMenuEdits(db, unsentEdits);
 
     // ── Users (staff accounts for offline PIN verification) ────────────────
     for (const u of config.users ?? []) {
@@ -958,12 +970,141 @@ export async function pullIncrementalChanges(): Promise<{ success: boolean; chan
   }
 }
 
+// ── Never overwrite an edit this PC has not sent to the cloud yet ────────────
+// The PC is where the restaurant edits menu, prices and settings, so a change
+// the PC made but could not push yet (offline, slow, retrying) is newer than
+// whatever the cloud sends back for the same record. A record whose push keeps
+// failing (50+ attempts) is let go, so the cloud's version can still reach it.
+const STUCK_PUSH_ATTEMPTS = 50;
+
+// Rows that belong to a menu item travel inside the item's own sync entry.
+const MENU_ITEM_CHILD_TABLES = new Set([
+  "price_profile_item", "venue_price", "venue_menu_item_availability",
+  "section_menu_item_availability", "menu_item_variant", "menu_item_addon",
+]);
+
+// ── Full reload: keep unsent edits ───────────────────────────────────────────
+// Rows (category, menu item, its venue prices and availability) that this PC
+// changed and has not pushed yet are copied before the full-reload purge and
+// written back after the cloud snapshot is inserted.
+type UnsentSnapshot = Array<{ table: string; rows: any[] }>;
+
+function pendingIds(db: any, table: string): string[] {
+  return (db.query(
+    "SELECT DISTINCT record_id FROM sync_queue WHERE table_name = ? AND synced = 0 AND attempts < ?",
+  ).all(table, STUCK_PUSH_ATTEMPTS) as Array<{ record_id: string }>).map((r) => r.record_id);
+}
+
+function snapshotUnsentMenuEdits(db: any, restaurantId: string): UnsentSnapshot {
+  const out: UnsentSnapshot = [];
+  try {
+    const take = (table: string, where: string, params: any[]) => {
+      const rows = db.query(`SELECT * FROM ${table} WHERE ${where}`).all(...params) as any[];
+      if (rows.length > 0) out.push({ table, rows });
+    };
+    const inList = (ids: string[]) => ids.map(() => "?").join(",");
+
+    const cats = pendingIds(db, "category");
+    if (cats.length) take("category", `restaurant_id = ? AND id IN (${inList(cats)})`, [restaurantId, ...cats]);
+
+    const items = pendingIds(db, "menu_item");
+    if (items.length) {
+      const p = [restaurantId, ...items];
+      take("menu_item", `restaurant_id = ? AND id IN (${inList(items)})`, p);
+      take("venue_menu_item_availability", `restaurant_id = ? AND menu_item_id IN (${inList(items)})`, p);
+      take("section_menu_item_availability", `restaurant_id = ? AND menu_item_id IN (${inList(items)})`, p);
+    }
+    take("venue_price", "restaurant_id = ? AND pending_push IS NOT NULL", [restaurantId]);
+  } catch (err) {
+    runtimeLog.warn("[config] Could not snapshot unsent edits before reload", { error: String(err) });
+  }
+  return out;
+}
+
+// Rows kept from this PC that the cloud snapshot does not have yet (e.g. an
+// item created offline), per table — the count check after the reload must
+// not treat them as a mismatch.
+let lastReloadLocalExtras: Record<string, number> = {};
+
+function restoreUnsentMenuEdits(db: any, snapshot: UnsentSnapshot): void {
+  let restored = 0;
+  const extras: Record<string, number> = {};
+  for (const { table, rows } of snapshot) {
+    for (const row of rows) {
+      try {
+        const existed = row.id != null && db.query(`SELECT 1 FROM ${table} WHERE id = ?`).get(row.id);
+        const cols = Object.keys(row);
+        db.query(
+          `INSERT OR REPLACE INTO ${table} (${cols.map((c) => `"${c}"`).join(",")}) VALUES (${cols.map(() => "?").join(",")})`,
+        ).run(...cols.map((c) => row[c]));
+        if (!existed) extras[table] = (extras[table] ?? 0) + 1;
+        restored++;
+      } catch (err) {
+        // One row whose venue/category no longer exists must not abort the
+        // whole reload; the row's upload will report the problem.
+        runtimeLog.warn("[config] Could not keep one unsent edit through reload", { table, id: row?.id, error: String(err) });
+      }
+    }
+  }
+  lastReloadLocalExtras = extras;
+  if (restored > 0) runtimeLog.info("[config] Kept unsent PC edits through the full reload", { rows: restored });
+}
+
+export function hasUnsentLocalEdit(db: any, table: string, row: any): boolean {
+  if (!table || table === "transaction") return false;
+  // A venue price edited on this PC and not yet confirmed by the cloud
+  // (pending_push) is newer than any cloud copy — keep it, even if the item's
+  // upload is stuck. It is cleared once the cloud accepts it.
+  if (table === "venue_price" && row && typeof row === "object") {
+    const venueId = row.venueId ?? row.venue_id;
+    const itemId = row.menuItemId ?? row.menu_item_id;
+    if (venueId && itemId) {
+      const local = db.query(
+        "SELECT 1 FROM venue_price WHERE venue_id = ? AND menu_item_id = ? AND pending_push IS NOT NULL",
+      ).get(venueId, itemId);
+      if (local) return true;
+    }
+  }
+  const id = row && typeof row === "object" ? row.id : row;
+  const targets: Array<[string, string]> = [];
+  if (id) targets.push([table === "user" ? "users" : table, String(id)]);
+  if (MENU_ITEM_CHILD_TABLES.has(table) && row && typeof row === "object") {
+    const itemId = row.menuItemId ?? row.menu_item_id;
+    if (itemId) targets.push(["menu_item", String(itemId)]);
+  }
+  for (const [queueTable, recordId] of targets) {
+    const pending = db.query(
+      "SELECT 1 FROM sync_queue WHERE table_name = ? AND record_id = ? AND synced = 0 AND attempts < ? LIMIT 1",
+    ).get(queueTable, recordId, STUCK_PUSH_ATTEMPTS);
+    if (pending) return true;
+  }
+  return false;
+}
+
+/**
+ * The cloud refused one of this PC's edits because its own copy was newer.
+ * Move the download position back to just before that copy so the next pull
+ * brings it (and the rows that belong to it) down, and the PC and cloud end up
+ * identical instead of quietly keeping different values.
+ */
+export function rewindConfigCursor(cloudUpdatedAtIso: string): void {
+  const target = new Date(cloudUpdatedAtIso).getTime() - 2000;
+  if (!Number.isFinite(target)) return;
+  const current = new Date(getSyncState("last_incremental_sync") || 0).getTime();
+  if (current > target) setSyncState("last_incremental_sync", new Date(target).toISOString());
+}
+
 // ── Apply a single change from cloud → edge ──────────────────────────────────
 // Returns true if applied, false if skipped/unknown.
 function applyChange(db: any, change: any): boolean {
   const table = change.table;
   const op = change.operation || "upsert";
   const row = change.row;
+
+  if (hasUnsentLocalEdit(db, table, row)) {
+    runtimeLog.info("[Config] Kept the PC's unsent edit; skipped the cloud copy", { table, id: row?.id ?? row });
+    return false;
+  }
 
   // Handle delete operations
   if (op === "delete") {
@@ -1009,8 +1150,8 @@ function applyChange(db: any, change: any): boolean {
         gstin, logo_url, receipt_header, receipt_sub_header, theme_primary, theme_secondary,
         printer_config, bar_unit_ml, full_bottle_ml, half_bottle_ml, fssai,
         prices_include_gst, gst_category, gst_rate, gst_registered, service_charge_percent,
-        enabled_modules, shared_kitchen_outlet_id, organization_id, is_active, synced_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+        enabled_modules, shared_kitchen_outlet_id, organization_id, is_active, expenditure_approvers, synced_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
       ON CONFLICT(id) DO UPDATE SET
         name=excluded.name, slug=excluded.slug, restaurant_code=excluded.restaurant_code,
         restaurant_type=excluded.restaurant_type, address=excluded.address, phone=excluded.phone,
@@ -1023,7 +1164,7 @@ function applyChange(db: any, change: any): boolean {
         gst_category=excluded.gst_category, gst_rate=excluded.gst_rate,
         gst_registered=excluded.gst_registered, service_charge_percent=excluded.service_charge_percent,
         enabled_modules=excluded.enabled_modules, shared_kitchen_outlet_id=excluded.shared_kitchen_outlet_id,
-        organization_id=excluded.organization_id, is_active=excluded.is_active, synced_at=unixepoch()
+        organization_id=excluded.organization_id, is_active=excluded.is_active, expenditure_approvers=excluded.expenditure_approvers, synced_at=unixepoch()
       `).run(
         row.id, row.name, row.slug, row.restaurantCode,
         row.restaurantType || null, row.address || null, row.phone || null, row.email || null,
@@ -1034,7 +1175,8 @@ function applyChange(db: any, change: any): boolean {
         row.pricesIncludeGst ? 1 : 0, row.gstCategory || "NON_AC", row.gstRate || null,
         row.gstRegistered !== false ? 1 : 0, row.serviceChargePercent || 0,
         JSON.stringify(row.enabledModules || {}), row.sharedKitchenOutletId || null,
-        row.organizationId || null, row.isActive !== false ? 1 : 0
+        row.organizationId || null, row.isActive !== false ? 1 : 0,
+        JSON.stringify(row.expenditureApprovers || [])
       );
 
       // Extract printer mapping from outlet printer_config → edge_config (RC-5 fix)
@@ -1199,6 +1341,15 @@ function applyChange(db: any, change: any): boolean {
         VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(venue_id, menu_item_id) DO UPDATE SET price=excluded.price, is_active=excluded.is_active
       `).run(row.id, row.venueId, row.menuItemId, Number(row.price), row.isActive !== false ? 1 : 0, row.restaurantId);
+      // The cloud removed this venue's price. Price-list deletions are never
+      // downloaded (the pull only carries changed rows), so drop the list entry
+      // here too — otherwise the PC keeps billing the removed price.
+      if (row.isActive === false) {
+        db.query(
+          `DELETE FROM price_profile_item WHERE menu_item_id = ?
+             AND price_profile_id = (SELECT price_profile_id FROM venue WHERE id = ?)`,
+        ).run(row.menuItemId, row.venueId);
+      }
       return true;
 
     // ── Venue Menu Item Availability ─────────────────────────────────────────

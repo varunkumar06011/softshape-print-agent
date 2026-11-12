@@ -10,6 +10,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { sendToPrintService, isPrintServiceReady } from "./printServiceManager.ts";
+import { printerLog } from "./contract/logger.ts";
 
 // ── Convert ESC/POS data string to byte array ────────────────────────────────
 
@@ -51,7 +52,7 @@ export async function printToPrinter(
       return { ok: true, printerName, bytes: rawBytes.length, method: "print_service" };
     }
     lastError = result.error || "Print service failed";
-    console.warn(`[Printer] Print service failed → ${printerName}: ${lastError}`);
+    printerLog.error("Print service failed", { printerName, jobType: jobType ?? null, error: lastError });
   } else {
     lastError = "Print service is not ready";
   }

@@ -19,17 +19,31 @@ const ORDER_RETENTION_DAYS = 90;
 let lastBackupDate = "";
 let lastPruneDate = "";
 
-// ── Periodic backup (every 30 minutes) ───────────────────────────────────────
+// ── Periodic backup (every 30 minutes, only when something was saved) ───────
 // Creates a VACUUM INTO backup without the full maintenance prune.
-// Reduces the data loss window from 24h to 30min in case of DB corruption.
+// Keeps the data loss window at 30min in case of DB corruption. Only the newest
+// MAX_PERIODIC_BACKUPS copies are kept, and no copy is made while nothing has
+// been saved since the last one (closed overnight, quiet periods).
 
 let lastPeriodicBackupAt = 0;
-const PERIODIC_BACKUP_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
-const MAX_PERIODIC_BACKUPS = 48; // 48 × 30min = 24h of periodic backups
+export const PERIODIC_BACKUP_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+export const MAX_PERIODIC_BACKUPS = 15; // 15 × 30min = 7.5h of periodic backups
+
+/** When the database file (or its write-ahead log) was last written, 0 if unknown. */
+function lastDbWriteAt(): number {
+  const dbPath = getDbPath();
+  let latest = 0;
+  for (const path of [dbPath, `${dbPath}-wal`]) {
+    try { latest = Math.max(latest, statSync(path).mtimeMs); } catch { /* file may not exist */ }
+  }
+  return latest;
+}
 
 export function runPeriodicBackup(db: Database): void {
   const now = Date.now();
   if (now - lastPeriodicBackupAt < PERIODIC_BACKUP_INTERVAL_MS) return;
+  // Nothing saved since the last copy (closed overnight, quiet day): nothing to protect.
+  if (lastPeriodicBackupAt > 0 && lastDbWriteAt() < lastPeriodicBackupAt) return;
   lastPeriodicBackupAt = now;
 
   try {

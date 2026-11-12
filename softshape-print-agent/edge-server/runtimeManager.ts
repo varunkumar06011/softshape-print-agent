@@ -590,7 +590,7 @@ class RuntimeManager {
       }
     }, 24 * 60 * 60 * 1000);
 
-    // Periodic backup every 30 minutes
+    // Periodic backup check every 30 minutes (backup.ts decides whether one is due)
     this._backupTimer = setInterval(() => {
       if (this._runtimeState === "STOPPING" || this._runtimeState === "STOPPED") return;
       try {

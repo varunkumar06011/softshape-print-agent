@@ -583,6 +583,58 @@ fn perform_runtime_update(
 // If the Host itself crashes or is killed, Task Scheduler restarts it within
 // 5 minutes. This provides defense-in-depth beyond the autostart registry key.
 
+// ── Update marker ────────────────────────────────────────────────────────────
+// The cashier writes this file before it stops the Runtime for an update, and
+// removes it when the Runtime is needed again. While the marker is fresh, the
+// Host does not start or restart the Runtime. It goes stale after
+// UPDATE_MARKER_MAX_AGE_SECS, so a failed update cannot keep the Runtime down forever.
+
+const UPDATE_MARKER_MAX_AGE_SECS: u64 = 30 * 60;
+
+fn update_marker_file() -> PathBuf {
+    let base = env::var("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
+    base.join("Softshape").join("update-in-progress.flag")
+}
+
+fn update_in_progress() -> bool {
+    let Ok(meta) = fs::metadata(update_marker_file()) else {
+        return false;
+    };
+    let age = meta
+        .modified()
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok());
+    matches!(age, Some(age) if age.as_secs() < UPDATE_MARKER_MAX_AGE_SECS)
+}
+
+/// Ask the Runtime to shut down through its own API, so it can close the database cleanly.
+fn request_runtime_shutdown() {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], RUNTIME_PORT));
+    if let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+        let _ = stream.write_all(
+            b"POST /runtime/shutdown HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+    }
+}
+
+/// Stop the Runtime cleanly for an update. Waits up to 30s for a clean exit before forcing it.
+fn stop_runtime_for_update(child: &mut Child) {
+    log("Update in progress — asking the Runtime to shut down cleanly");
+    request_runtime_shutdown();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if let Ok(Some(_)) = child.try_wait() {
+            log("Runtime stopped cleanly for update");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    log("Runtime did not stop within 30s — forcing stop for update");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn heartbeat_file() -> PathBuf {
     log_dir().join("host.heartbeat")
 }
@@ -737,6 +789,15 @@ fn main() {
         return;
     }
 
+    // ── Update in progress: do not start the Runtime ─────────────────────────
+    // The cashier stops the Runtime on purpose while it installs an update. Starting
+    // it again here would race the installer. Checked before the lock so nothing
+    // is left behind.
+    if update_in_progress() {
+        log("Update in progress — not starting the Runtime. It starts again after the update.");
+        return;
+    }
+
     // ── Single-instance guard (Phase 7) ──────────────────────────────────────
     // Task Scheduler fires every 5 minutes. If the Host is already running,
     // the lock file prevents a duplicate instance.
@@ -826,6 +887,12 @@ fn main() {
             break;
         }
 
+        // The cashier asked for an update: stop the Runtime cleanly and leave it stopped
+        if update_in_progress() {
+            stop_runtime_for_update(&mut child);
+            break;
+        }
+
         // Write heartbeat file — Task Scheduler can check this to determine
         // if the Host is alive (vs. hung but still running)
         write_heartbeat();
@@ -895,6 +962,10 @@ fn main() {
             }
 
             // ── Respawn ──────────────────────────────────────────────────────
+            if update_in_progress() {
+                log("Runtime exited during an update — not respawning");
+                break;
+            }
             child = match spawn_runtime(&runtime_exe) {
                 Some(c) => c,
                 None => {

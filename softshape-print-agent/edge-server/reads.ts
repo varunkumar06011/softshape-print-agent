@@ -19,6 +19,7 @@ import { getDb } from "./db.ts";
 import { getRestaurantId } from "./auth.ts";
 import { getBoundVenueId } from "./deviceScope.ts";
 import { runtimeLog } from "./contract/logger.ts";
+import { buildVenuePriceMap, buildAllVenuePriceMaps, effectiveItemPrice } from "./pricing.ts";
 
 const ACTIVE_ORDER_STATUSES = ["PENDING", "CONFIRMED", "PREPARING", "READY", "BILLING_REQUESTED"];
 
@@ -501,40 +502,9 @@ export function getMenu(venueId?: string): any[] {
     ORDER BY sort_order ASC, name ASC
   `).all(restaurantId) as any[];
 
-  // Build venue price map — merge price_profile_item (cloud-synced) with
-  // venue_price (local edge edits). Local edits take priority.
-  let venuePriceMap: Map<string, number> = new Map();
-  if (venueId) {
-    const venue = db.query("SELECT price_profile_id FROM venue WHERE id = ?").get(venueId) as any;
-    if (venue?.price_profile_id) {
-      const profileItems = db.query("SELECT menu_item_id, price FROM price_profile_item WHERE price_profile_id = ?").all(venue.price_profile_id) as any[];
-      for (const pi of profileItems) {
-        venuePriceMap.set(pi.menu_item_id, Number(pi.price));
-      }
-    }
-    const localPrices = db.query("SELECT menu_item_id, price FROM venue_price WHERE venue_id = ? AND is_active = 1").all(venueId) as any[];
-    for (const vp of localPrices) {
-      venuePriceMap.set(vp.menu_item_id, Number(vp.price));
-    }
-  }
-
-  // Get all venue prices grouped by item (for client-side resolution)
-  const allVenuePricesByItem: Record<string, Record<string, number>> = {};
-  const allProfilePrices = db.query(`
-    SELECT v.id as venue_id, ppi.menu_item_id, ppi.price
-    FROM venue v
-    JOIN price_profile_item ppi ON v.price_profile_id = ppi.price_profile_id
-    WHERE v.is_deleted = 0 AND v.restaurant_id = ?
-  `).all(restaurantId) as any[];
-  for (const vp of allProfilePrices) {
-    if (!allVenuePricesByItem[vp.menu_item_id]) allVenuePricesByItem[vp.menu_item_id] = {};
-    allVenuePricesByItem[vp.menu_item_id][vp.venue_id] = Number(vp.price);
-  }
-  const allLocalPrices = db.query("SELECT venue_id, menu_item_id, price FROM venue_price WHERE restaurant_id = ? AND is_active = 1").all(restaurantId) as any[];
-  for (const vp of allLocalPrices) {
-    if (!allVenuePricesByItem[vp.menu_item_id]) allVenuePricesByItem[vp.menu_item_id] = {};
-    allVenuePricesByItem[vp.menu_item_id][vp.venue_id] = Number(vp.price);
-  }
+  // Prices come from pricing.ts — the same rule orders and bills use.
+  const venuePriceMap = buildVenuePriceMap(venueId);
+  const allVenuePricesByItem = buildAllVenuePriceMaps(restaurantId);
 
   const result = categories.map((cat) => {
     const items = db.query(`
@@ -547,9 +517,7 @@ export function getMenu(venueId?: string): any[] {
       // Get default variant price if exists
       const defaultVariant = db.query("SELECT price FROM menu_item_variant WHERE menu_item_id = ? AND is_default = 1 LIMIT 1").get(m.id) as any;
 
-      const basePrice = venuePriceMap.get(m.id) ?? Number(m.base_price);
-      const variantPrice = defaultVariant ? Number(defaultVariant.price) : null;
-      const effectivePrice = variantPrice ?? basePrice;
+      const effectivePrice = effectiveItemPrice(venuePriceMap.get(m.id), m.base_price, defaultVariant ? Number(defaultVariant.price) : null);
 
       // Get all variants
       const variants = db.query("SELECT id, name, price, is_default, is_available FROM menu_item_variant WHERE menu_item_id = ? AND is_available = 1").all(m.id) as any[];
@@ -625,45 +593,9 @@ export function getMenuItems(venueId?: string): any[] {
 
   const db = getDb();
 
-  // Build venue price map — merge price_profile_item (cloud-synced) with
-  // venue_price (local edge edits). Local edits take priority so a cashier's
-  // offline price change is visible immediately instead of being silently
-  // overridden by stale price-profile data from the last config pull.
-  let venuePriceMap: Map<string, number> = new Map();
-  if (venueId) {
-    const venue = db.query("SELECT price_profile_id FROM venue WHERE id = ?").get(venueId) as any;
-    if (venue?.price_profile_id) {
-      const profileItems = db.query("SELECT menu_item_id, price FROM price_profile_item WHERE price_profile_id = ?").all(venue.price_profile_id) as any[];
-      for (const pi of profileItems) {
-        venuePriceMap.set(pi.menu_item_id, Number(pi.price));
-      }
-    }
-    // Override with locally-edited venue prices (highest priority)
-    const localPrices = db.query("SELECT menu_item_id, price FROM venue_price WHERE venue_id = ? AND is_active = 1").all(venueId) as any[];
-    for (const vp of localPrices) {
-      venuePriceMap.set(vp.menu_item_id, Number(vp.price));
-    }
-  }
-
-  // Build all venue prices by item (for client-side venue price resolution)
-  const allVenuePricesByItem: Record<string, Record<string, number>> = {};
-  // First load from price_profile_item (cloud-synced)
-  const allProfilePrices = db.query(`
-    SELECT v.id as venue_id, ppi.menu_item_id, ppi.price
-    FROM venue v
-    JOIN price_profile_item ppi ON v.price_profile_id = ppi.price_profile_id
-    WHERE v.is_deleted = 0 AND v.restaurant_id = ?
-  `).all(restaurantId) as any[];
-  for (const vp of allProfilePrices) {
-    if (!allVenuePricesByItem[vp.menu_item_id]) allVenuePricesByItem[vp.menu_item_id] = {};
-    allVenuePricesByItem[vp.menu_item_id][vp.venue_id] = Number(vp.price);
-  }
-  // Then override with venue_price (local edge edits take priority)
-  const allLocalPrices = db.query("SELECT venue_id, menu_item_id, price FROM venue_price WHERE restaurant_id = ? AND is_active = 1").all(restaurantId) as any[];
-  for (const vp of allLocalPrices) {
-    if (!allVenuePricesByItem[vp.menu_item_id]) allVenuePricesByItem[vp.menu_item_id] = {};
-    allVenuePricesByItem[vp.menu_item_id][vp.venue_id] = Number(vp.price);
-  }
+  // Prices come from pricing.ts — the same rule orders and bills use.
+  const venuePriceMap = buildVenuePriceMap(venueId);
+  const allVenuePricesByItem = buildAllVenuePriceMaps(restaurantId);
 
   // Build venue availability by item
   const venueAvailRecords = db.query(`
@@ -704,9 +636,7 @@ export function getMenuItems(venueId?: string): any[] {
     })
     .map((m) => {
       const defaultVariant = db.query("SELECT price FROM menu_item_variant WHERE menu_item_id = ? AND is_default = 1 LIMIT 1").get(m.id) as any;
-      const basePrice = venuePriceMap.get(m.id) ?? Number(m.base_price);
-      const variantPrice = defaultVariant ? Number(defaultVariant.price) : null;
-      const price = variantPrice ?? basePrice;
+      const price = effectiveItemPrice(venuePriceMap.get(m.id), m.base_price, defaultVariant ? Number(defaultVariant.price) : null);
 
       // Get all variants for this item (for POS portion size selection)
       const variants = db.query("SELECT id, name, price, is_default, is_available FROM menu_item_variant WHERE menu_item_id = ? AND is_available = 1").all(m.id) as any[];
@@ -818,6 +748,17 @@ export function getVenues(): any[] {
 
 // ─── GET /api/edge/outlet — outlet settings ──────────────────────────────────
 
+/** outlet.expenditure_approvers is a JSON array of names; tolerate null/bad JSON. */
+export function parseExpenditureApprovers(raw: unknown): string[] {
+  if (typeof raw !== "string" || !raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((n) => typeof n === "string" && n.trim()) : [];
+  } catch {
+    return [];
+  }
+}
+
 export function getOutletSettings(): any | null {
   const restaurantId = getRestaurantId();
   if (!restaurantId) return null;
@@ -857,6 +798,7 @@ export function getOutletSettings(): any | null {
     gstRegistered: !!outlet.gst_registered,
     serviceChargePercent: outlet.service_charge_percent,
     enabledModules: outlet.enabled_modules ? JSON.parse(outlet.enabled_modules) : {},
+    expenditureApprovers: parseExpenditureApprovers(outlet.expenditure_approvers),
     organizationId: outlet.organization_id,
     isActive: !!outlet.is_active,
   };

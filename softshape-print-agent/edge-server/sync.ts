@@ -25,7 +25,8 @@
 import { getDb, getTransactionRecord } from "./db.ts";
 import { getBackendUrl, getSessionToken, getRestaurantId, isSessionValid, getDeviceId, saveSession, loadSession } from "./auth.ts";
 import { cloudFetch } from "./cloudFetch.ts";
-import { pullIncrementalChanges } from "./config.ts";
+import { pullIncrementalChanges, rewindConfigCursor } from "./config.ts";
+import { flushEdgeErrorReports } from "./errorReport.ts";
 import { startSocketSync } from "./socketSync.ts";
 
 const SYNC_INTERVAL_MS = parseInt(process.env.EDGE_SYNC_INTERVAL_MS || "5000", 10);
@@ -517,6 +518,8 @@ async function reconcileWithCloud(): Promise<{ ordersReset: number; expenditures
 
   const cloudOrderIds = new Set<string>();
   const cloudTxnIds = new Set<string>();
+  const cloudPaidOrderIds = new Set<string>();
+  let cloudReportsPaidOrders = false;
   const cloudExpenditureIds = new Set<string>();
   const cloudWalkinIds = new Set<string>();
 
@@ -546,11 +549,16 @@ async function reconcileWithCloud(): Promise<{ ordersReset: number; expenditures
         transactionLocalIds: string[];
         expenditureIds: string[];
         walkinLocalIds: string[];
+        ordersWithPayment?: string[];
         nextCursor: string | null;
       };
 
       for (const o of data.orders) cloudOrderIds.add(o.id);
       for (const t of data.transactionLocalIds) cloudTxnIds.add(t);
+      if (Array.isArray(data.ordersWithPayment)) {
+        cloudReportsPaidOrders = true;
+        for (const id of data.ordersWithPayment) cloudPaidOrderIds.add(id);
+      }
       for (const e of data.expenditureIds) cloudExpenditureIds.add(e);
       for (const w of data.walkinLocalIds) cloudWalkinIds.add(w);
 
@@ -582,6 +590,26 @@ async function reconcileWithCloud(): Promise<{ ordersReset: number; expenditures
       if (!cloudOrderIds.has(o.id)) {
         resetOrder.run(o.id);
         ordersReset++;
+      }
+    }
+
+    // Settled orders whose PAYMENT never reached the cloud. The order itself
+    // usually uploads during service (KOTs), so checking order ids alone never
+    // noticed a lost settlement — the bill stayed unpaid in the cloud for good.
+    // Only when the cloud reports payments per order (newer backends).
+    if (cloudReportsPaidOrders) {
+      const settledSynced = db.query(
+        `SELECT id FROM order_record
+         WHERE status = 'SETTLED' AND is_deleted = 0 AND cloud_synced_version > 0
+           AND EXISTS (SELECT 1 FROM transaction_record t WHERE t.order_id = order_record.id AND t.kind = 'settle')
+           -- a bill deleted in the admin panel must never be sent back up
+           AND NOT EXISTS (SELECT 1 FROM edge_config WHERE key = 'txn_deleted:' || order_record.id)`,
+      ).all() as Array<{ id: string }>;
+      for (const o of settledSynced) {
+        if (cloudOrderIds.has(o.id) && !cloudPaidOrderIds.has(o.id)) {
+          resetOrder.run(o.id);
+          ordersReset++;
+        }
       }
     }
 
@@ -794,9 +822,15 @@ function buildConfigPayload(tableName: string, recordId: string): any | null {
   // For menu_item, include nested venue prices + availabilities so the
   // cloud's upsertMenuItem can apply them in the same request.
   if (tableName === "menu_item") {
+    // Only prices edited on this PC and not yet confirmed (pending_push). Sending
+    // every venue's stored price let an old price ride along with an unrelated
+    // edit and overwrite a newer admin price in the cloud.
     const venuePrices = db.query(
-      "SELECT venue_id, price, is_active FROM venue_price WHERE menu_item_id = ?",
+      "SELECT venue_id, price, is_active FROM venue_price WHERE menu_item_id = ? AND pending_push IS NOT NULL",
     ).all(recordId) as any[];
+    // Tells the cloud these are only prices edited on this PC (newer builds) —
+    // older builds sent every stored price, which must not win a conflict.
+    data.venuePricesAreEdits = true;
     if (venuePrices.length > 0) {
       data.venuePrices = venuePrices.map((vp) => ({
         venueId: vp.venue_id,
@@ -853,9 +887,16 @@ async function pushConfigBatch(): Promise<{ ok: boolean; pushed: number; accepte
     return { ok: false, pushed: 0, accepted: 0, rejected: 0 };
   }
 
-  // Build the batch payload, skipping rows that no longer exist
+  // Build the batch payload, skipping rows that no longer exist. Note the
+  // newest price-edit time sent per item, so only the marks we actually sent
+  // are cleared (an edit made while the upload is in flight stays marked).
   const batch: Array<{ queueId: number; tableName: string; recordId: string; operation: string; data: any }> = [];
+  const sentPriceEditsUpTo = new Map<string, number>();
   for (const item of pending) {
+    if (item.tableName === "menu_item") {
+      const row = getDb().query("SELECT MAX(pending_push) AS t FROM venue_price WHERE menu_item_id = ?").get(item.recordId) as any;
+      if (row?.t != null) sentPriceEditsUpTo.set(item.recordId, Number(row.t));
+    }
     const data = buildConfigPayload(item.tableName, item.recordId);
     if (data) {
       batch.push({
@@ -891,17 +932,31 @@ async function pushConfigBatch(): Promise<{ ok: boolean; pushed: number; accepte
       return { ok: false, pushed: batch.length, accepted: 0, rejected: batch.length };
     }
 
-    const result = (await res.json()) as { accepted: number[]; rejected: Array<{ queueId: number; error: string; outcome: string }> };
+    const result = (await res.json()) as { accepted: number[]; rejected: Array<{ queueId: number; error: string; outcome: string; cloudUpdatedAt?: string }> };
     const acceptedSet = new Set(result.accepted);
+
+    const clearSentPriceEdits = (recordId: string) => {
+      const upTo = sentPriceEditsUpTo.get(recordId);
+      if (upTo == null) return;
+      getDb().query("UPDATE venue_price SET pending_push = NULL WHERE menu_item_id = ? AND pending_push <= ?").run(recordId, upTo);
+    };
 
     for (const item of batch) {
       if (acceptedSet.has(item.queueId)) {
         markConfigSynced(item.queueId);
+        clearSentPriceEdits(item.recordId);
       } else {
         const rejectedItem = result.rejected.find((r) => r.queueId === item.queueId);
         if (rejectedItem && rejectedItem.outcome !== "error" && rejectedItem.outcome !== "waiting_dependency") {
-          // Permanent rejection (duplicate, rejected, conflict) — safe to dequeue
+          // Permanent rejection (duplicate, rejected, conflict) — safe to dequeue.
+          // Venue prices are applied by the cloud even on an item conflict, so
+          // the sent price marks are done too.
           markConfigSynced(item.queueId);
+          clearSentPriceEdits(item.recordId);
+          // The cloud's copy was newer: fetch it, so both sides end up the same.
+          if (rejectedItem.outcome === "conflict" && rejectedItem.cloudUpdatedAt) {
+            rewindConfigCursor(rejectedItem.cloudUpdatedAt);
+          }
         } else if (rejectedItem && rejectedItem.outcome === "waiting_dependency") {
           // Parent not yet synced — leave for retry next cycle without penalty
         } else {
@@ -1046,6 +1101,9 @@ async function runSyncCycle(): Promise<void> {
     // handles this after the Edge is already READY and serving requests.
 
     const result = await pushSyncBatch();
+
+    // Errors and refused KOTs waiting to be shown in the cloud (no-op when none).
+    await flushEdgeErrorReports();
 
     // WAL checkpoint: use PASSIVE mode (non-blocking) instead of TRUNCATE
     // (which requires an exclusive lock and freezes all reads). PASSIVE
