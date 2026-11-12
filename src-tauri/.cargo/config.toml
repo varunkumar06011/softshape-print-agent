@@ -1,0 +1,5 @@
+# Link the Microsoft C runtime into the exe instead of loading it from the PC.
+# Without this, the app will not start on Windows PCs that lack the "Microsoft Visual C++
+# Redistributable" (error: "VCRUNTIME140_1.dll was not found").
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

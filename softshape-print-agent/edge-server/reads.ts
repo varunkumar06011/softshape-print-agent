@@ -544,6 +544,7 @@ export function getMenu(venueId?: string): any[] {
         specialActive: !!m.special_active,
         specialExpiresAt: m.special_expires_at ? new Date(m.special_expires_at).toISOString() : null,
         printerTarget: m.printer_target,
+        categoryPrinterTarget: cat.printer_target || null,
         printerName: m.printer_name,
         effectivePrice,
         variants: variants.map((v) => ({
@@ -618,7 +619,8 @@ export function getMenuItems(venueId?: string): any[] {
   }
 
   const items = db.query(`
-    SELECT m.*, c.name as category_name, c.sort_order as category_sort_order
+    SELECT m.*, c.name as category_name, c.sort_order as category_sort_order,
+           c.printer_target as category_printer_target
     FROM menu_item m
     LEFT JOIN category c ON m.category_id = c.id
     WHERE m.restaurant_id = ? AND m.is_deleted = 0
@@ -665,6 +667,8 @@ export function getMenuItems(venueId?: string): any[] {
           isAvailable: !!v.is_available,
         })),
         printerTarget: m.printer_target || null,
+        // The category's KOT printer, used when the item has no printer of its own.
+        categoryPrinterTarget: m.category_printer_target || null,
         printerName: m.printer_name || null,
         venuePrices: venueId ? (venuePriceMap.has(m.id) ? { [venueId]: venuePriceMap.get(m.id)! } : {}) : (allVenuePricesByItem[m.id] ?? {}),
         venueAvailabilities: venueAvailByItem[m.id] ?? {},

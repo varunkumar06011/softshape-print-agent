@@ -347,6 +347,56 @@ export function updateMenuItemEdge(id: string, data: any): MenuEditResult {
   return { success: true, id };
 }
 
+// ── Category printer ─────────────────────────────────────────────────────────
+
+export function listCategoriesWithPrinters(): { id: string; name: string; printerTarget: string | null }[] {
+  const restaurantId = getRestaurantId();
+  if (!restaurantId) return [];
+  const rows = getDb()
+    .query("SELECT id, name, printer_target FROM category WHERE restaurant_id = ? AND is_active = 1 ORDER BY sort_order ASC, name ASC")
+    .all(restaurantId) as any[];
+  return rows.map((r) => ({ id: r.id, name: r.name, printerTarget: r.printer_target || null }));
+}
+
+/**
+ * Set a category's KOT printer. This overrides every per-item printer in the
+ * category (item-level printer_target is cleared so all items follow the
+ * category). A per-item printer set afterwards wins over the category again.
+ */
+export function setCategoryPrinterEdge(categoryId: string, printerTarget: string | null): MenuEditResult {
+  const restaurantId = getRestaurantId();
+  if (!restaurantId) return { success: false, error: "No restaurant ID in session", statusCode: 500 };
+  if (!categoryId) return { success: false, error: "id is required", statusCode: 400 };
+
+  const db = getDb();
+  const cat = db.query("SELECT id FROM category WHERE id = ? AND restaurant_id = ?").get(categoryId, restaurantId) as any;
+  if (!cat) return { success: false, error: "Category not found", statusCode: 404 };
+
+  const target = typeof printerTarget === "string" && printerTarget.trim() ? printerTarget.trim() : null;
+  const now = Date.now();
+
+  // Items carrying their own printer: a logical one (printer_target) or a physical
+  // override (printer_name). The physical override outranks everything at print time,
+  // so it must be cleared too or the category printer would never take effect.
+  const itemIds = (db.query(
+    "SELECT id FROM menu_item WHERE category_id = ? AND restaurant_id = ? AND ((printer_target IS NOT NULL AND printer_target != '') OR (printer_name IS NOT NULL AND printer_name != ''))"
+  ).all(categoryId, restaurantId) as any[]).map((r) => r.id);
+
+  db.transaction(() => {
+    db.query("UPDATE category SET printer_target = ? WHERE id = ? AND restaurant_id = ?").run(target, categoryId, restaurantId);
+    db.query("UPDATE menu_item SET printer_target = NULL, printer_name = NULL, updated_at = ?, synced_at = unixepoch() WHERE category_id = ? AND restaurant_id = ?")
+      .run(now, categoryId, restaurantId);
+  })();
+
+  enqueueSync("category", categoryId, "update");
+  for (const itemId of itemIds) enqueueSync("menu_item", itemId, "update");
+  invalidateReadCache();
+  emitMenuChanged();
+
+  runtimeLog.info("[menuService] Set category printer", { categoryId, printerTarget: target, itemsReset: itemIds.length });
+  return { success: true, id: categoryId };
+}
+
 // ── Delete (soft) ────────────────────────────────────────────────────────────
 
 export function deleteMenuItemEdge(id: string): MenuEditResult {

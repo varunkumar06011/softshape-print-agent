@@ -414,7 +414,7 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
     db.query(`DELETE FROM menu_item_variant WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM menu_item WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM category WHERE restaurant_id = ?`).run(rid);
-    db.query(`DELETE FROM "table" WHERE restaurant_id = ? AND id NOT IN (SELECT table_id FROM order_record WHERE restaurant_id = ? AND status IN ('PREPARING','READY','BILLING_REQUESTED','SETTLED') AND is_deleted = 0)`).run(rid, rid);
+    db.query(`DELETE FROM "table" WHERE restaurant_id = ? AND id NOT IN (SELECT table_id FROM order_record WHERE restaurant_id = ? AND status IN ('PENDING','CONFIRMED','PREPARING','READY','BILLING_REQUESTED','SETTLED') AND is_deleted = 0)`).run(rid, rid);
     db.query(`DELETE FROM section WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM floor WHERE restaurant_id = ?`).run(rid);
     db.query(`DELETE FROM venue WHERE restaurant_id = ?`).run(rid);
@@ -466,7 +466,8 @@ async function _downloadFullConfigImpl(onStage?: SyncStageCallback): Promise<Con
       JSON.stringify(config.outlet.enabledModules || {}),
       config.outlet.sharedKitchenOutletId || null,
       config.outlet.organizationId || null, config.outlet.isActive !== false ? 1 : 0,
-      JSON.stringify(config.outlet.expenditureApprovers || [])
+      // Cloud keeps the "Approved by" names in enabledModules.expenditureApprovers.
+      JSON.stringify(config.outlet.expenditureApprovers || config.outlet.enabledModules?.expenditureApprovers || [])
     );
     totalRows++;
 
@@ -1176,7 +1177,7 @@ function applyChange(db: any, change: any): boolean {
         row.gstRegistered !== false ? 1 : 0, row.serviceChargePercent || 0,
         JSON.stringify(row.enabledModules || {}), row.sharedKitchenOutletId || null,
         row.organizationId || null, row.isActive !== false ? 1 : 0,
-        JSON.stringify(row.expenditureApprovers || [])
+        JSON.stringify(row.expenditureApprovers || row.enabledModules?.expenditureApprovers || [])
       );
 
       // Extract printer mapping from outlet printer_config → edge_config (RC-5 fix)
@@ -1444,6 +1445,17 @@ export function applyChangesBatch(changes: any[]): number {
     if (applyChange(db, change)) {
       applied++;
       if (change?.table) touchedTables.push(change.table);
+    }
+  }
+  if (applied > 0) {
+    // Drop cached reads (e.g. /api/edge/outlet) so socket-pushed settings such
+    // as expenditure approvers are served fresh instead of after the 5-min TTL.
+    try {
+      invalidateReadCache();
+    } catch (cacheErr) {
+      runtimeLog.warn("[config] Cache invalidation after socket batch failed (non-fatal)", {
+        error: String(cacheErr),
+      });
     }
   }
   if (touchedTables.length > 0) notifyConfigChanged(touchedTables, "socket");
